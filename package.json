@@ -1,0 +1,35 @@
+{
+  "name": "pi-realctx",
+  "version": "0.1.0",
+  "description": "Working context and long-term memory for Pi: drops spent tool outputs behind restorable placeholders, and keeps surprise-gated, path-scoped Markdown facts across sessions (SQLite FTS5 + sqlite-vec)",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "memory", "context", "context-management", "sqlite", "embeddings"],
+  "engines": { "node": ">=22.13.0" },
+  "pi": {
+    "extensions": ["./extensions/realctx/index.ts"]
+  },
+  "files": ["src", "extensions", "skills", "docs", "README.md"],
+  "scripts": {
+    "test": "node --test --test-timeout=60000 tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.9",
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@types/node": "^24.0.0",
+    "typebox": "*",
+    "typescript": "^5.9.0"
+  }
+}

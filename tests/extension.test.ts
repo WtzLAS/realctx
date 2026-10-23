@@ -64,7 +64,7 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, Handler[]>();
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
-	let active = ["read", "bash", "ctx_memory", "real_recall"];
+	let active = ["read", "bash", "ctx_memory", "realctx_recall"];
 	const pi: any = {
 		registerTool: (t: any) => tools.set(t.name, t),
 		registerCommand: (n: string, c: any) => commands.set(n, c),
@@ -82,10 +82,9 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	realctx(pi);
 	assert.deepEqual(
 		[...tools.keys()].sort(),
-		["real_expand", "real_forget", "real_list", "real_recall", "real_remember", "real_status", "realmem_forget", "realmem_list", "realmem_recall", "realmem_remember", "realmem_status"],
+		["realctx_expand", "realctx_forget", "realctx_list", "realctx_recall", "realctx_remember", "realctx_status"],
 	);
-	assert.equal(tools.get("realmem_recall").exposure, "deferred", "realmem_* aliases are callable but not declared");
-	assert.ok(commands.has("realmem"), "/realmem stays as an alias");
+	assert.deepEqual([...commands.keys()], ["realctx"]);
 	assert.ok(commands.has("realctx"));
 	const emit = async (e: string, ev: any, ctx: any) => {
 		let last: any;
@@ -112,14 +111,14 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	assert.equal(await emit("tool_call", { type: "tool_call", toolCallId: "y", toolName: "bash", input: {} }, ctx), undefined);
 
 	// Remember via the tool.
-	const res = await tools.get("real_remember").execute("1", { caption: "Run tests with node --test", content: "`npm test` runs node --test over tests/*.test.ts." }, undefined, undefined, ctx);
+	const res = await tools.get("realctx_remember").execute("1", { caption: "Run tests with node --test", content: "`npm test` runs node --test over tests/*.test.ts." }, undefined, undefined, ctx);
 	assert.match(res.content[0].text, /remembered/);
 	assert.equal(res.details.status, "added");
-	const rec = await tools.get("real_recall").execute("2", { queries: ["how to run tests"] }, undefined, undefined, ctx);
+	const rec = await tools.get("realctx_recall").execute("2", { queries: ["how to run tests"] }, undefined, undefined, ctx);
 	assert.match(rec.content[0].text, /<memory id="[A-Za-z0-9_-]{22}" scope="project-shared" used="0">/);
-	const list = await tools.get("real_list").execute("3", {}, undefined, undefined, ctx);
+	const list = await tools.get("realctx_list").execute("3", {}, undefined, undefined, ctx);
 	assert.match(list.content[0].text, /\| shared \| \* \| 1 \| Run tests/);
-	const st = await tools.get("real_status").execute("4", {}, undefined, undefined, ctx);
+	const st = await tools.get("realctx_status").execute("4", {}, undefined, undefined, ctx);
 	assert.match(st.content[0].text, /project-shared: 1 memories/);
 
 	// Mark an AGENTS.md as imported, then the first prompt freezes the section and strips it.
@@ -140,7 +139,7 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	assert.equal(entries.length, 1, "snapshot persisted in session");
 
 	// More memories later must not change the frozen prompt.
-	await tools.get("real_remember").execute("5", { caption: "Lint with biome", content: "Run `npx biome check .` before committing." }, undefined, undefined, ctx);
+	await tools.get("realctx_remember").execute("5", { caption: "Lint with biome", content: "Run `npx biome check .` before committing." }, undefined, undefined, ctx);
 	const ev2 = { type: "before_agent_start", prompt: "again", systemPromptOptions: opts() };
 	await emit("before_agent_start", ev2, ctx);
 	assert.equal(ev2.systemPromptOptions.sections.realctx, ev1.systemPromptOptions.sections.realctx, "prompt is byte-identical within a session");
@@ -200,9 +199,9 @@ test("warns when .pi/realctx is ignored by git; /realctx fix-gitignore applies t
 		assert.match(warn[0], /\/realctx fix-gitignore/);
 
 		// Status shows it too, and a shared remember says the memory will not be committed.
-		const st = await tools.get("real_status").execute("s", {}, undefined, undefined, ctx);
+		const st = await tools.get("realctx_status").execute("s", {}, undefined, undefined, ctx);
 		assert.match(st.content[0].text, /WARNING: The shared memory store \.pi\/realctx\/ is ignored by git/);
-		const r = await tools.get("real_remember").execute("r", { caption: "Build with make", content: "Run make all." }, undefined, undefined, ctx);
+		const r = await tools.get("realctx_remember").execute("r", { caption: "Build with make", content: "Run make all." }, undefined, undefined, ctx);
 		assert.match(r.content[0].text, /is ignored by git, so this memory will not be committed/);
 
 		// The command appends the fix after confirmation and re-checks.

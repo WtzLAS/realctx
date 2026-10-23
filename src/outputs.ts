@@ -39,7 +39,7 @@ export interface OutputMeta {
 	/** Absolute path of the stored original. */
 	file: string;
 	capturedAt: number;
-	/** For real_expand results: ordinals of the outputs they restored. */
+	/** For realctx_expand results: ordinals of the outputs they restored. */
 	expandOf?: number[];
 }
 

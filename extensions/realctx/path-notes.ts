@@ -12,8 +12,6 @@ interface ShownData {
 	unshow?: string[];
 }
 
-const LEGACY_SHOWN = "realmem-shown";
-
 export interface BranchEntry {
 	type: string;
 	id?: string;
@@ -52,7 +50,7 @@ export class PathNoteState {
 		}
 		for (let i = keptFrom; i < branch.length; i++) {
 			const e = branch[i];
-			if (e.type !== "custom" || (e.customType !== SHOWN_ENTRY && e.customType !== LEGACY_SHOWN)) continue;
+			if (e.type !== "custom" || e.customType !== SHOWN_ENTRY) continue;
 			const data = e.data as ShownData | undefined;
 			if (Array.isArray(data?.ids)) for (const id of data.ids) if (typeof id === "string") this.shown.add(id);
 			if (Array.isArray(data?.unshow)) for (const id of data.unshow) if (typeof id === "string") this.shown.delete(id);

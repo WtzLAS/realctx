@@ -6,13 +6,15 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ScopeKind } from "./files.ts";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /** A durable fact extracted from a dropped output, waiting for approval (capture mode `suggest`). */
 export interface Suggestion {
 	seq: number;
 	session: string;
 	toolCallId?: string;
+	/** Where the fact came from: a dropped tool output or a user message. */
+	origin: "output" | "user";
 	caption: string;
 	content: string;
 	paths?: string[];
@@ -335,7 +337,7 @@ export class RealctxDB {
 				this.db.exec(`
 					CREATE TABLE IF NOT EXISTS outputs (
 						rid INTEGER PRIMARY KEY,
-						tool_call_id TEXT NOT NULL UNIQUE,
+						tool_call_id TEXT NOT NULL,
 						session TEXT NOT NULL,
 						project TEXT NOT NULL,
 						ord INTEGER NOT NULL,
@@ -343,7 +345,7 @@ export class RealctxDB {
 						file TEXT NOT NULL,
 						created INTEGER NOT NULL
 					);
-					CREATE INDEX IF NOT EXISTS outputs_session ON outputs(session);
+					CREATE UNIQUE INDEX IF NOT EXISTS outputs_key ON outputs(session, tool_call_id);
 					CREATE VIRTUAL TABLE IF NOT EXISTS outputs_fts USING fts5(head, body, tokenize = 'unicode61 remove_diacritics 2');
 					CREATE TABLE IF NOT EXISTS verdicts (
 						tool_call_id TEXT PRIMARY KEY,
@@ -373,6 +375,47 @@ export class RealctxDB {
 						created INTEGER NOT NULL
 					);
 				`);
+			}
+			if (version === 4) {
+				// v4 keyed outputs by tool call id alone; ids are only unique per session. Outputs are a
+				// cache of files on disk, so rebuild the tables instead of migrating rows.
+				this.db.exec(`
+					DROP TABLE IF EXISTS outputs;
+					DROP TABLE IF EXISTS outputs_fts;
+					CREATE TABLE outputs (
+						rid INTEGER PRIMARY KEY,
+						tool_call_id TEXT NOT NULL,
+						session TEXT NOT NULL,
+						project TEXT NOT NULL,
+						ord INTEGER NOT NULL,
+						meta TEXT NOT NULL,
+						file TEXT NOT NULL,
+						created INTEGER NOT NULL
+					);
+					CREATE UNIQUE INDEX outputs_key ON outputs(session, tool_call_id);
+					CREATE VIRTUAL TABLE outputs_fts USING fts5(head, body, tokenize = 'unicode61 remove_diacritics 2');
+				`);
+			}
+			if (version < 5) {
+				// Vectors of dropped outputs (per session, brute-force cosine) and session activity for retention.
+				this.db.exec(`
+					CREATE TABLE IF NOT EXISTS output_vecs (
+						session TEXT NOT NULL,
+						tool_call_id TEXT NOT NULL,
+						fingerprint TEXT NOT NULL,
+						vec BLOB NOT NULL,
+						PRIMARY KEY (session, tool_call_id)
+					);
+					CREATE TABLE IF NOT EXISTS output_sessions (
+						session TEXT PRIMARY KEY,
+						project TEXT NOT NULL,
+						dir TEXT NOT NULL,
+						last_active INTEGER NOT NULL
+					);
+					CREATE TABLE IF NOT EXISTS schedule (key TEXT PRIMARY KEY, at INTEGER NOT NULL, data TEXT);
+				`);
+				const cols = (this.db.prepare("PRAGMA table_info(suggestions)").all() as Array<{ name: string }>).map((c) => c.name);
+				if (!cols.includes("origin")) this.db.exec("ALTER TABLE suggestions ADD COLUMN origin TEXT NOT NULL DEFAULT 'output'");
 			}
 			this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 		});
@@ -917,7 +960,7 @@ export class RealctxDB {
 	/** Record a captured tool output (metadata JSON + path of the original on disk) and index it for recall. */
 	putOutput(o: { toolCallId: string; session: string; project: string; ord: number; meta: unknown; file: string; head: string; body: string }): void {
 		this.tx(() => {
-			const prev = this.stmt("SELECT rid FROM outputs WHERE tool_call_id = ?").get(o.toolCallId) as { rid: number } | undefined;
+			const prev = this.stmt("SELECT rid FROM outputs WHERE session = ? AND tool_call_id = ?").get(o.session, o.toolCallId) as { rid: number } | undefined;
 			if (prev) {
 				this.stmt("DELETE FROM outputs_fts WHERE rowid = ?").run(Number(prev.rid));
 				this.stmt("DELETE FROM outputs WHERE rid = ?").run(Number(prev.rid));
@@ -935,8 +978,8 @@ export class RealctxDB {
 		});
 	}
 
-	getOutputMeta(toolCallId: string): { meta: unknown; file: string; session: string } | undefined {
-		const r = this.stmt("SELECT meta, file, session FROM outputs WHERE tool_call_id = ?").get(toolCallId) as Row | undefined;
+	getOutputMeta(session: string, toolCallId: string): { meta: unknown; file: string; session: string } | undefined {
+		const r = this.stmt("SELECT meta, file, session FROM outputs WHERE session = ? AND tool_call_id = ?").get(session, toolCallId) as Row | undefined;
 		if (!r) return undefined;
 		try {
 			return { meta: JSON.parse(String(r.meta)), file: String(r.file), session: String(r.session) };
@@ -945,31 +988,100 @@ export class RealctxDB {
 		}
 	}
 
-	updateOutputMeta(toolCallId: string, meta: unknown): void {
-		this.stmt("UPDATE outputs SET meta = ? WHERE tool_call_id = ?").run(JSON.stringify(meta), toolCallId);
+	/** Store the vector of a captured output (`fingerprint` = embedding space). */
+	putOutputVec(toolCallId: string, session: string, fingerprint: string, vec: Float32Array): void {
+		this.stmt(
+			"INSERT INTO output_vecs(tool_call_id, session, fingerprint, vec) VALUES (?, ?, ?, ?) ON CONFLICT(session, tool_call_id) DO UPDATE SET fingerprint = excluded.fingerprint, vec = excluded.vec",
+		).run(toolCallId, session, fingerprint, toF32Bytes(vec));
 	}
 
-	/** BM25 search over captured outputs, restricted to the given tool call ids. */
-	searchOutputs(ids: string[], match: string, limit: number): Array<{ toolCallId: string; score: number }> {
-		try {
-			const rows = this.stmt(
-				`SELECT o.tool_call_id AS id, bm25(outputs_fts, 2.0, 1.0) AS score FROM outputs_fts f JOIN outputs o ON o.rid = f.rowid
-				 WHERE outputs_fts MATCH ? AND o.tool_call_id IN (SELECT value FROM json_each(?)) ORDER BY score LIMIT ?`,
-			).all(match, JSON.stringify(ids), limit) as Array<{ id: string; score: number }>;
-			return rows.map((r) => ({ toolCallId: String(r.id), score: -Number(r.score) }));
-		} catch {
-			return [];
-		}
+	/** Ids among `ids` (of `session`) that have no vector in the current embedding space. */
+	outputsWithoutVec(session: string, ids: string[], fingerprint: string): string[] {
+		if (ids.length === 0) return [];
+		const have = new Set(
+			(this.stmt("SELECT tool_call_id AS id FROM output_vecs WHERE session = ? AND fingerprint = ? AND tool_call_id IN (SELECT value FROM json_each(?))").all(session, fingerprint, JSON.stringify(ids)) as Array<{ id: string }>).map(
+				(r) => String(r.id),
+			),
+		);
+		return ids.filter((id) => !have.has(id));
 	}
 
-	/** Remove captured outputs of a session (files are the caller's job). Returns their files. */
-	deleteSessionOutputs(session: string): string[] {
+	/** Cosine KNN over the vectors of one session's outputs, restricted to `ids`. */
+	vecSearchOutputs(session: string, ids: string[], fingerprint: string, query: Float32Array, k: number): Array<{ toolCallId: string; score: number }> {
+		if (ids.length === 0) return [];
+		const rows = this.stmt("SELECT tool_call_id AS id, vec FROM output_vecs WHERE session = ? AND fingerprint = ? AND tool_call_id IN (SELECT value FROM json_each(?))").all(
+			session,
+			fingerprint,
+			JSON.stringify(ids),
+		) as Array<{ id: string; vec: Uint8Array }>;
+		return rows
+			.map((r) => ({ toolCallId: String(r.id), score: cosine(query, fromBytes(r.vec)) }))
+			.sort((a, b) => b.score - a.score)
+			.slice(0, Math.max(1, k));
+	}
+
+	/** Text indexed for one output (head + body), for embedding. */
+	outputText(session: string, toolCallId: string): string | undefined {
+		const r = this.stmt("SELECT f.head AS head, f.body AS body FROM outputs o JOIN outputs_fts f ON f.rowid = o.rid WHERE o.session = ? AND o.tool_call_id = ?").get(session, toolCallId) as
+			| { head: string; body: string }
+			| undefined;
+		return r ? `${r.head}\n${r.body}` : undefined;
+	}
+
+	/** Mark a session's output store as active now (retention clock). */
+	touchOutputSession(session: string, project: string, dir: string): void {
+		this.stmt(
+			"INSERT INTO output_sessions(session, project, dir, last_active) VALUES (?, ?, ?, ?) ON CONFLICT(session) DO UPDATE SET project = excluded.project, dir = excluded.dir, last_active = excluded.last_active",
+		).run(session, project, dir, Date.now());
+	}
+
+	/** Sessions whose outputs were last active before `before` (ms), except `keep`. */
+	staleOutputSessions(before: number, keep: string[]): Array<{ session: string; dir: string }> {
+		const rows = this.stmt("SELECT session, dir FROM output_sessions WHERE last_active < ? AND session NOT IN (SELECT value FROM json_each(?))").all(before, JSON.stringify(keep)) as Row[];
+		return rows.map((r) => ({ session: String(r.session), dir: String(r.dir) }));
+	}
+
+	/** Forget everything recorded about a session's outputs: index, vectors, verdicts, activity. Returns the original files. */
+	purgeOutputSession(session: string): string[] {
 		return this.tx(() => {
 			const rows = this.stmt("SELECT rid, file FROM outputs WHERE session = ?").all(session) as Row[];
 			for (const r of rows) this.stmt("DELETE FROM outputs_fts WHERE rowid = ?").run(Number(r.rid));
 			this.stmt("DELETE FROM outputs WHERE session = ?").run(session);
+			this.stmt("DELETE FROM output_vecs WHERE session = ?").run(session);
+			this.stmt("DELETE FROM verdicts WHERE substr(tool_call_id, 1, ?) = ?").run(session.length + 1, `${session}:`);
+			this.stmt("DELETE FROM output_sessions WHERE session = ?").run(session);
 			return rows.map((r) => String(r.file));
 		});
+	}
+
+	/** When a scheduled job last ran (ms), and its stored data. */
+	getSchedule(key: string): { at: number; data: unknown } | undefined {
+		const r = this.stmt("SELECT at, data FROM schedule WHERE key = ?").get(key) as Row | undefined;
+		if (!r) return undefined;
+		let data: unknown;
+		try {
+			data = r.data ? JSON.parse(String(r.data)) : undefined;
+		} catch {
+			data = undefined;
+		}
+		return { at: Number(r.at), data };
+	}
+
+	setSchedule(key: string, at: number, data?: unknown): void {
+		this.stmt("INSERT INTO schedule(key, at, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at, data = excluded.data").run(key, at, data === undefined ? null : JSON.stringify(data));
+	}
+
+	/** BM25 search over one session's captured outputs, restricted to the given tool call ids. */
+	searchOutputs(session: string, ids: string[], match: string, limit: number): Array<{ toolCallId: string; score: number }> {
+		try {
+			const rows = this.stmt(
+				`SELECT o.tool_call_id AS id, bm25(outputs_fts, 2.0, 1.0) AS score FROM outputs_fts f JOIN outputs o ON o.rid = f.rowid
+				 WHERE outputs_fts MATCH ? AND o.session = ? AND o.tool_call_id IN (SELECT value FROM json_each(?)) ORDER BY score LIMIT ?`,
+			).all(match, session, JSON.stringify(ids), limit) as Array<{ id: string; score: number }>;
+			return rows.map((r) => ({ toolCallId: String(r.id), score: -Number(r.score) }));
+		} catch {
+			return [];
+		}
 	}
 
 	getVerdict(toolCallId: string): { goal: string; data: unknown; updated: number } | undefined {
@@ -1030,13 +1142,14 @@ export class RealctxDB {
 		});
 	}
 
-	addSuggestion(s: { projectRoot: string | undefined; session: string; toolCallId?: string; caption: string; content: string; paths?: string[]; cwd: string }): number {
+	addSuggestion(s: { projectRoot: string | undefined; session: string; toolCallId?: string; origin?: Suggestion["origin"]; caption: string; content: string; paths?: string[]; cwd: string }): number {
 		const dup = this.stmt("SELECT seq FROM suggestions WHERE project_root IS ? AND caption = ? AND content = ?").get(s.projectRoot ?? null, s.caption, s.content) as Row | undefined;
 		if (dup) return Number(dup.seq);
-		const r = this.stmt("INSERT INTO suggestions(project_root, session, tool_call_id, caption, content, paths, cwd, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+		const r = this.stmt("INSERT INTO suggestions(project_root, session, tool_call_id, origin, caption, content, paths, cwd, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
 			s.projectRoot ?? null,
 			s.session,
 			s.toolCallId ?? null,
+			s.origin ?? "output",
 			s.caption,
 			s.content,
 			s.paths && s.paths.length > 0 ? JSON.stringify(s.paths) : null,
@@ -1052,6 +1165,7 @@ export class RealctxDB {
 			seq: Number(r.seq),
 			session: String(r.session),
 			toolCallId: (r.tool_call_id as string | null) ?? undefined,
+			origin: r.origin === "user" ? "user" : "output",
 			caption: String(r.caption),
 			content: String(r.content),
 			paths: parseStringArray(r.paths),

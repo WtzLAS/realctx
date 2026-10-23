@@ -2,7 +2,7 @@
  * realctx — working context and long-term memory for Pi (design: docs/realctx-design-v2.md).
  *
  * Context layer: captures tool outputs, drops spent ones behind byte-stable placeholders,
- * restores them with real_expand. Memory layer (realmem): surprise-gated Markdown facts,
+ * restores them with realctx_expand. Memory layer: surprise-gated Markdown facts,
  * path notes, a frozen per-session system prompt section. Plus the /realctx command and a skill.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,12 +11,12 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatPlan, planSummary } from "../../src/consolidate.ts";
-import { MemoryEngine } from "../../src/engine.ts";
+import type { MemoryEngine } from "../../src/engine.ts";
+import { checkConsolidation, markConsolidated, pruneOutputsThrottled, storedPlan } from "../../src/jobs.ts";
+import { acquireEngine, announceParent, announcedParent, closeSession, openSession, openSessions, releaseEngine, sessionIdFromRef, setParent } from "../../src/shared.ts";
 import type { ScopeKind } from "../../src/files.ts";
 import { formatContextStatus, formatPathNotes, formatStatus } from "../../src/format.ts";
-import { canonicalEntryType } from "../../src/migrate.ts";
 import { type ContentPart, fmtTokens } from "../../src/outputs.ts";
-import type { Settings } from "../../src/config.ts";
 import { describeIgnoreProblem, SHARED_REL } from "../../src/gitignore.ts";
 import { displayPath } from "../../src/paths.ts";
 import { buildSessionPrompt, SNAPSHOT_ENTRY, SNAPSHOT_VERSION, type SessionSnapshot } from "../../src/prompt.ts";
@@ -58,9 +58,28 @@ export default function realctx(pi: ExtensionAPI) {
 	let draining = false;
 	const notes = new PathNoteState();
 
+	/** The memory layer is shared by every session of the process (one engine, one database). */
 	const getEngine = (): MemoryEngine => {
-		engine ??= new MemoryEngine();
+		engine ??= acquireEngine();
 		return engine;
+	};
+	let sessionId = "";
+	let unannounce: (() => void) | undefined;
+
+	/** Parent of the current session: fork/clone header, else the session that spawned this process. */
+	const familyOf = (ctx: ExtensionContext): { parent?: string; subagent: boolean } => {
+		let header: { parentSession?: string } | null | undefined;
+		try {
+			header = ctx.sessionManager.getHeader?.();
+		} catch {
+			header = undefined;
+		}
+		const self = ctx.sessionManager.getSessionId?.() ?? "";
+		const fromHeader = sessionIdFromRef(header?.parentSession);
+		if (fromHeader && fromHeader !== self) return { parent: fromHeader, subagent: false };
+		// Started while another realctx session was running (subagent, in-process or subprocess).
+		const announced = announcedParent(self);
+		return announced ? { parent: announced, subagent: true } : { subagent: false };
 	};
 
 	const refreshStatus = (ctx: ExtensionContext) => {
@@ -102,6 +121,28 @@ export default function realctx(pi: ExtensionAPI) {
 			});
 	};
 
+	/** Scheduled consolidation (suggest only): every consolidate.schedule.everyDays, at session start. */
+	const suggestConsolidation = async (ctx: ExtensionContext, e: MemoryEngine) => {
+		try {
+			const rw = rewriterFor(e, ctx);
+			const sug = await checkConsolidation(e, ctx.cwd, { rewriter: rw.rewriter, completer: rw.completer });
+			if (!sug || !ctx.hasUI) return;
+			const since = sug.sinceDays !== undefined ? ` (last ${sug.sinceDays} days ago)` : "";
+			if (sug.plan) {
+				const n = sug.plan.ops.length;
+				ctx.ui.notify(
+					n > 0
+						? `realctx: consolidation suggested${since}: ${planSummary(sug.plan)}. Review and apply with /realctx consolidate (nothing was changed).`
+						: `realctx: checked ${sug.memories} memories${since}; nothing to consolidate.`,
+					"info",
+				);
+			} else if (sug.error) ctx.ui.notify(`realctx: scheduled consolidation check failed (${sug.error}); run /realctx consolidate when the judge is reachable.`, "warning");
+			else ctx.ui.notify(`realctx: ${sug.memories} memories, not consolidated${since}. Consider running /realctx consolidate.`, "info");
+		} catch {
+			// best effort: the session goes on
+		}
+	};
+
 	const layer = new ContextLayer({
 		engine: () => getEngine(),
 		settings: () => getEngine().settings,
@@ -109,16 +150,10 @@ export default function realctx(pi: ExtensionAPI) {
 		notify: (ctx, text, level) => {
 			if (ctx.hasUI) ctx.ui.notify(text, level);
 		},
+		onCaptured: (ctx) => refreshStatus(ctx),
 	});
 
 	const contextStatus = (): string[] => formatContextStatus(layer.status());
-
-	let aliasMode: Settings["compat"]["aliases"] = "deferred";
-	try {
-		aliasMode = getEngine().settings.compat.aliases;
-	} catch {
-		// engine unavailable at load: keep the default
-	}
 
 	registerTools(pi, {
 		engine: () => getEngine(),
@@ -131,7 +166,6 @@ export default function realctx(pi: ExtensionAPI) {
 		},
 		context: () => layer,
 		contextStatus,
-		aliasMode: () => aliasMode,
 	});
 
 	pi.on("resources_discover", () => ({ skillPaths: [SKILLS_DIR] }));
@@ -140,7 +174,7 @@ export default function realctx(pi: ExtensionAPI) {
 		snapshot = undefined;
 		notes.reset(ctx.sessionManager.getBranch());
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && canonicalEntryType(entry.customType) === SNAPSHOT_ENTRY) {
+			if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY) {
 				const data = entry.data as SessionSnapshot | undefined;
 				if (typeof data?.v === "number" && data.v >= 1 && typeof data.prompt === "string") snapshot = data; // older snapshots stay valid: never change a running session's prompt
 			}
@@ -159,8 +193,9 @@ export default function realctx(pi: ExtensionAPI) {
 		} catch {
 			conflicts = [];
 		}
+		const family = familyOf(ctx);
 		try {
-			layer.reset(ctx, conflicts);
+			layer.reset(ctx, conflicts, family);
 		} catch (err) {
 			layer.disabledReason = `failed to start: ${err instanceof Error ? err.message : String(err)}`;
 		}
@@ -190,9 +225,23 @@ export default function realctx(pi: ExtensionAPI) {
 		} catch (err) {
 			if (ctx.hasUI) ctx.ui.notify(`realctx sync failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 		}
-		if (!e.semifClient.configured && ctx.hasUI) {
-			ctx.ui.notify("realctx: no SemIf judge endpoint is set, so new memories are only queued. Configure it (and the embedding API) in /realctx settings.", "warning");
+		sessionId = ctx.sessionManager.getSessionId?.() ?? "";
+		if (sessionId) {
+			openSession(sessionId);
+			if (family.parent) setParent(sessionId, family.parent);
+			// Subagents started from this session (child processes, in-process SDK sessions) see it as their parent.
+			unannounce?.();
+			unannounce = announceParent(sessionId);
 		}
+		if (!e.semifClient.configured && !family.subagent && ctx.hasUI) {
+			ctx.ui.notify(
+				"realctx: no judge endpoint is set: memories use the deterministic gate (near duplicates reinforce, the rest is added) and the context layer drops by rules only. Configure the judge (and the embedding API) in /realctx settings.",
+				"info",
+			);
+		}
+		// Stored originals of sessions inactive past context.retentionDays are deleted (shared, throttled).
+		void pruneOutputsThrottled(e, openSessions()).catch(() => {});
+		if (!family.subagent) void suggestConsolidation(ctx, e);
 		try {
 			e.resetRepoCache();
 			const project = e.scopes(ctx.cwd).project;
@@ -283,7 +332,7 @@ export default function realctx(pi: ExtensionAPI) {
 	pi.on("tool_result", (event, ctx) => {
 		if (!engine) return;
 		const e = engine;
-		const own = event.toolName.startsWith("real_") || event.toolName.startsWith("realmem_");
+		const own = event.toolName.startsWith("realctx_");
 		const original = event.content as ContentPart[];
 		let noteIds: string[] = [];
 		let appended: string | undefined;
@@ -315,7 +364,7 @@ export default function realctx(pi: ExtensionAPI) {
 		}
 		// The original is stored without path notes: they do not count towards its size (§13.3).
 		layer.capture({ toolCallId: event.toolCallId, toolName: event.toolName, input: event.input, content: original, isError: event.isError }, touched, noteIds, ctx.cwd);
-		if (event.toolName === "real_expand") layer.linkExpansion(event.toolCallId, event.input.ids);
+		if (event.toolName === "realctx_expand") layer.linkExpansion(event.toolCallId, event.input.ids);
 		if (!appended) return;
 		return { content: [...event.content, { type: "text" as const, text: appended }] };
 	});
@@ -330,6 +379,8 @@ export default function realctx(pi: ExtensionAPI) {
 		// SAFETY: MessageView only names optional fields of AgentMessage; transform returns the same
 		// array (mutated in place or with whole tool-result messages replaced by same-role copies).
 		const out = layer.transform(event.messages as unknown as MessageView[], ctx);
+		// SAFETY: `out` is `event.messages` itself (or the same array with tool results swapped for
+		// same-shape copies), so it is still an AgentMessage[] at runtime.
 		return out ? { messages: out as unknown as typeof event.messages } : undefined;
 	});
 
@@ -348,20 +399,27 @@ export default function realctx(pi: ExtensionAPI) {
 		const draft = notes.flush();
 		if (draft) entries.push(draft as (typeof entries)[number]);
 		layer.judgeInBackground(ctx);
+		layer.captureUserInBackground(ctx);
 		refreshStatus(ctx);
 		return entries.length > 0 ? { entries } : undefined;
 	});
 
+	// Messages sent by extensions (not typed by the user) are never captured as user facts.
+	pi.on("input", (event, ctx) => {
+		if (event.source === "extension") layer.skipNextUser(event.text);
+		void ctx;
+	});
+
 	pi.on("session_tree", (_event, ctx) => {
 		notes.reset(ctx.sessionManager.getBranch());
-		layer.reset(ctx, layer.conflicts);
+		layer.reset(ctx, layer.conflicts, familyOf(ctx));
 	});
 
 	// After a compaction the summarised tool results (and their path notes) are gone:
 	// notes shown before the first kept entry may be shown again.
 	pi.on("session_compact", (_event, ctx) => {
 		notes.reset(ctx.sessionManager.getBranch(), { keepUnflushed: true });
-		layer.reset(ctx, layer.conflicts);
+		layer.reset(ctx, layer.conflicts, familyOf(ctx));
 	});
 
 	// Calls to other memory systems' tools are refused, even when they stay active.
@@ -370,15 +428,21 @@ export default function realctx(pi: ExtensionAPI) {
 		if (!engine.settings.prompt.hideTools.includes(event.toolName)) return;
 		return {
 			block: true,
-			reason: `${event.toolName} is disabled: realctx is the only long-term memory and context manager. Use real_recall / real_remember / real_expand instead.`,
+			reason: `${event.toolName} is disabled: realctx is the only long-term memory and context manager. Use realctx_recall / realctx_remember / realctx_expand instead.`,
 		};
 	});
 
 	pi.on("session_shutdown", () => {
 		pendingImport = undefined;
 		snapshot = undefined;
+		if (sessionId) {
+			closeSession(sessionId);
+			unannounce?.();
+			unannounce = undefined;
+			sessionId = "";
+		}
 		if (engine) {
-			engine.close();
+			releaseEngine(engine);
 			engine = undefined;
 		}
 	});
@@ -397,7 +461,7 @@ export default function realctx(pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			const ok = await ctx.ui.confirm(
 				"Import context files into realctx?",
-				`${todo.map((f) => `• ${f.path}`).join("\n")}\n\nThe agent will split them into facts and store each with real_remember. The files themselves are not modified.`,
+				`${todo.map((f) => `• ${f.path}`).join("\n")}\n\nThe agent will split them into facts and store each with realctx_remember. The files themselves are not modified.`,
 			);
 			if (!ok) return;
 		}
@@ -412,7 +476,7 @@ export default function realctx(pi: ExtensionAPI) {
 		pi.sendUserMessage(
 			[
 				"Import these instruction files into realctx long-term memory.",
-				"Split them into self-contained facts (one topic each: setup, build/test commands, architecture, conventions, release steps, preferences, pitfalls) and call real_remember once per fact with a specific caption and complete content (keep commands and paths verbatim), user_requested=true, and the scope given by default_scope.",
+				"Split them into self-contained facts (one topic each: setup, build/test commands, architecture, conventions, release steps, preferences, pitfalls) and call realctx_remember once per fact with a specific caption and complete content (keep commands and paths verbatim), user_requested=true, and the scope given by default_scope.",
 				"Skip generic advice that any competent agent follows anyway, and anything that only restates how to use other memory systems. Do not change any files. When done, reply with a short summary of what was stored.",
 				"",
 				body,
@@ -645,7 +709,6 @@ export default function realctx(pi: ExtensionAPI) {
 		},
 	};
 	pi.registerCommand("realctx", realctxCommand);
-	pi.registerCommand("realmem", { ...realctxCommand, description: "alias of /realctx (realmem was renamed to realctx)" });
 }
 
 /**
@@ -660,6 +723,27 @@ async function consolidate(ctx: ExtensionCommandContext, e: MemoryEngine, args: 
 	if (unknown.length > 0) {
 		ctx.ui.notify(`realctx: unknown consolidate argument(s): ${unknown.join(", ")}. Usage: /realctx consolidate [global] [shared] [personal] [--no-paths]`, "warning");
 		return;
+	}
+	// A plan made by the scheduled background check (whole visible scope) can be applied as is.
+	const ready = scopes.length === 0 && !words.includes("--no-paths") ? storedPlan(e, ctx.cwd) : undefined;
+	if (ready && ready.plan.ops.length > 0 && ctx.hasUI) {
+		const age = Math.max(0, Math.round((Date.now() - ready.at) / 3_600_000));
+		const use = await ctx.ui.confirm(
+			`Apply the scheduled plan from ${age} h ago? (${planSummary(ready.plan)})`,
+			[...formatPlan(ready.plan), "", "No = plan again now."].join("\n"),
+		);
+		if (use) {
+			const r = await runWithLoader(ctx, "writing", () => e.applyConsolidation(ctx.cwd, ready.plan));
+			if (r.cancelled) return;
+			if (r.error || !r.value) {
+				ctx.ui.notify(`realctx: ${r.error instanceof Error ? r.error.message : String(r.error)}`, "error");
+				return;
+			}
+			markConsolidated(e, ctx.cwd);
+			const d = r.value;
+			ctx.ui.notify(`realctx: consolidated: updated ${d.updated}, deleted ${d.deleted}${d.stale.length ? `; skipped ${d.stale.length} changed since the plan` : ""}`, "info");
+			return;
+		}
 	}
 	const rw = rewriterFor(e, ctx);
 	if (rw.error) ctx.ui.notify(`realctx: ${rw.error}; merges fall back to appending and paths are not revised.`, "warning");
@@ -683,6 +767,7 @@ async function consolidate(ctx: ExtensionCommandContext, e: MemoryEngine, args: 
 		return;
 	}
 	const { plan, done } = r.value;
+	if (scopes.length === 0) markConsolidated(e, ctx.cwd);
 	const lines = formatPlan(plan);
 	const head = done
 		? `consolidated: updated ${done.updated}, deleted ${done.deleted}${done.stale.length ? `; skipped ${done.stale.length} changed meanwhile` : ""} (${planSummary(plan)})`

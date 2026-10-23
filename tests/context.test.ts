@@ -1,6 +1,6 @@
 /**
  * Context layer end to end through the extension hooks: capture, rule drops, judge drops
- * (shadow vs live), apply timing, byte-stable placeholders, real_expand, persistence,
+ * (shadow vs live), apply timing, byte-stable placeholders, realctx_expand, persistence,
  * path-note survival, compaction cancel, conflicts.
  */
 import assert from "node:assert/strict";
@@ -43,7 +43,7 @@ before(async () => {
 			if (isDrop) judgeCalls++;
 			for (const [k, q] of Object.entries<any>(body.questions)) {
 				if (q.type === "noul") {
-					const v = k === "still_needed" ? stillNeeded : k === "unique_info" ? 0.05 : k === "durable_fact" ? 0.1 : k === "unsafe" ? 0.01 : 0.95;
+					const v = k === "still_needed" ? stillNeeded : k === "unique_info" ? 0.05 : k === "durable_fact" ? 0.1 : k === "durable_user_fact" ? userFact : k === "unsafe" ? 0.01 : 0.95;
 					answers[k] = { type: "noul", noul: v };
 				} else if (q.type === "score") answers[k] = { type: "score", score: 1, legend: {}, probabilities: {}, confidence: 0.9 };
 				else {
@@ -92,7 +92,13 @@ function writeSettings(extra: Record<string, unknown>) {
 
 const big = (tag: string) => Array.from({ length: 200 }, (_, i) => `${tag} line ${i} with some words`).join("\n");
 
-async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path: string } }> } = {}) {
+/** Answers of the mock rewrite model (fact extraction, summaries). */
+let completeText = '{"facts": []}';
+let completeCalls = 0;
+/** P(durable_user_fact) the mock judge answers. */
+let userFact = 0.9;
+
+async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path: string } }>; sessionId?: string; parentSession?: string } = {}) {
 	const { default: realctx } = await import("../extensions/realctx/index.ts");
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
@@ -120,14 +126,20 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path
 		for (const h of handlers.get(e) ?? []) last = (await h(ev, ctx)) ?? last;
 		return last;
 	};
-	const sessionId = `s-${Math.random().toString(36).slice(2)}`;
+	const sessionId = opts.sessionId ?? `s-${Math.random().toString(36).slice(2)}`;
 	const ctx: any = {
 		cwd: proj,
 		hasUI: true,
 		mode: "print",
 		ui: { setStatus() {}, notify: (t: string) => notices.push(t) },
-		sessionManager: { getBranch: () => entries, getSessionId: () => sessionId },
-		modelRegistry: { find: () => undefined, complete: async () => ({}) },
+		sessionManager: { getBranch: () => entries, getSessionId: () => sessionId, getHeader: () => ({ type: "session", id: sessionId, parentSession: opts.parentSession }) },
+		modelRegistry: {
+			find: () => undefined,
+			complete: async () => {
+				completeCalls++;
+				return { stopReason: "stop", content: [{ type: "text", text: completeText }], usage: {} };
+			},
+		},
 		model: { provider: "p", id: "m", contextWindow: 200_000, maxTokens: 20_000 },
 		getSystemPrompt: () => "",
 	};
@@ -160,10 +172,11 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path
 			.join("\n") as string;
 	const settle = () => new Promise((r) => setTimeout(r, 150));
 	await emit("session_start", { type: "session_start", reason: "startup" }, ctx);
-	return { tools, commands, emit, ctx, entries, turn, user, request, resultText, settle, notices, sessionId };
+	const shutdown = () => emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+	return { tools, commands, emit, ctx, entries, turn, user, request, resultText, settle, notices, sessionId, shutdown };
 }
 
-test("rule drops apply only when the cache is cold, render byte-stable placeholders, and restore with real_expand", async () => {
+test("rule drops apply only when the cache is cold, render byte-stable placeholders, and restore with realctx_expand", async () => {
 	writeSettings({});
 	const h = await harness();
 	h.user("refactor a.ts");
@@ -177,7 +190,7 @@ test("rule drops apply only when the cache is cold, render byte-stable placehold
 	// The last response is old (cache cold): the queued re-read drop applies now.
 	const m1 = await h.request();
 	const p = h.resultText(m1, r1);
-	assert.match(p, /^\[#1 dropped · read src\/a\.ts · [\d.]+k tok · re-read in #3 · real_expand\(1\)\]$/);
+	assert.match(p, /^\[#1 dropped · read src\/a\.ts · [\d.]+k tok · re-read in #3 · realctx_expand\(1\)\]$/);
 	assert.match(h.resultText(m1, r2), /second read of a line 0/, "the newer read stays");
 	// Byte-stable across requests.
 	const m2 = await h.request();
@@ -188,24 +201,24 @@ test("rule drops apply only when the cache is cold, render byte-stable placehold
 	await h.turn("bash", { command: "echo 4" }, big("z"));
 	assert.ok(h.entries.some((e) => e.customType === "realctx-drops" && e.data.drops?.some((d: any) => d.ord === 1)));
 
-	// real_expand returns the original as a new result, with a staleness hint when the file changed.
+	// realctx_expand returns the original as a new result, with a staleness hint when the file changed.
 	writeFileSync(join(proj, "src", "a.ts"), "export const a = 2;\n");
-	const ex = await h.tools.get("real_expand").execute("x1", { ids: [1] }, undefined, undefined, h.ctx);
+	const ex = await h.tools.get("realctx_expand").execute("x1", { ids: [1] }, undefined, undefined, h.ctx);
 	assert.match(ex.content[0].text, /^#1 · read src\/a\.ts · turn 1/);
 	assert.match(ex.content[0].text, /file edited since turn 1; re-read for the current version/);
 	assert.match(ex.content[0].text, /first read of a line 0/);
 	assert.ok(ex.content[0].text.length < big("first read of a").length + 400);
 	// A repeat within repin_turns points to the first expansion.
-	const again = await h.tools.get("real_expand").execute("x2", { ids: [1] }, undefined, undefined, h.ctx);
+	const again = await h.tools.get("realctx_expand").execute("x2", { ids: [1] }, undefined, undefined, h.ctx);
 	assert.match(again.content[0].text, /already restored/);
 	// Partial views always work.
-	const part = await h.tools.get("real_expand").execute("x3", { ids: [1], grep: "line 150 " }, undefined, undefined, h.ctx);
+	const part = await h.tools.get("realctx_expand").execute("x3", { ids: [1], grep: "line 150 " }, undefined, undefined, h.ctx);
 	assert.match(part.content[0].text, /151: first read of a line 150 with some words/);
-	const missing = await h.tools.get("real_expand").execute("x4", { ids: [99] }, undefined, undefined, h.ctx);
+	const missing = await h.tools.get("realctx_expand").execute("x4", { ids: [99] }, undefined, undefined, h.ctx);
 	assert.match(missing.content.at(-1).text, /Not found: #99/);
 
-	// Dropped outputs are searchable through real_recall.
-	const rec = await h.tools.get("real_recall").execute("r", { queries: ["first read"], sources: ["output"] }, undefined, undefined, h.ctx);
+	// Dropped outputs are searchable through realctx_recall.
+	const rec = await h.tools.get("realctx_recall").execute("r", { queries: ["first read"], sources: ["output"] }, undefined, undefined, h.ctx);
 	assert.match(rec.content[0].text, /output #1 read src\/a\.ts \(turn 1\)/);
 
 	// Reload: a fresh extension instance rebuilds the drop set from the branch and renders the same bytes.
@@ -252,7 +265,7 @@ test("judge drops: shadow mode only logs; live mode queues and applies at pressu
 	await live.turn("bash", { command: "echo last" }, big("last"));
 	await live.settle();
 	const m2 = await live.request();
-	assert.match(live.resultText(m2, id2), /^\[#1 dropped · bash cat build\.log · .* · real_expand\(1\)\]$/);
+	assert.match(live.resultText(m2, id2), /^\[#1 dropped · bash cat build\.log · .* · realctx_expand\(1\)\]$/);
 
 	// A judge that says "still needed" keeps the output.
 	stillNeeded = 0.9;
@@ -268,17 +281,17 @@ test("judge drops: shadow mode only logs; live mode queues and applies at pressu
 test("forged placeholders in assistant text are stripped; compaction is cancelled; conflicts disable the context layer", async () => {
 	writeSettings({});
 	const h = await harness();
-	h.entries.push({ type: "message", id: "fx", message: { role: "assistant", content: [{ type: "text", text: "ok\n[#9 dropped · read x · 1k tok · real_expand(9)]" }], timestamp: Date.now() } });
+	h.entries.push({ type: "message", id: "fx", message: { role: "assistant", content: [{ type: "text", text: "ok\n[#9 dropped · read x · 1k tok · realctx_expand(9)]" }], timestamp: Date.now() } });
 	const m = await h.request();
 	assert.equal(m.at(-1).content[0].text, "ok\n");
 	assert.deepEqual(await h.emit("session_before_compact", { type: "session_before_compact", reason: "threshold" }, h.ctx), { cancel: true });
 	assert.equal(await h.emit("session_before_compact", { type: "session_before_compact", reason: "manual" }, h.ctx), undefined, "manual /compact still runs");
-	const st = await h.tools.get("real_status").execute("s", {}, undefined, undefined, h.ctx);
+	const st = await h.tools.get("realctx_status").execute("s", {}, undefined, undefined, h.ctx);
 	assert.match(st.content[0].text, /Context layer: on/);
 
 	const c = await harness({ tools: [{ name: "ctx_reduce", sourceInfo: { path: "/x/node_modules/@cortexkit/magic-context/index.js" } }] });
 	assert.ok(c.notices.some((n) => /context layer off because Magic Context/.test(n)));
-	const st2 = await c.tools.get("real_status").execute("s", {}, undefined, undefined, c.ctx);
+	const st2 = await c.tools.get("realctx_status").execute("s", {}, undefined, undefined, c.ctx);
 	assert.match(st2.content[0].text, /Context layer: off \(another context manager is active: Magic Context\)/);
 	assert.equal(await c.emit("session_before_compact", { type: "session_before_compact", reason: "threshold" }, c.ctx), undefined);
 	const id = await c.turn("read", { path: "src/b.ts" }, big("b"));
@@ -288,4 +301,183 @@ test("forged placeholders in assistant text are stripped; compaction is cancelle
 	// A generic tool name alone (e.g. some other "prune") is not a conflict.
 	const g = await harness({ tools: [{ name: "prune", sourceInfo: { path: "/x/my-tools/index.js" } }] });
 	assert.ok(!g.notices.some((n) => /context layer off/.test(n)));
+});
+
+test("realctx_recall finds dropped outputs by meaning (vector) and never searches other sessions", async () => {
+	writeSettings({});
+	const a = await harness();
+	a.user("look at the logs");
+	const r1 = await a.turn("read", { path: "src/a.ts" }, big("zebra unicorn telemetry"));
+	await a.turn("read", { path: "src/a.ts" }, big("second"));
+	for (let i = 0; i < 3; i++) await a.turn("bash", { command: `echo ${i}` }, big("f"));
+	await a.request();
+	await a.settle();
+	assert.match(a.resultText(await a.request(), r1), /^\[#1 dropped/);
+	const rec = await a.tools.get("realctx_recall").execute("r", { queries: ["zebra"], sources: ["output"] }, undefined, undefined, a.ctx);
+	assert.match(rec.content.at(-1).text, /output #1 read src\/a\.ts/);
+	// No shared word with the output: only the vector search (mock embedder) can find it.
+	const vec = await a.tools.get("realctx_recall").execute("r", { queries: ["qqqqxxxx"], sources: ["output"] }, undefined, undefined, a.ctx);
+	assert.match(vec.content.at(-1).text, /output #1 read src\/a\.ts/);
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, embedDropped: false } });
+	const noVec = await a.tools.get("realctx_recall").execute("r", { queries: ["qqqqxxxx"], sources: ["output"] }, undefined, undefined, a.ctx);
+	assert.ok(!/output #1/.test(noVec.content.map((c: any) => c.text).join("\n")), "keyword-only without vectors");
+	writeSettings({});
+
+	// Another session with the same tool call ids sees none of a's outputs.
+	const b = await harness();
+	b.user("other work");
+	const rb = await b.turn("read", { path: "src/b.ts" }, big("other session"));
+	await b.turn("read", { path: "src/b.ts" }, big("other session again"));
+	for (let i = 0; i < 3; i++) await b.turn("bash", { command: `echo ${i}` }, big("g"));
+	await b.request();
+	assert.match(b.resultText(await b.request(), rb), /^\[#1 dropped/);
+	const recB = await b.tools.get("realctx_recall").execute("r", { queries: ["zebra unicorn telemetry"], sources: ["output"] }, undefined, undefined, b.ctx);
+	assert.ok(!/zebra|src\/a\.ts/.test(recB.content.map((c: any) => c.text).join("\n")), "no hits from session a");
+	await a.shutdown();
+	await b.shutdown();
+});
+
+test("output retention deletes originals of inactive sessions; open sessions are kept", async () => {
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, retentionDays: 7 } });
+	const old = await harness();
+	await old.turn("bash", { command: "cat x" }, big("old"));
+	await old.shutdown();
+	const { MemoryEngine } = await import("../src/engine.ts");
+	const { pruneOutputs } = await import("../src/jobs.ts");
+	const e = new MemoryEngine();
+	try {
+		// Pretend the old session was last active 8 days ago.
+		e.db.touchOutputSession(old.sessionId, "p", join(base, "sessions", "gone"));
+		const db: any = e.db;
+		db.db.prepare("UPDATE output_sessions SET last_active = ? WHERE session = ?").run(Date.now() - 8 * 86_400_000, old.sessionId);
+		assert.ok(e.db.getOutputMeta(old.sessionId, old.entries.find((x: any) => x.message?.role === "toolResult").message.toolCallId));
+		const live = await harness();
+		await live.turn("bash", { command: "cat y" }, big("live"));
+		db.db.prepare("UPDATE output_sessions SET last_active = ? WHERE session = ?").run(Date.now() - 8 * 86_400_000, live.sessionId);
+		const r = pruneOutputs(e, [live.sessionId]);
+		assert.equal(r.sessions, 1);
+		assert.equal(e.db.getOutputMeta(old.sessionId, old.entries.find((x: any) => x.message?.role === "toolResult").message.toolCallId), undefined);
+		assert.ok(e.db.getOutputMeta(live.sessionId, live.entries.find((x: any) => x.message?.role === "toolResult").message.toolCallId), "open session kept");
+		await live.shutdown();
+	} finally {
+		e.close();
+	}
+});
+
+test("user messages: judged facts are captured as suggestions; acknowledgements, extension input and subagents are not", async () => {
+	// Earlier tests leave sessions open (no session_shutdown): forget their parent announcement.
+	delete process.env.REALCTX_PARENT_SESSION;
+	writeSettings({ capture: { mode: "suggest", userMessages: true, pDurable: 0.7 } });
+	completeText = '{"facts": [{"caption": "Use pnpm, not npm", "content": "This repo uses pnpm; never run npm install."}]}';
+	completeCalls = 0;
+	userFact = 0.9;
+	const h = await harness();
+	h.user("From now on always use pnpm instead of npm in this repo, please.");
+	await h.turn("bash", { command: "echo hi" }, "hi");
+	await h.settle();
+	const { MemoryEngine } = await import("../src/engine.ts");
+	const e = new MemoryEngine();
+	try {
+		const root = e.scopes(proj).project?.root;
+		const list = e.db.listSuggestions(root);
+		const s = list.find((x) => x.caption === "Use pnpm, not npm");
+		assert.ok(s, "suggestion queued");
+		assert.equal(s?.origin, "user");
+		const calls = completeCalls;
+		// Acknowledgement: not even judged.
+		h.user("ok thanks");
+		await h.turn("bash", { command: "echo 2" }, "2");
+		// Extension-sent message: skipped.
+		await h.emit("input", { type: "input", text: "Please always summarize the build log for me in detail.", source: "extension" }, h.ctx);
+		h.user("Please always summarize the build log for me in detail.");
+		await h.turn("bash", { command: "echo 3" }, "3");
+		await h.settle();
+		assert.equal(completeCalls, calls, "no extraction for ack or extension input");
+		// The judge says "one-off": nothing extracted.
+		userFact = 0.1;
+		h.user("Now rename the helper in src/a.ts to parseThing and update callers.");
+		await h.turn("bash", { command: "echo 4" }, "4");
+		await h.settle();
+		assert.equal(completeCalls, calls);
+		await h.shutdown();
+
+		// A subagent (started while another session announces itself as parent) never captures its
+		// "user" messages: they are the parent agent's prompts.
+		userFact = 0.9;
+		const top = await harness();
+		const sub = await harness();
+		const st = (await sub.tools.get("realctx_status").execute("s", {}, undefined, undefined, sub.ctx)).details.context;
+		assert.equal(st.subagent, true);
+		assert.equal(st.parent, top.sessionId);
+		const before = completeCalls;
+		sub.user("Always run the integration tests with --runInBand in this repository.");
+		await sub.turn("bash", { command: "echo s" }, "s");
+		await sub.settle();
+		assert.equal(completeCalls, before, "subagent prompts are not captured");
+		await sub.shutdown();
+		await top.shutdown();
+		const after = await harness();
+		assert.equal((await after.tools.get("realctx_status").execute("s", {}, undefined, undefined, after.ctx)).details.context.subagent, false, "parent announcement removed on shutdown");
+		await after.shutdown();
+	} finally {
+		e.close();
+		userFact = 0.9;
+		completeText = '{"facts": []}';
+	}
+});
+
+test("child sessions: own context layer (copied originals, separate drops); memory layer shared", async () => {
+	writeSettings({});
+	const parent = await harness();
+	parent.user("work");
+	const r1 = await parent.turn("read", { path: "src/a.ts" }, big("parent read"));
+	await parent.turn("read", { path: "src/a.ts" }, big("parent read 2"));
+	for (let i = 0; i < 3; i++) await parent.turn("bash", { command: `echo ${i}` }, big("f"));
+	await parent.request();
+	// Fork: the child starts with the parent's branch (same entries) and a parentSession header.
+	const childId = `child-${Math.random().toString(36).slice(2)}`;
+	const child = await harness({ sessionId: childId, parentSession: `/x/sessions/2026-01-01T00-00-00_${parent.sessionId}.jsonl` });
+	for (const e of parent.entries) child.entries.push(structuredClone(e));
+	await child.emit("session_start", { type: "session_start", reason: "fork" }, child.ctx);
+	const st = (await child.tools.get("realctx_status").execute("s", {}, undefined, undefined, child.ctx)).details.context;
+	assert.equal(st.parent, parent.sessionId);
+	// The child's placeholder is byte-identical and restorable from its own copy.
+	assert.equal(child.resultText(await child.request(), r1), parent.resultText(await parent.request(), r1));
+	const ex = await child.tools.get("realctx_expand").execute("x", { ids: [1] }, undefined, undefined, child.ctx);
+	assert.match(ex.content[0].text, /parent read line 0/);
+	const ids = child.entries.filter((e: any) => e.customType === "realctx-ids").flatMap((e: any) => e.data.metas);
+	await child.turn("bash", { command: "echo c" }, "c");
+	const adopted = child.entries.filter((e: any) => e.customType === "realctx-ids").flatMap((e: any) => e.data.metas);
+	assert.ok(adopted.length > ids.length && adopted.some((m: any) => m.file.includes(childId)), "child owns copies of the originals");
+	// Memory layer is shared: a memory written in the parent is visible in the child.
+	const rem = await parent.tools.get("realctx_remember").execute("m", { caption: "Shared fact for children", content: "Parent and child share memories through one engine." }, undefined, undefined, parent.ctx);
+	assert.match(rem.content[0].text, /remembered|reinforced|added/i);
+	const rec = await child.tools.get("realctx_recall").execute("r", { queries: ["Shared fact for children"], sources: ["memory"] }, undefined, undefined, child.ctx);
+	assert.match(rec.content[0].text, /Shared fact for children/);
+	await child.shutdown();
+	await parent.shutdown();
+});
+
+test("scheduled consolidation: suggested after everyDays, never applied without the user", async () => {
+	writeSettings({ consolidate: { schedule: { mode: "remind", everyDays: 14, minMemories: 1 } } });
+	const { MemoryEngine } = await import("../src/engine.ts");
+	const { checkConsolidation, consolidationKey } = await import("../src/jobs.ts");
+	const e = new MemoryEngine();
+	try {
+		await e.remember({ caption: "Fact for schedule", content: "Something durable about the build.", source: "agent" }, { cwd: proj });
+		assert.equal(await checkConsolidation(e, proj), undefined, "first sight starts the clock");
+		assert.equal(await checkConsolidation(e, proj), undefined, "not due yet");
+		const { key } = consolidationKey(e, proj);
+		e.db.setSchedule(key, Date.now() - 15 * 86_400_000);
+		const before = e.db.count(e.scopes(proj).stores.map((s) => s.id));
+		const sug = await checkConsolidation(e, proj);
+		assert.ok(sug && sug.sinceDays === 15 && !sug.plan, "remind mode suggests without planning");
+		assert.equal(await checkConsolidation(e, proj), undefined, "suggested once per period");
+		assert.equal(e.db.count(e.scopes(proj).stores.map((s) => s.id)), before, "nothing written");
+	} finally {
+		e.close();
+	}
+	const h = await harness();
+	h.notices.length = 0;
+	await h.shutdown();
 });

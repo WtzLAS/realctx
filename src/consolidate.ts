@@ -194,7 +194,7 @@ const pct = (p: number | undefined) => (p === undefined ? "n/a" : `${Math.round(
 /** Turn the review answers into one action (forget > covered > supersede > merge > revise > keep). */
 export function decideReview(
 	s: ReviewSignals,
-	t: Pick<Settings["thresholds"], "covered" | "conflict" | "merge"> & Settings["consolidate"],
+	t: Pick<Settings["thresholds"], "covered" | "conflict" | "merge"> & Pick<Settings["consolidate"], "forget" | "minImportance" | "revise">,
 	targetOk: (id: string) => boolean,
 ): ReviewAction {
 	if (s.forget !== undefined && s.forget >= t.forget) return { action: "forget", reason: `judge: obsolete or trivial (P=${pct(s.forget)})` };

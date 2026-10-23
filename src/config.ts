@@ -70,7 +70,7 @@ export interface Settings {
 		cacheTtl: string;
 		/** Per-model cache lifetime overrides: `provider/model` or `model` → duration. */
 		cacheTtlByModel: Record<string, string>;
-		/** Max tokens one real_expand call returns. */
+		/** Max tokens one realctx_expand call returns. */
 		expandMaxTokens: number;
 		/** Expanded items stay pinned for this many turns. */
 		repinTurns: number;
@@ -80,6 +80,10 @@ export interface Settings {
 		conflictTools: string[];
 		/** Run the context layer even when a foreign context manager is detected. */
 		ignoreConflicts: boolean;
+		/** Days to keep stored originals of sessions without activity (0 = keep forever). */
+		retentionDays: number;
+		/** Embed dropped outputs so realctx_recall finds them by meaning (needs the embedding endpoint). */
+		embedDropped: boolean;
 	};
 	/** Drop-time capture of durable facts (§13.1). */
 	capture: {
@@ -90,12 +94,12 @@ export interface Settings {
 		minImportance: number;
 		/** Minimum P(durable) for captured facts. */
 		minDurable: number;
-		/** Extractions per session and hour. */
+		/** Extractions per session and hour (outputs and user messages together). */
 		maxPerSessionHour: number;
-	};
-	compat: {
-		/** realmem_* tool aliases (one release): `deferred` = callable but not declared, `active` = declared too, `off`. */
-		aliases: "deferred" | "active" | "off";
+		/** Also capture durable facts the user states (preferences, corrections, conventions). */
+		userMessages: boolean;
+		/** User messages shorter than this (characters) are not considered. */
+		userMinChars: number;
 	};
 	thresholds: {
 		/** Minimum expected importance (0..3 score) to Add or Merge. */
@@ -177,6 +181,15 @@ export interface Settings {
 		pathBatch: number;
 		/** Max lines of the file tree sent to the model. */
 		treeLines: number;
+		/** Scheduled, suggest-only consolidation: never writes without the user. */
+		schedule: {
+			/** `plan` = dry-run in the background and suggest the result; `remind` = only suggest running it; `off`. */
+			mode: "plan" | "remind" | "off";
+			/** Days between suggestions for the same stores. */
+			everyDays: number;
+			/** Stores with fewer memories are not suggested. */
+			minMemories: number;
+		};
 	};
 }
 
@@ -224,6 +237,8 @@ export const DEFAULT_SETTINGS: Settings = {
 		cancelCompaction: true,
 		conflictTools: [],
 		ignoreConflicts: false,
+		retentionDays: 7,
+		embedDropped: true,
 	},
 	capture: {
 		mode: "suggest",
@@ -231,9 +246,8 @@ export const DEFAULT_SETTINGS: Settings = {
 		minImportance: 1.5,
 		minDurable: 0.7,
 		maxPerSessionHour: 6,
-	},
-	compat: {
-		aliases: "deferred",
+		userMessages: true,
+		userMinChars: 24,
 	},
 	thresholds: {
 		minImportance: 0.8,
@@ -282,6 +296,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		paths: true,
 		pathBatch: 20,
 		treeLines: 400,
+		schedule: { mode: "plan", everyDays: 14, minMemories: 20 },
 	},
 };
 
@@ -332,7 +347,7 @@ function mergeInto<T>(defaults: T, patch: unknown): T {
 
 const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo);
 
-/** The design doc names the judge connection `judge.{endpoint,model,key,timeout_ms,max_questions}`; realmem called it `semif`. */
+/** The design doc names the judge connection `judge.{endpoint,model,key,timeout_ms,max_questions}` (stored as `semif`). */
 type RawConfig = Record<string, unknown>;
 
 function liftJudgeConnection(input: unknown): RawConfig {
@@ -385,7 +400,6 @@ export function normalizeSettings(input: unknown): Settings {
 	s.capture.minDurable = clamp(s.capture.minDurable, 0, 1);
 	s.capture.minImportance = clamp(s.capture.minImportance, 0, 3);
 	s.capture.maxPerSessionHour = Math.round(clamp(s.capture.maxPerSessionHour, 0, 1000));
-	if (!["deferred", "active", "off"].includes(s.compat.aliases)) s.compat.aliases = "deferred";
 	s.embedding.dimensions = Math.round(clamp(s.embedding.dimensions, 32, 4096));
 	s.embedding.batchSize = Math.round(clamp(s.embedding.batchSize, 1, 2048));
 	s.embedding.timeoutMs = Math.round(clamp(s.embedding.timeoutMs, 1000, 600_000));
@@ -413,6 +427,13 @@ export function normalizeSettings(input: unknown): Settings {
 	s.consolidate.neighbors = Math.round(clamp(s.consolidate.neighbors, 1, 254));
 	s.consolidate.pathBatch = Math.round(clamp(s.consolidate.pathBatch, 1, 200));
 	s.consolidate.treeLines = Math.round(clamp(s.consolidate.treeLines, 20, 5000));
+	if (!["plan", "remind", "off"].includes(s.consolidate.schedule.mode)) s.consolidate.schedule.mode = "plan";
+	s.consolidate.schedule.everyDays = clamp(s.consolidate.schedule.everyDays, 1, 365);
+	s.consolidate.schedule.minMemories = Math.round(clamp(s.consolidate.schedule.minMemories, 0, 100_000));
+	c.retentionDays = clamp(c.retentionDays, 0, 3650);
+	s.capture.userMinChars = Math.round(clamp(s.capture.userMinChars, 0, 10_000));
+	// No endpoint is built in: "none" (or empty) means not configured.
+	for (const k of ["semif", "embedding"] as const) if (/^\s*(none|off|-)?\s*$/i.test(s[k].endpoint)) s[k].endpoint = "";
 	if (s.safety.secretAction !== "redact") s.safety.secretAction = "reject";
 	if (!["imported", "always", "never"].includes(s.prompt.stripContextFiles)) s.prompt.stripContextFiles = "imported";
 	return s;

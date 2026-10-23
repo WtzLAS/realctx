@@ -1,16 +1,16 @@
 /**
  * Context layer runtime (§6–§9, §13): captures tool outputs, judges spent ones in the
  * background, applies queued drops in one pass at the right moment, renders byte-stable
- * placeholders, and restores originals through real_expand.
+ * placeholders, and restores originals through realctx_expand.
  *
  * Everything that reaches the model is derived from immutable data (the frozen
  * placeholder text of each applied drop), so the rendered prefix stays byte-identical
  * between requests and the provider's prompt cache survives.
  */
-import { statSync } from "node:fs";
+import { copyFileSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { parseDuration, type Settings } from "../../src/config.ts";
+import { embeddingFingerprint, parseDuration, type Settings } from "../../src/config.ts";
 import type { MemoryEngine } from "../../src/engine.ts";
 import { chunkQuestions } from "../../src/judge.ts";
 import {
@@ -42,7 +42,12 @@ import {
 	filterOutputs,
 	isMutating,
 	isReading,
+	buildUserExtractPrompt,
 	parseFacts,
+	USER_EXTRACT_SYSTEM,
+	USER_FACT_CUE,
+	userFactQuestion,
+	userMessageWorthJudging,
 	readDropSignals,
 	type RuleReason,
 	renderPlaceholder,
@@ -55,6 +60,7 @@ import {
 import { parseJsonObject } from "../../src/rewrite.ts";
 import { redactSecrets, sanitizeForPrompt } from "../../src/safety.ts";
 import { estimateTokens, ftsQuery, oneLine, sha256 } from "../../src/text.ts";
+import { familyRoot, takeCaptureBudget } from "../../src/shared.ts";
 import { rewriterFor } from "./tools.ts";
 
 export const IDS_ENTRY = "realctx-ids";
@@ -138,6 +144,9 @@ const CONFLICT_SOURCES: Array<[RegExp, string]> = [
 export interface LayerStatus {
 	active: boolean;
 	reason?: string;
+	session?: string;
+	parent?: string;
+	subagent?: boolean;
 	shadow: boolean;
 	captured: number;
 	applied: number;
@@ -156,6 +165,8 @@ export interface LayerHost {
 	/** Path-note ids whose tool result left the context (§13.3). */
 	unshowNotes(ids: string[]): void;
 	notify(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error"): void;
+	/** Facts were captured (status line refresh). */
+	onCaptured?(ctx: ExtensionContext): void;
 }
 
 function branchEntries(ctx: ExtensionContext): BranchEntryView[] {
@@ -214,7 +225,15 @@ export class ContextLayer {
 	private flushRequested = false;
 	private lastApplyAt = 0;
 	private lastRequestApplied = false;
-	private captureTimes: number[] = [];
+	/** Parent session id when this session is a child (fork, clone, subagent). */
+	parent: string | undefined;
+	/** Started by another agent (subagent): its "user" messages are the parent agent's, not the user's. */
+	subagent = false;
+	/** Hashes of user-role messages sent by extensions (not typed by the user): never captured. */
+	private extensionSent = new Set<string>();
+	/** User messages already considered for capture (entry key → true). */
+	private userSeen = new Set<string>();
+	private embedding = false;
 	private lastUsage: LayerStatus["usage"];
 	/** Why the layer is off (conflict, disabled, store unavailable); undefined = active. */
 	disabledReason: string | undefined;
@@ -239,7 +258,9 @@ export class ContextLayer {
 	// -------------------------------------------------------------------------
 
 	/** Rebuild the registry, drop set and pins from the current branch (session start, tree navigation, reload). */
-	reset(ctx: ExtensionContext, conflicts: string[]): void {
+	reset(ctx: ExtensionContext, conflicts: string[], family: { parent?: string; subagent?: boolean } = {}): void {
+		this.parent = family.parent;
+		this.subagent = !!family.subagent;
 		this.generation++;
 		this.metas.clear();
 		this.byOrd.clear();
@@ -265,6 +286,7 @@ export class ContextLayer {
 			const e = this.host.engine();
 			this.projectKey = e.scopes(ctx.cwd).project?.key ?? `cwd-${sha256(ctx.cwd).slice(0, 16)}`;
 			this.files = new OutputFiles(join(e.paths.base, "sessions"), this.projectKey, this.sessionId);
+			e.db.touchOutputSession(this.sessionId, this.projectKey, this.files.dir);
 		} catch (err) {
 			this.files = undefined;
 			this.disabledReason ??= `output store unavailable: ${err instanceof Error ? err.message : String(err)}`;
@@ -290,8 +312,8 @@ export class ContextLayer {
 			const db = this.host.engine().db;
 			for (const id of resultIds) {
 				if (this.metas.has(id)) continue;
-				const row = db.getOutputMeta(id);
-				if (row && row.session === this.sessionId) {
+				const row = db.getOutputMeta(this.sessionId, id);
+				if (row) {
 					const m = row.meta as OutputMeta;
 					if (m && typeof m.ord === "number" && !this.byOrd.has(m.ord)) {
 						this.addMeta(m);
@@ -302,10 +324,38 @@ export class ContextLayer {
 		} catch {
 			// database busy: the registry entries are enough
 		}
+		// A child session (fork, clone) inherits its parent's registry: take copies of the
+		// originals into its own store, so the two context layers never share files and the
+		// parent's retention cannot break the child's placeholders.
+		if (this.files) this.adoptInherited(this.files);
 		// Never keep a drop whose original cannot be restored.
 		for (const id of [...this.applied.keys()]) {
 			const m = this.metas.get(id);
 			if (!m || !storedExists(m.file)) this.applied.delete(id);
+		}
+	}
+
+	private adoptInherited(files: OutputFiles): void {
+		for (const m of [...this.metas.values()]) {
+			if (m.file.startsWith(`${files.dir}/`) || !storedExists(m.file)) continue;
+			const file = files.fileFor(m.ord, m.id);
+			try {
+				mkdirSync(files.dir, { recursive: true, mode: 0o700 });
+				copyFileSync(m.file, file);
+			} catch {
+				continue;
+			}
+			const own: OutputMeta = { ...m, file };
+			this.addMeta(own);
+			this.unflushedMetas.push(own);
+			try {
+				const db = this.host.engine().db;
+				const stored = readStored(file);
+				const text = stored ? contentText(stored.content) : "";
+				db.putOutput({ toolCallId: m.id, session: this.sessionId, project: this.projectKey, ord: m.ord, meta: own, file, head: `${m.tool} ${m.args}`, body: text.slice(0, 200_000) });
+			} catch {
+				// index unavailable: the registry entry is enough to restore
+			}
 		}
 	}
 
@@ -386,7 +436,7 @@ export class ContextLayer {
 		const file = this.files.fileFor(ord, ev.toolCallId);
 		const capturedAt = Date.now();
 		const expandOf =
-			ev.toolName === "real_expand" || ev.toolName === "realmem_expand"
+			ev.toolName === "realctx_expand"
 				? (Array.isArray(ev.input.ids) ? ev.input.ids : []).map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0)
 				: undefined;
 		const meta: OutputMeta = {
@@ -625,6 +675,7 @@ export class ContextLayer {
 			db?.logEvent(this.sessionId, p.source, p.id, saved, { kind: p.kind, reason: p.reason });
 		}
 		this.pending.clear();
+		this.embedDroppedInBackground();
 	}
 
 	/** §8.3: drop the largest unprotected outputs until usage is under the apply threshold. */
@@ -644,7 +695,7 @@ export class ContextLayer {
 
 	/** Verdict cache key: tool call ids are only unique within a session. */
 	private verdictKey(toolCallId: string): string {
-		return `${this.sessionId}\u0000${toolCallId}`;
+		return `${this.sessionId}:${toolCallId}`;
 	}
 
 	private safeDb() {
@@ -838,15 +889,12 @@ export class ContextLayer {
 	private async captureFacts(ctx: ExtensionContext, meta: OutputMeta, gen: number): Promise<{ savedAs: string[]; memoryBacked: boolean }> {
 		const none = { savedAs: [], memoryBacked: false };
 		const s = this.host.settings();
-		const now = Date.now();
-		this.captureTimes = this.captureTimes.filter((t) => now - t < 3_600_000);
-		if (this.captureTimes.length >= s.capture.maxPerSessionHour) return none;
 		const e = this.host.engine();
 		const rw = rewriterFor(e, ctx);
 		if (!rw.completer) return none;
 		const stored = readStored(meta.file);
 		if (!stored) return none;
-		this.captureTimes.push(now);
+		if (!takeCaptureBudget(familyRoot(this.sessionId), s.capture.maxPerSessionHour)) return none;
 		const text = stripPathNotes(contentText(stored.content));
 		let facts: ReturnType<typeof parseFacts>;
 		try {
@@ -869,7 +917,7 @@ export class ContextLayer {
 		for (const fct of facts) {
 			try {
 				const out = await e.remember(
-					{ caption: fct.caption, content: fct.content, paths: fct.paths ?? this.defaultPaths(meta, project?.root), source: "capture" },
+					{ caption: fct.caption, content: fct.content, paths: fct.paths ?? this.defaultPaths(meta, project?.root), source: "capture", origin: "output" },
 					{ cwd: ctx.cwd, rewriter: rw.rewriter, queueOnFailure: true },
 				);
 				if (out.status !== "reinforced") backed = false;
@@ -889,7 +937,7 @@ export class ContextLayer {
 	}
 
 	// -------------------------------------------------------------------------
-	// real_expand (§9.3) and output recall
+	// realctx_expand (§9.3) and output recall
 	// -------------------------------------------------------------------------
 
 	expand(params: { ids: number[]; lines?: string; grep?: string }, cwd: string, ctx: ExtensionContext): { content: ContentPart[]; details: Record<string, unknown> } {
@@ -924,7 +972,7 @@ export class ContextLayer {
 			const view = viewOriginal(text, { lines: params.lines, grep: params.grep, maxTokens: budget });
 			if (view.truncated) {
 				head.push(
-					`(truncated to ~${fmtTokens(budget)} of ${view.totalLines} lines; call real_expand(ids=[${ord}], lines="200-400") or grep="pattern" for the rest)`,
+					`(truncated to ~${fmtTokens(budget)} of ${view.totalLines} lines; call realctx_expand(ids=[${ord}], lines="200-400") or grep="pattern" for the rest)`,
 				);
 			}
 			parts.push({ type: "text", text: `${head.join("\n")}\n\n${view.text}` });
@@ -940,7 +988,7 @@ export class ContextLayer {
 		return { content: parts.length ? parts : [{ type: "text", text: "nothing to expand" }], details: { restored, missing } };
 	}
 
-	/** Link a pin to the captured result of the real_expand call that created it. */
+	/** Link a pin to the captured result of the realctx_expand call that created it. */
 	linkExpansion(toolCallId: string, ids: unknown): void {
 		const result = this.metas.get(toolCallId);
 		if (!result || !Array.isArray(ids)) return;
@@ -972,24 +1020,171 @@ export class ContextLayer {
 		return `Note: file edited since turn ${meta.turn}${edited ? ` (turn ${edited.turn})` : ""}; re-read for the current version.`;
 	}
 
-	/** Dropped outputs of this branch matching the queries (for real_recall sources=output). */
-	searchDropped(queries: string[], limit = 8): Array<{ meta: OutputMeta; drop: AppliedDrop; score: number }> {
+	/**
+	 * Dropped outputs of THIS session's branch matching the queries (realctx_recall
+	 * sources=output): BM25 and, when the embedding endpoint is set, vector search, fused
+	 * by reciprocal rank. Other sessions' outputs are never searched.
+	 */
+	async searchDropped(queries: string[], limit = 8, signal?: AbortSignal): Promise<Array<{ meta: OutputMeta; drop: AppliedDrop; score: number; via: string }>> {
 		const ids = [...this.applied.keys()];
-		if (ids.length === 0) return [];
-		const q = ftsQuery(queries);
-		if (!q) return [];
+		if (ids.length === 0 || queries.length === 0) return [];
+		this.host.engine().reloadSettingsIfChanged();
 		const db = this.safeDb();
 		if (!db) return [];
-		const hits = db.searchOutputs(ids, q, limit * 2);
-		const out: Array<{ meta: OutputMeta; drop: AppliedDrop; score: number }> = [];
-		for (const h of hits) {
-			const meta = this.metas.get(h.toolCallId);
-			const drop = this.applied.get(h.toolCallId);
+		const lists: Array<{ kind: "fts" | "vec"; hits: Array<{ toolCallId: string; score: number }> }> = [];
+		const q = ftsQuery(queries);
+		if (q) lists.push({ kind: "fts", hits: db.searchOutputs(this.sessionId, ids, q, limit * 3) });
+		const e = this.host.engine();
+		if (this.cfg.embedDropped && e.embeddingClient.configured) {
+			try {
+				await this.embedDropped(signal);
+				const fp = embeddingFingerprint(e.settings);
+				const { vectors } = await e.embeddingClient.embed(queries.slice(0, 4), "query", signal);
+				const best = new Map<string, number>();
+				for (const v of vectors) for (const h of db.vecSearchOutputs(this.sessionId, ids, fp, v, limit * 3)) best.set(h.toolCallId, Math.max(best.get(h.toolCallId) ?? -1, h.score));
+				lists.push({
+					kind: "vec",
+					hits: [...best.entries()]
+						.filter(([, sc]) => sc >= 0.3)
+						.map(([toolCallId, score]) => ({ toolCallId, score }))
+						.sort((a, b) => b.score - a.score),
+				});
+			} catch {
+				// embedding API down: keyword hits only
+			}
+		}
+		const fused = new Map<string, { score: number; via: Set<string> }>();
+		for (const l of lists) {
+			l.hits.forEach((h, i) => {
+				const cur = fused.get(h.toolCallId) ?? { score: 0, via: new Set<string>() };
+				cur.score += 1 / (60 + i + 1);
+				cur.via.add(l.kind);
+				fused.set(h.toolCallId, cur);
+			});
+		}
+		const out: Array<{ meta: OutputMeta; drop: AppliedDrop; score: number; via: string }> = [];
+		for (const [id, f] of fused) {
+			const meta = this.metas.get(id);
+			const drop = this.applied.get(id);
 			if (!meta || !drop) continue;
-			// Relevance, then recency.
-			out.push({ meta, drop, score: h.score + meta.ord / Math.max(1, this.byOrd.size) / 10 });
+			// Relevance first, recency breaks ties.
+			out.push({ meta, drop, score: f.score + meta.ord / Math.max(1, this.byOrd.size) / 1e4, via: [...f.via].sort().join("+") });
 		}
 		return out.sort((a, b) => b.score - a.score).slice(0, limit);
+	}
+
+	/** Embed dropped outputs of this session that have no vector yet (bounded per call). */
+	private async embedDropped(signal?: AbortSignal): Promise<number> {
+		const e = this.host.engine();
+		if (!this.cfg.embedDropped || !e.embeddingClient.configured) return 0;
+		const fp = embeddingFingerprint(e.settings);
+		const ids = e.db.outputsWithoutVec(this.sessionId, [...this.applied.keys()], fp).slice(0, 32);
+		if (ids.length === 0) return 0;
+		const texts: string[] = [];
+		const keep: string[] = [];
+		for (const id of ids) {
+			const t = e.db.outputText(this.sessionId, id);
+			if (!t) continue;
+			// Redacted, bounded: head of the output is what identifies it best.
+			texts.push(redactSecrets(t).slice(0, 6000));
+			keep.push(id);
+		}
+		if (texts.length === 0) return 0;
+		const { vectors } = await e.embeddingClient.embed(texts, "document", signal);
+		vectors.forEach((v, i) => e.db.putOutputVec(keep[i], this.sessionId, fp, v));
+		return vectors.length;
+	}
+
+	private embedDroppedInBackground(): void {
+		if (this.embedding) return;
+		this.embedding = true;
+		void this.embedDropped()
+			.catch(() => {})
+			.finally(() => {
+				this.embedding = false;
+			});
+	}
+
+	// -------------------------------------------------------------------------
+	// user-message capture (§13.1, extended to what the user says)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * After a turn: consider the latest user message of the branch for capture. The judge
+	 * (when configured) decides whether it states a lasting fact; without one, a keyword
+	 * cue is required. Extraction uses the rewrite model; results follow capture.mode.
+	 */
+	/** Mark the next user message with this text as sent by an extension (not the user). */
+	skipNextUser(text: string): void {
+		this.extensionSent.add(sha256(text.trim()));
+		if (this.extensionSent.size > 64) this.extensionSent.delete(this.extensionSent.values().next().value as string);
+	}
+
+	captureUserInBackground(ctx: ExtensionContext): void {
+		const s = this.host.settings();
+		if (!this.active || this.subagent || s.capture.mode === "off" || !s.capture.userMessages) return;
+		const entries = branchEntries(ctx);
+		let user: { key: string; text: string } | undefined;
+		let prevReply: string | undefined;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const m = entries[i].message;
+			if (entries[i].type !== "message" || !m) continue;
+			if (!user && m.role === "user") {
+				const text = textOf(m.content).trim();
+				user = { key: `${m.timestamp ?? i}:${sha256(text).slice(0, 12)}`, text };
+				continue;
+			}
+			if (user && m.role === "assistant") {
+				prevReply = textOf(m.content).trim() || undefined;
+				break;
+			}
+		}
+		if (!user || this.userSeen.has(user.key)) return;
+		this.userSeen.add(user.key);
+		if (this.extensionSent.delete(sha256(user.text))) return;
+		if (!userMessageWorthJudging(user.text, s.capture.userMinChars)) return;
+		const gen = this.generation;
+		const u = user;
+		void this.captureUser(ctx, u.key, u.text, prevReply, gen).catch((err) => console.error(`[realctx] user capture failed: ${err instanceof Error ? err.message : String(err)}`));
+	}
+
+	private async captureUser(ctx: ExtensionContext, key: string, text: string, prevReply: string | undefined, gen: number): Promise<void> {
+		const e = this.host.engine();
+		const s = this.host.settings();
+		const clean = redactSecrets(text);
+		if (e.semifClient.configured) {
+			const state = JSON.stringify({ user_message: sanitizeForPrompt(clean).slice(0, 6000), previous_agent_reply: prevReply ? sanitizeForPrompt(redactSecrets(prevReply)).slice(0, 2000) : undefined });
+			const r = await e.semifClient.evaluate(state, userFactQuestion(), undefined, "drop");
+			const a = r.response.answers.durable_user_fact;
+			const p = a?.type === "noul" ? a.noul : 0;
+			e.db.logEvent(this.sessionId, "user_judged", undefined, 0, { key, p });
+			if (p < s.capture.pDurable) return;
+		} else if (!USER_FACT_CUE.test(clean)) return;
+		const rw = rewriterFor(e, ctx);
+		if (!rw.completer || gen !== this.generation) return;
+		if (!takeCaptureBudget(familyRoot(this.sessionId), s.capture.maxPerSessionHour)) return;
+		let facts: ReturnType<typeof parseFacts>;
+		try {
+			const r = await rw.completer({ system: USER_EXTRACT_SYSTEM, prompt: buildUserExtractPrompt(clean, prevReply ? redactSecrets(prevReply) : undefined), maxTokens: 1000 });
+			facts = parseFacts(parseJsonObject(r.text));
+		} catch {
+			return;
+		}
+		if (facts.length === 0 || gen !== this.generation) return;
+		const project = e.scopes(ctx.cwd).project;
+		e.db.logEvent(this.sessionId, "capture", undefined, 0, { facts: facts.length, mode: s.capture.mode, origin: "user" });
+		for (const fct of facts) {
+			if (s.capture.mode === "suggest") {
+				e.db.addSuggestion({ projectRoot: project?.root, session: this.sessionId, caption: fct.caption, content: fct.content, paths: fct.paths, cwd: ctx.cwd, origin: "user" });
+				continue;
+			}
+			try {
+				await e.remember({ caption: fct.caption, content: fct.content, paths: fct.paths, source: "capture", origin: "user" }, { cwd: ctx.cwd, rewriter: rw.rewriter, queueOnFailure: true });
+			} catch {
+				// refused by the safety scan or the gate: nothing to do
+			}
+		}
+		this.host.onCaptured?.(ctx);
 	}
 
 	// -------------------------------------------------------------------------
@@ -1008,6 +1203,9 @@ export class ContextLayer {
 		return {
 			active: this.active,
 			reason: this.disabledReason,
+			session: this.sessionId,
+			parent: this.parent,
+			subagent: this.subagent,
 			shadow: s.judge.shadow,
 			captured: this.metas.size,
 			applied: this.applied.size,
@@ -1070,7 +1268,7 @@ export function detectConflicts(tools: ReadonlyArray<{ name: string; sourceInfo?
 	const found = new Set<string>();
 	const extraSet = new Set(extra);
 	for (const t of tools) {
-		if (t.name.startsWith("real_") || t.name.startsWith("realmem_")) continue;
+		if (t.name.startsWith("realctx_")) continue;
 		const byName = CONFLICT_TOOLS[t.name];
 		const path = t.sourceInfo?.path ?? "";
 		const bySource = CONFLICT_SOURCES.find(([re]) => re.test(path))?.[1];

@@ -4,10 +4,9 @@ Working context and long-term memory for [Pi](https://pi.dev), at two time scale
 (design: [`docs/realctx-design-v2.md`](docs/realctx-design-v2.md)):
 
 - **Context layer** (within a session): spent tool outputs are dropped from the context
-  behind byte-stable placeholders and restored on demand with `real_expand`. Sessions run
+  behind byte-stable placeholders and restored on demand with `realctx_expand`. Sessions run
   far past the context window without compaction pauses, and nothing is lost.
-- **Memory layer** (across sessions, formerly [realmem](https://github.com/WtzLAS/realmem)):
-  small surprise-gated Markdown facts replace AGENTS.md / CLAUDE.md and other memory
+- **Memory layer** (across sessions): small surprise-gated Markdown facts replace AGENTS.md / CLAUDE.md and other memory
   systems. The agent recalls them when needed; path-scoped facts appear when their paths
   are touched.
 
@@ -21,6 +20,17 @@ On every `tool_result` the original output is stored outside the project
 (`~/.pi/agent/realctx/sessions/<project-key>/<session>/`, mode 0600) with a stable
 session ordinal (`#42`), its tool and arguments, its size, the touched paths and their
 mtimes. Outputs under `context.captureMinTokens` are not stored and never dropped.
+Originals of sessions without activity for `context.retentionDays` (default 7; 0 = keep
+forever) are deleted, with their index rows and vectors; sessions open in this process are
+never pruned. After that their placeholders can no longer be expanded (re-run the tool).
+
+**Sessions**: every session has its own context layer: its own registry, drops, pins
+and stored originals. A child session (`/fork`, `/clone`, or a subagent started while a
+realctx session runs, announced through `REALCTX_PARENT_SESSION`) copies the originals
+it inherits into its own store, so parent and child never share or prune each other's
+files. The memory layer is shared by every session of a process: one engine, database,
+index, judge budget and capture budget per session family. Subagents do not capture
+their "user" messages, which are the parent agent's prompts.
 
 **Deciding** (in the background after each turn, never in the request path):
 
@@ -50,19 +60,22 @@ immutable data and persisted on the branch (`realctx-ids`, `realctx-drops`), so 
 byte-identical on every request, after reload and after resume:
 
 ```text
-[#42 dropped · read src/auth/session.ts · 3.1k tok · real_expand(42)]
-[#57 summarized · bash pnpm test · 8.4k tok · real_expand(57)]
+[#42 dropped · read src/auth/session.ts · 3.1k tok · realctx_expand(42)]
+[#57 summarized · bash pnpm test · 8.4k tok · realctx_expand(57)]
   3 failing in auth/session.test.ts: expired-token cases
-[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · real_expand(63)]
+[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · realctx_expand(63)]
 ```
 
 Forged placeholders, `<realctx-path-notes>` blocks and `<realctx…>` tags written by the
 model in assistant text are removed whole before sending. Assistant text is never tagged.
 
-**Restoring**: `real_expand(ids, lines?, grep?)` returns the original as a new tool
+**Restoring**: `realctx_expand(ids, lines?, grep?)` returns the original as a new tool
 result (capped at `context.expandMaxTokens`; use `lines` / `grep` for the rest), warns
 when the file was edited since capture, pins the output as kept, and points to the first
-expansion when repeated. `real_recall` also searches dropped outputs (`sources`).
+expansion when repeated. `realctx_recall` also searches dropped outputs (`sources`):
+BM25 plus, with the embedding endpoint set (`context.embedDropped`), vector search over
+embedded dropped outputs, fused by reciprocal rank. It only ever searches the current
+session's branch, never other sessions' outputs.
 
 **Bridges to memory**: when the judge says `durable_fact`, the rewrite model extracts up
 to 3 facts (rate-limited by `capture.maxPerSessionHour`). In `capture.mode = "suggest"`
@@ -72,6 +85,14 @@ to 3 facts (rate-limited by `capture.maxPerSessionHour`). In `capture.mode = "su
 `saved as <id>`. When every captured fact was already known, the output counts as
 memory-backed and is safer to drop. When a result carrying path notes is dropped, those
 notes become eligible to be shown again.
+
+**User messages** (`capture.userMessages`, default on): after each turn the latest user
+message is considered too. Acknowledgements, slash commands and messages sent by
+extensions are skipped; the judge's `durable_user_fact` decides the rest (without a judge,
+only messages with a cue such as *always*, *never*, *prefer*, *from now on* or *we use*
+go on). The rewrite model extracts lasting preferences, decisions, corrections and
+project facts, which follow the same capture mode and hourly budget; suggestions are
+marked as coming from the user.
 
 **Conflicts**: if another context manager is loaded (Magic Context, billion-context,
 DCP-style pruners; extend with `context.conflictTools`), the context layer stays off and
@@ -192,7 +213,7 @@ when `.pi/` is in `.gitignore`. realctx therefore runs `git check-ignore` on the
 
 - **At session start**, a warning names the rule that ignores it (file, line, pattern)
   and gives the fix.
-- **`real_status`** repeats the warning, and a remember into the shared store notes
+- **`realctx_status`** repeats the warning, and a remember into the shared store notes
   that the memory will not be committed.
 - **`/realctx fix-gitignore`** re-checks, asks for confirmation, and appends the fix.
   Fixes are verified in a scratch copy of the repository's ignore rules before they are
@@ -275,25 +296,22 @@ Moving a memory between stores (manage page) re-expresses its paths.
 - **Import**: `/realctx import` marks context files as imported only when the agent
   actually stored facts from them.
 - **Tools**:
-  - `real_recall(queries?, paths?, ids?, sources?, page?, scope?)`: hybrid search over
+  - `realctx_recall(queries?, paths?, ids?, sources?, page?, scope?)`: hybrid search over
     memories and (with `sources` containing `output`, the default) this session's
     dropped outputs. Results are
     ordered by path (memories about the given or recently touched paths first,
     project-wide next, other areas last), then by used_count, then by relevance, and are
     paginated. `paths` alone lists the memories attached to those paths; `ids` reads
     memories that were shown as captions.
-  - `real_remember(caption, content, scope?, paths?, user_requested?)`: `paths` takes
+  - `realctx_remember(caption, content, scope?, paths?, user_requested?)`: `paths` takes
     files, directories or globs.
-  - `real_expand(ids, lines?, grep?)`: restore dropped outputs (see above).
-  - `real_status()`: context usage, queued and applied drops, stores, index, queue.
-  - `real_list(page?, scope?)`: sorted by path, then used; demoted, since its output
+  - `realctx_expand(ids, lines?, grep?)`: restore dropped outputs (see above).
+  - `realctx_status()`: context usage, queued and applied drops, stores, index, queue.
+  - `realctx_list(page?, scope?)`: sorted by path, then used; demoted, since its output
     is large.
-  - `real_forget(ids)`: delete memories by id (or unique prefix).
+  - `realctx_forget(ids)`: delete memories by id (or unique prefix).
 - **Skill**: `realctx` covers when and how to recall, remember, pick a scope, correct
   memories and restore dropped outputs.
-- **Compatibility**: `realmem_*` tools stay registered as aliases for one release
-  (`compat.aliases`: `deferred` = callable but not declared, `active`, `off`), and
-  `/realmem` is an alias of `/realctx`.
 
 ## Commands
 
@@ -354,6 +372,14 @@ A memory that was edited while consolidation ran is left alone (reported as
 skipped), and a folded memory is only deleted when the memory that absorbed it was
 written.
 
+**Schedule** (`consolidate.schedule`, suggest only, never writes): at session start, when
+the stores visible from the cwd hold at least `minMemories` (20) memories and were not
+consolidated for `everyDays` (14), realctx suggests a consolidation. In mode `plan`
+(default, with a judge) it first makes a dry-run plan in the background and reports its
+summary; `/realctx consolidate` then offers to apply that plan as is, or to plan again.
+In mode `remind` (or without a judge) it only suggests running the command. Running
+`/realctx consolidate` resets the clock; subagent sessions never suggest.
+
 ## Install
 
 ```bash
@@ -361,12 +387,18 @@ cd ~/Projects/realctx && npm install
 pi install ~/Projects/realctx        # or add the path to "packages" in ~/.pi/agent/settings.json
 ```
 
-realctx ships with no endpoints, API keys or model names. Open `/realctx settings` and set:
+realctx ships with no endpoints, API keys or model names: both endpoints default to none
+(empty, or `"none"` in `config.json`), and realctx works without them. Open
+`/realctx settings` to set:
 
-- the **SemIf endpoint** and key. Without it, new memories are only queued; they are
-  processed once it is set;
-- the **embedding endpoint** and key. Without it, recall and deduplication use keyword
-  (BM25) search only;
+- the **judge (SemIf) endpoint** and key. Without it, `realctx_remember` uses a
+  deterministic gate (the safety scan, then a near duplicate by text overlap or
+  embedding similarity is reinforced and anything else is added, with no
+  importance/durability gate), the context layer drops by rules only (re-reads, re-edits,
+  duplicates, emergency), user-message capture needs an explicit cue, and scheduled
+  consolidation only reminds;
+- the **embedding endpoint** and key. Without it, recall, deduplication and the search
+  over dropped outputs use keyword (BM25) search only;
 - the **SemIf model** and **embedding model**: the picker fetches the server's
   `/v1/models` list for you to choose from (or type a name). Left at `(auto)`, realctx
   uses the server's only model; if the server lists several, calls fail until you pick one.
@@ -380,13 +412,6 @@ The context layer starts in shadow mode (`judge.shadow`) with capture in `sugges
 Watch `/realctx outputs` and `/realctx status` for a while, then turn shadow off in
 `/realctx settings` (rule-based drops of re-read, re-edited and duplicate outputs apply
 from the start).
-
-### Upgrading from realmem
-
-Uninstall realmem first (both would register path notes). On first start realctx moves
-`~/.pi/agent/realmem/` to `~/.pi/agent/realctx/` (database renamed, tables kept) and each
-project's `.pi/realmem/` to `.pi/realctx/` (commit the move). Memory ids and file contents
-are unchanged, and `realmem-*` session entries are read as their `realctx-*` equivalents.
 
 ## Development
 

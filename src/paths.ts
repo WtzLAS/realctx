@@ -212,7 +212,7 @@ function shellTokens(command: string): string[] {
  * are taken as given; words of shell commands only when they exist on disk.
  */
 export function touchedPaths(toolName: string, input: Record<string, unknown> | undefined, cwd: string): string[] {
-	if (!input || (toolName.startsWith("real_") || toolName.startsWith("realmem_"))) return [];
+	if (!input || toolName.startsWith("realctx_")) return [];
 	const out = new Set<string>();
 	const add = (p: unknown, mustExist: boolean) => {
 		if (typeof p !== "string" || p === "." || p === ".." || /[*?[\]{}]/.test(p)) return;

@@ -360,7 +360,7 @@ function before_id(pathKey: string): string {
 	return `p:${pathKey}`;
 }
 
-test("fresh install: no endpoints, facts are queued, not lost; keyword recall still works", async () => {
+test("fresh install: no endpoints; the deterministic gate stores facts and reinforces near duplicates; keyword recall works", async () => {
 	const fresh = mkdtempSync(join(tmpdir(), "realctx-fresh-"));
 	clearProjectCache();
 	const e = new MemoryEngine(fresh);
@@ -369,14 +369,24 @@ test("fresh install: no endpoints, facts are queued, not lost; keyword recall st
 		assert.equal(e.settings.semif.endpoint, "");
 		assert.equal(e.settings.embedding.apiKey, "");
 		assert.equal(e.settings.semif.apiKey, "");
-		const o = await e.remember({ caption: "Use make", content: "Build with `make all`.", source: "agent" }, { cwd: proj, queueOnFailure: true });
-		assert.equal(o.status, "queued");
-		assert.match(o.message, /not set up/);
-		assert.deepEqual(await e.drainPending(proj, undefined), [], "no retries while unconfigured");
-		assert.equal(e.pendingCount(proj), 1, "still queued");
+		const o = await e.remember({ caption: "Use make", content: "Build with `make all` from the repository root.", source: "agent" }, { cwd: proj, queueOnFailure: true });
+		assert.equal(o.status, "added");
+		assert.match(o.decision?.reasons[0] ?? "", /no judge configured: deterministic gate \(no near duplicate\)/);
+		const dup = await e.remember({ caption: "Use make", content: "Build with `make all` from the repository root!", source: "agent" }, { cwd: proj, queueOnFailure: true });
+		assert.equal(dup.status, "reinforced");
+		assert.equal(dup.memory?.id, o.memory?.id);
+		const other = await e.remember({ caption: "Tests need Docker", content: "Integration tests start Postgres via docker compose.", source: "agent" }, { cwd: proj, queueOnFailure: true });
+		assert.equal(other.status, "added");
+		const r = await e.recall(proj, ["make all"]);
+		assert.equal(r.items[0]?.memory.id, o.memory?.id);
+		assert.equal(e.pendingCount(proj), 0);
 		const st = e.status(proj) as { config: { semif: string | null; embedding: string | null } };
 		assert.equal(st.config.semif, null);
 		assert.equal(st.config.embedding, null);
+		// "none" in the config file means not configured.
+		const n = normalizeSettings({ semif: { endpoint: "none" }, embedding: { endpoint: "None" } });
+		assert.equal(n.semif.endpoint, "");
+		assert.equal(n.embedding.endpoint, "");
 	} finally {
 		e.close();
 		rmSync(fresh, { recursive: true, force: true });

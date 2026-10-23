@@ -70,7 +70,7 @@ test("touched paths from tool calls", () => {
 		assert.deepEqual(rel(touchedPaths("read", { path: "schema.sql" }, join(root, "src", "db"))), ["src/db/schema.sql"], "relative to cwd");
 		const bash = rel(touchedPaths("bash", { command: "cat package.json | jq . && ls src/db --color=auto; rm -rf nothere" }, root)).sort();
 		assert.deepEqual(bash, ["package.json", "src/db"], "shell words only when they exist; `.` is ignored");
-		assert.deepEqual(touchedPaths("real_recall", { paths: ["src"] }, root), []);
+		assert.deepEqual(touchedPaths("realctx_recall", { paths: ["src"] }, root), []);
 		assert.equal(displayPath(`${R}/src/db`, root), "src/db");
 		assert.equal(displayPath(`${homeRoot()}/.config/x`, "/"), "~/.config/x");
 	} finally {

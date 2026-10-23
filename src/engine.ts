@@ -17,6 +17,7 @@ import {
 	chunkQuestions,
 	type Decision,
 	decide,
+	signalsWithoutJudge,
 	type JudgeRequest,
 	type Neighbor,
 	pathUrgencyQuestion,
@@ -26,7 +27,6 @@ import {
 	urgencyTier,
 } from "./judge.ts";
 import { migratePersonalStore, type ProjectInfo, personalStore, type ScopeContext, scopeContext, writeProjectInfo } from "./project.ts";
-import { migrateBaseDir, migrateSharedStore } from "./migrate.ts";
 import { judgeScheduler } from "./scheduler.ts";
 import { type Completer, fallbackRewrite, type RewriteRequest, type RewriteResult, type Rewriter } from "./rewrite.ts";
 import { describeSafety, redactSecrets, sanitizeForPrompt, scanAll, scanInjection, stripInvisible } from "./safety.ts";
@@ -77,6 +77,8 @@ export interface RememberInput {
 	paths?: string[];
 	scope?: ScopeKind;
 	source: Candidate["source"];
+	/** For `capture`: tool output or user message. */
+	origin?: Candidate["origin"];
 	force?: boolean;
 }
 
@@ -219,21 +221,11 @@ export class MemoryEngine {
 	private embedPromise: Promise<unknown> | undefined;
 	private urgencyPromise: Promise<unknown> | undefined;
 	private migrated = new Set<string>();
-	/** One-line notices produced by realmem → realctx migration, shown once by the extension. */
+	/** One-line notices shown once by the extension (e.g. a personal store moved to its git key). */
 	readonly notices: string[] = [];
 
 	constructor(baseDir?: string) {
-		const explicit = baseDir ?? process.env.REALCTX_HOME;
-		const agentDir = agentDirFromEnv();
-		const base = explicit ?? join(agentDir, "realctx");
-		if (!explicit) {
-			try {
-				const n = migrateBaseDir(agentDir, base);
-				if (n) this.notices.push(n);
-			} catch (err) {
-				this.notices.push(`realctx: could not migrate realmem data: ${err instanceof Error ? err.message : String(err)}`);
-			}
-		}
+		const base = baseDir ?? process.env.REALCTX_HOME ?? join(agentDirFromEnv(), "realctx");
 		this.paths = realctxPaths(base);
 		this.settings = loadSettings(this.paths.config);
 		this.settingsMtime = settingsMtime(this.paths.config);
@@ -291,12 +283,6 @@ export class MemoryEngine {
 		const p = ctx.project;
 		if (p && !this.migrated.has(p.root)) {
 			this.migrated.add(p.root);
-			try {
-				const n = migrateSharedStore(p.root);
-				if (n) this.notices.push(n);
-			} catch {
-				// best effort; the old directory stays in place
-			}
 			try {
 				if (migratePersonalStore(this.paths.personalRoot, p) > 0) {
 					const old = personalStore(this.paths.personalRoot, p.pathKey).id;
@@ -670,7 +656,7 @@ export class MemoryEngine {
 			// Naming a store root is the same as naming no path.
 			paths = abs.length > 0 && !abs.every((p) => wholeRoots.has(p)) ? abs.filter((p) => !wholeRoots.has(p)).sort() : undefined;
 		}
-		return { candidate: { caption, content, paths, scopeHint: input.scope, source: input.source, force: input.source === "capture" ? false : input.force }, safety };
+		return { candidate: { caption, content, paths, scopeHint: input.scope, source: input.source, origin: input.origin, force: input.source === "capture" ? false : input.force }, safety };
 	}
 
 	/** Find memories similar to a candidate (vector + BM25), for the judge. */
@@ -761,6 +747,16 @@ export class MemoryEngine {
 				step("embed + search");
 				const { neighbors } = await this.neighbors(ctx, candidate, trace, opts.signal);
 				outcome.neighbors = neighbors;
+				if (!this.semif.configured) {
+					// No judge configured (the default): deterministic gate. Near duplicates reinforce, the rest is added.
+					const { signals, duplicate } = signalsWithoutJudge(candidate, neighbors);
+					outcome.signals = signals;
+					outcome.decision = decide({ candidate, neighbors, signals, scopes, projectRoot: ctx.project?.root }, this.gateThresholds(candidate));
+					outcome.decision.reasons.unshift(
+						`no judge configured: deterministic gate (${duplicate ? `near duplicate of ${duplicate.id}, ${duplicate.why}` : "no near duplicate"}); configure one in /realctx settings for the surprise gate`,
+					);
+					return this.apply(outcome, ctx, opts);
+				}
 				step("judge");
 				const req = buildJudgeRequest(
 					candidate,
@@ -780,9 +776,7 @@ export class MemoryEngine {
 					this.db.enqueuePending(ctx.project?.root, { input, cwd: opts.cwd }, msg);
 					outcome.status = "queued";
 					outcome.error = msg;
-					outcome.message = this.semif.configured
-						? `NOT stored yet: the memory judge is unreachable (${msg}). The fact was queued and will be retried automatically; no need to call again.`
-						: "NOT stored yet: realctx is not set up (no SemIf judge endpoint). The fact was queued and will be processed once the user configures /realctx settings; no need to call again.";
+					outcome.message = `NOT stored yet: the memory judge is unreachable (${msg}). The fact was queued and will be retried automatically; no need to call again.`;
 					return outcome;
 				}
 				throw err;

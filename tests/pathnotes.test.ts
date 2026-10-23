@@ -143,7 +143,7 @@ test("remember with paths → urgency judged → shown on touch by tier, once pe
 	const h = await harness();
 	await h.emit("session_start", { type: "session_start", reason: "startup" }, h.ctx);
 	const remember = (caption: string, content: string, paths?: string[]) =>
-		h.tools.get("real_remember").execute("r", { caption, content, ...(paths ? { paths } : {}) }, undefined, undefined, h.ctx);
+		h.tools.get("realctx_remember").execute("r", { caption, content, ...(paths ? { paths } : {}) }, undefined, undefined, h.ctx);
 
 	const r1 = await remember("MIGRATE before editing schema", "Run `make migrate` after changing db/schema.sql; CI checks drift.", ["db"]);
 	assert.equal(r1.details.status, "added");
@@ -223,10 +223,10 @@ test("remember with paths → urgency judged → shown on touch by tier, once pe
 	e2.close();
 
 	// recall by paths / ids.
-	const byPath = await h.tools.get("real_recall").execute("q", { paths: ["db/schema.sql"] }, undefined, undefined, h.ctx);
+	const byPath = await h.tools.get("realctx_recall").execute("q", { paths: ["db/schema.sql"] }, undefined, undefined, h.ctx);
 	assert.match(byPath.content[0].text, /HISTORY of the naming scheme/);
 	assert.ok(byPath.content[0].text.indexOf("OWNER") < byPath.content[0].text.indexOf("MIGRATE"), "most specific first");
-	const byId = await h.tools.get("real_recall").execute("q", { ids: [row.id] }, undefined, undefined, h.ctx);
+	const byId = await h.tools.get("realctx_recall").execute("q", { ids: [row.id] }, undefined, undefined, h.ctx);
 	assert.match(byId.content[0].text, /make migrate/);
 
 	// Session prompt: path-scoped memories are not in the caption list; a path map is.

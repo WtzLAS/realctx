@@ -27,7 +27,7 @@ function urgencyLines(engine: MemoryEngine, m: MemoryRow): (t: Theme) => string[
 		const th = engine.settings.thresholds;
 		const pad = (k: string) => t.fg("muted", k.padEnd(10));
 		if (!scopePaths(m)) {
-			return [`${pad("urgency")} ${t.fg("dim", "n/a: covers the whole root, never shown on path touch (reached through real_recall)")}`];
+			return [`${pad("urgency")} ${t.fg("dim", "n/a: covers the whole root, never shown on path touch (reached through realctx_recall)")}`];
 		}
 		const out: string[] = [];
 		if (!engine.settings.paths.inject) out.push(t.fg("warning", "path notes are off (settings): urgency has no effect right now"));

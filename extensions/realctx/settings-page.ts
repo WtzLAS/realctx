@@ -305,7 +305,7 @@ function fields(): FieldDef[] {
 		{
 			id: "recall.pageSize",
 			label: "Recall page size",
-			description: "Memories returned per real_recall page.",
+			description: "Memories returned per realctx_recall page.",
 			get: (s) => String(s.recall.pageSize),
 			set: (s, v) => {
 				s.recall.pageSize = num(v);
@@ -434,7 +434,7 @@ function fields(): FieldDef[] {
 		{
 			id: "context.enabled",
 			label: "Context layer",
-			description: "Capture tool outputs and drop spent ones from the context (placeholders + real_expand). Off = memory layer only.",
+			description: "Capture tool outputs and drop spent ones from the context (placeholders + realctx_expand). Off = memory layer only.",
 			get: (s) => (s.context.enabled ? "on" : "off"),
 			set: (s, v) => {
 				s.context.enabled = v === "on";
@@ -460,8 +460,20 @@ function fields(): FieldDef[] {
 			},
 			kind: "text",
 		},
-		ctxNum("expandMaxTokens", "Context: expand max tokens", "Maximum tokens returned by one real_expand call.", 200, 200_000, true),
+		ctxNum("expandMaxTokens", "Context: expand max tokens", "Maximum tokens returned by one realctx_expand call.", 200, 200_000, true),
 		ctxNum("repinTurns", "Context: re-pin turns", "Expanded outputs are kept (not re-dropped) for this many turns.", 0, 1000, true),
+		ctxNum("retentionDays", "Context: output retention (days)", "Stored originals of sessions inactive this long are deleted (0 = keep forever). Their placeholders can no longer be expanded.", 0, 3650, false),
+		{
+			id: "context.embedDropped",
+			label: "Context: embed dropped outputs",
+			description: "Embed dropped outputs so realctx_recall finds them by meaning (needs the embedding endpoint). Only this session's outputs are ever searched.",
+			get: (s) => (s.context.embedDropped ? "on" : "off"),
+			set: (s, v) => {
+				s.context.embedDropped = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
 		{
 			id: "capture.mode",
 			label: "Capture mode",
@@ -472,6 +484,40 @@ function fields(): FieldDef[] {
 			},
 			kind: "cycle",
 			values: ["suggest", "auto", "off"],
+		},
+		{
+			id: "capture.userMessages",
+			label: "Capture: user messages",
+			description: "Also capture lasting preferences, decisions and corrections the user states (judged after each turn; without a judge only messages with cues like always/never/prefer). Same capture mode and hourly budget.",
+			get: (s) => (s.capture.userMessages ? "on" : "off"),
+			set: (s, v) => {
+				s.capture.userMessages = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		{
+			id: "consolidate.schedule.mode",
+			label: "Consolidation schedule",
+			description: "plan = every N days make a dry-run plan in the background and suggest it; remind = only suggest running /realctx consolidate; off. Never writes without you.",
+			get: (s) => s.consolidate.schedule.mode,
+			set: (s, v) => {
+				s.consolidate.schedule.mode = v as Settings["consolidate"]["schedule"]["mode"];
+			},
+			kind: "cycle",
+			values: ["plan", "remind", "off"],
+		},
+		{
+			id: "consolidate.schedule.everyDays",
+			label: "Consolidation every (days)",
+			description: "Days between scheduled consolidation suggestions for the same stores.",
+			get: (s) => String(s.consolidate.schedule.everyDays),
+			set: (s, v) => {
+				s.consolidate.schedule.everyDays = num(v);
+			},
+			kind: "number",
+			min: 1,
+			max: 365,
 		},
 		{
 			id: "reset",

@@ -81,6 +81,8 @@ export interface Candidate {
 	/** Explicit scope requested by the caller (overrides the judge). */
 	scopeHint?: ScopeKind;
 	source: CandidateSource;
+	/** For `capture`: where the fact was extracted from (§13.1). */
+	origin?: "output" | "user";
 	/** The user explicitly asked to remember this: bypass the importance/durability gate. */
 	force?: boolean;
 }
@@ -138,7 +140,7 @@ export function buildJudgeRequest(
 		"Content:",
 		sanitizeForPrompt(c.content.trim()),
 		"",
-		`Context: ${where}; proposed by ${c.source === "user" ? "the user" : c.source === "import" ? "an import of project instruction files" : c.source === "capture" ? "realctx, extracted from a spent tool output (be strict: keep only durable, important project facts)" : "the coding agent"}.${pathsLine}`,
+		`Context: ${where}; proposed by ${c.source === "user" ? "the user" : c.source === "import" ? "an import of project instruction files" : c.source === "capture" ? (c.origin === "user" ? "realctx, extracted from what the user said in the conversation (be strict: keep only lasting preferences, decisions, corrections and project facts, not one-off instructions)" : "realctx, extracted from a spent tool output (be strict: keep only durable, important project facts)") : "the coding agent"}.${pathsLine}`,
 	].join("\n");
 
 	const optionCost = 18; // approx tokens per id option, repeated in three questions
@@ -333,6 +335,43 @@ function resolvePick(p: ChoicePick | undefined, byId: Map<string, MemoryRow>, th
 
 export function defaultScope(scopes: ScopeKind[]): ScopeKind {
 	return scopes.includes("shared") ? "shared" : scopes.includes("personal") ? "personal" : "global";
+}
+
+/** Similarity of two texts as word-set Jaccard (lower-cased, punctuation ignored). */
+export function wordJaccard(a: string, b: string): number {
+	const words = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}\p{N}_./-]+/u).filter((w) => w.length > 1));
+	const x = words(a);
+	const y = words(b);
+	if (x.size === 0 || y.size === 0) return 0;
+	let inter = 0;
+	for (const w of x) if (y.has(w)) inter++;
+	return inter / (x.size + y.size - inter);
+}
+
+/** Cosine similarity at or above which a neighbour counts as the same fact without a judge. */
+export const NO_JUDGE_VEC_DUPLICATE = 0.93;
+/** Word Jaccard at or above which a neighbour counts as the same fact without a judge. */
+export const NO_JUDGE_TEXT_DUPLICATE = 0.8;
+
+/**
+ * Deterministic stand-in for the judge (no System One endpoint configured): a near-duplicate
+ * neighbour is reinforced, anything else is added. No importance/durability gate applies;
+ * the safety scan has already run.
+ */
+export function signalsWithoutJudge(c: Pick<Candidate, "caption" | "content">, neighbors: Neighbor[]): { signals: Signals; duplicate?: { id: string; why: string } } {
+	const text = `${c.caption}\n${c.content}`;
+	let best: { id: string; why: string; score: number } | undefined;
+	for (const n of neighbors) {
+		const j = wordJaccard(text, `${n.memory.caption}\n${n.memory.content}`);
+		const v = n.vecScore ?? 0;
+		const score = Math.max(j / NO_JUDGE_TEXT_DUPLICATE, v / NO_JUDGE_VEC_DUPLICATE);
+		if (score >= 1 && (!best || score > best.score)) {
+			best = { id: n.memory.id, why: v >= NO_JUDGE_VEC_DUPLICATE ? `cosine ${v.toFixed(2)}` : `word overlap ${(j * 100).toFixed(0)}%`, score };
+		}
+	}
+	const sure = (choice: string): ChoicePick => ({ choice, p: 1, probs: { [choice]: 1 }, confidence: 1 });
+	if (best) return { signals: { covered: sure(best.id), action: sure("Reinforce") }, duplicate: best };
+	return { signals: { action: sure("Add") } };
 }
 
 /** Combine the judge's answers (and the thresholds) into one action. */

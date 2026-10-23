@@ -3,6 +3,7 @@
  * One instance per Pi process; stateless with respect to the working directory
  * (every call passes the cwd so multiple sessions can share it).
  */
+import { migrateBaseDir, migrateSharedStore } from "./migrate.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -221,11 +222,22 @@ export class MemoryEngine {
 	private embedPromise: Promise<unknown> | undefined;
 	private urgencyPromise: Promise<unknown> | undefined;
 	private migrated = new Set<string>();
-	/** One-line notices shown once by the extension (e.g. a personal store moved to its git key). */
+	/** One-line notices shown once by the extension (realmem migration, a personal store moved to its git key). */
 	readonly notices: string[] = [];
 
 	constructor(baseDir?: string) {
-		const base = baseDir ?? process.env.REALCTX_HOME ?? join(agentDirFromEnv(), "realctx");
+		const explicit = baseDir ?? process.env.REALCTX_HOME;
+		const agentDir = agentDirFromEnv();
+		const base = explicit ?? join(agentDir, "realctx");
+		if (!explicit) {
+			// First start after realmem: move ~/.pi/agent/realmem/ here (database renamed, tables kept).
+			try {
+				const n = migrateBaseDir(agentDir, base);
+				if (n) this.notices.push(n);
+			} catch (err) {
+				this.notices.push(`realctx: could not migrate realmem data: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
 		this.paths = realctxPaths(base);
 		this.settings = loadSettings(this.paths.config);
 		this.settingsMtime = settingsMtime(this.paths.config);
@@ -283,6 +295,12 @@ export class MemoryEngine {
 		const p = ctx.project;
 		if (p && !this.migrated.has(p.root)) {
 			this.migrated.add(p.root);
+			try {
+				const n = migrateSharedStore(p.root);
+				if (n) this.notices.push(n);
+			} catch {
+				// best effort; the old directory stays in place
+			}
 			try {
 				if (migratePersonalStore(this.paths.personalRoot, p) > 0) {
 					const old = personalStore(this.paths.personalRoot, p.pathKey).id;

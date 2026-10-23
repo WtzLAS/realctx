@@ -1,11 +1,11 @@
-# realctx: Design Doc (v2, with realmem)
+# realctx: Design Doc (v2)
 
-**Status:** Draft
+**Status:** Implemented (this repository); §19 lists what is still open
 **Target:** Pi coding agent (extension), single-harness only
 **Supersedes:** realctx design v1
-**Incorporates:** [realmem](https://github.com/WtzLAS/realmem) (surprise-gated long-term memory for Pi)
+**Incorporates:** [realmem](https://github.com/WtzLAS/realmem) (surprise-gated long-term memory for Pi), which realctx replaces; its data migrates automatically (§16)
 
-**Summary:** realctx manages everything the model knows, at two time scales. Within a session, it drops spent tool outputs from the context and lets the model re-expand them. Across sessions, it keeps a small base of durable Markdown facts (realmem) that surface when relevant. Both run on one judge, one search index, one safety scanner and one path tracker, and the two layers feed each other: outputs that are about to be dropped are the main source of new memories.
+**Summary:** realctx manages everything the model knows, at two time scales. Within a session, it drops spent tool outputs from the context and lets the model re-expand them. Across sessions, it keeps a small base of durable Markdown facts that surface when relevant. Both run on one judge, one search index, one safety scanner and one path tracker, and the two layers feed each other: outputs that are about to be dropped, and what the user says, are the main sources of new memories.
 
 ---
 
@@ -48,13 +48,14 @@ From realmem:
 - The main model doesn't manage context. It recalls and remembers; it never cites IDs to free space.
 - No inline tags on assistant text.
 - Replace AGENTS.md / CLAUDE.md with recallable, path-scoped facts.
-- Existing realmem users upgrade with no data migration of their Markdown facts.
+- Existing realmem users upgrade automatically: data directories move on first start, Markdown facts and memory ids are unchanged (§16).
+- Works with no endpoints configured; the judge and the embedder improve it but are optional (§13.5).
 
 **Non-goals**
 
 - Harnesses other than Pi.
 - Summarizing or dropping user and assistant prose in v2 (tool outputs only).
-- Automatic consolidation without the user starting it (see §15).
+- Consolidation that writes without the user. A scheduled check only suggests (§15).
 
 ## 3. Overview
 
@@ -68,7 +69,7 @@ From realmem:
                       │       │                                                │
  turn_end ───────────►│  Drop filter ─► Judge ─► Verdict cache                 │
                       │                   │                                    │
-                      │                   └─ durable? ─► Extractor ─► Remember │
+ user message ───────►│  Judge ───────────┴─ durable? ─► Extractor ─► Remember │
                       │                                   path (surprise gate) │
                       │                                         │              │
                       │                                         ▼              │
@@ -76,7 +77,7 @@ From realmem:
                       │                                                        │
  context ────────────►│  Scheduler + Renderer (drops, placeholders, snapshot)  │
                       │                                                        │
- model tools ────────►│  real_recall / real_expand / real_remember / …         │
+ model tools ────────►│  realctx_recall / realctx_expand / realctx_remember …  │
                       │        └──────── Unified index (FTS5 + vec) ───────┘   │
                       └────────────────────────────────────────────────────────┘
 ```
@@ -85,14 +86,15 @@ From realmem:
 
 | Component | Used by |
 |---|---|
-| **Judge client** (System One adapter, batching, question splitting, rate limit) | Drop decisions, remember path, path urgency, consolidation |
+| **Judge client** (System One adapter, `/v1/systemone` with `/v1/decisions` fallback, question splitting, priority queue, rate limit) | Drop decisions, user-message capture, remember path, path urgency, consolidation |
 | **Embedder** | Memory dedup and recall, dropped-output search |
-| **Unified index** (FTS5 BM25 + sqlite-vec, CJK pre-tokenizer) | `real_recall` across memories and dropped outputs |
+| **Unified index** (FTS5 BM25 + sqlite-vec, CJK pre-tokenizer) | `realctx_recall` across memories and dropped outputs |
 | **Safety scanner** (secrets, prompt injection) | Remember path, judge payload redaction |
 | **Path tracker** (paths touched per tool call) | Path notes, drop supersession rules, expand staleness |
-| **Rewrite model** (a configured Pi model) | Memory Edit/Merge, fact extraction from outputs, summaries |
+| **Rewrite model** (a configured Pi model) | Memory Edit/Merge, fact extraction from outputs and user messages, summaries |
 | **Prompt snapshot** | One `<realctx>` system-prompt section per session |
 | **Lease lock + WAL** | Multi-process safety for every write |
+| **Process-shared engine** | One engine (database, index, clients, capture budget) for every session of a process (§13.6) |
 
 ### 3.2 Two layers
 
@@ -100,23 +102,27 @@ From realmem:
 |---|---|---|
 | **Context layer** | §6–§9 | Output store, drop filter, scheduler, renderer, expansion |
 | **Memory layer** | §10–§12 | Memory stores, remember path, path notes, consolidation |
-| **Bridges** | §13 | Drop-time capture, memory-backed drops, path-note survival |
+| **Bridges** | §13 | Drop-time and user-message capture, memory-backed drops, path-note survival, sessions |
 
 ## 4. Pi integration points
 
 | Hook / API | Context layer | Memory layer |
 |---|---|---|
-| `session_start` | Restore ID registry, drop set, verdicts | Resolve project key, check missing paths, check `.gitignore` |
+| `session_start` | Restore ID registry, drop set, pins; adopt a parent's originals (§13.6); detect conflicts | Migrate realmem data, resolve project key, check missing paths and `.gitignore`, prune expired outputs, scheduled consolidation check |
 | `before_agent_start` | — | Build or replay the `<realctx>` snapshot |
 | `tool_result` | Capture original into output store | Compute touched paths, append path notes |
-| `turn_end` | Queue drop candidates (background) | Persist shown-note ids (`realctx-shown`) |
+| `turn_end` | Persist registry and drops; queue drop candidates (background) | Persist shown-note ids (`realctx-shown`); user-message capture (background) |
+| `message_end` | Usage and cache telemetry per response | — |
+| `input` | — | Mark extension-sent messages as not the user's |
+| `session_tree`, `session_compact` | Rebuild the drop set for the new branch | Rebuild shown-note ids |
+| `session_shutdown` | — | Release the shared engine; withdraw the parent announcement |
 | `context` | Apply drops, render placeholders | — (notes already in tool results) |
-| `session_before_compact` | Cancel Pi compaction | — |
+| `session_before_compact` | Cancel Pi's threshold compaction (manual `/compact` and overflow recovery still run) | — |
 | `tool_call` | — | Block hidden memory tools (`ctx_memory`, …) |
-| `registerTool` | `real_expand` | `real_recall`, `real_remember`, `real_forget`, `real_list`, `real_status` |
-| `appendEntry` | ID registry, drop set | `realctx-snapshot`, `realctx-shown` |
+| `registerTool` | `realctx_expand` | `realctx_recall`, `realctx_remember`, `realctx_forget`, `realctx_list`, `realctx_status` |
+| `appendEntry` / `turn_end` entries | `realctx-ids` (registry), `realctx-drops` (drops, pins) | `realctx-snapshot`, `realctx-shown` |
 
-> Verify event payloads and the `registerTool` signature against the installed Pi version.
+Verified against Pi 1.4.0.
 
 ## 5. Identity
 
@@ -124,7 +130,7 @@ Two ID namespaces, deliberately different in shape so neither the model nor the 
 
 | Object | Stable key | Shown to the model as | Lifetime |
 |---|---|---|---|
-| Tool output | Pi `toolCallId` | `#42` (session ordinal) | Session |
+| Tool output | Pi `toolCallId`, scoped by session id | `#42` (session ordinal) | Session, then `context.retentionDays` after its last activity |
 | Memory | UUIDv7 | 22-char base64url, e.g. `AZJrPlwafS-aSxwtPk9aaw` | Forever |
 
 - Output ordinals are assigned on first sight and persisted, so `#42` means the same thing for the whole session.
@@ -144,9 +150,11 @@ On `tool_result`, realctx records the original output in the output store, with:
 - touched paths (from the path tracker) and file mtimes at capture time
 - any path-note memory IDs appended to this result (§11)
 
-Results below `context.capture_min_tokens` are not stored; they're never dropped.
+Results below `context.captureMinTokens` are not stored; they're never dropped. Path notes appended to a result are not part of the stored original.
 
-**Where originals live:** `~/.pi/agent/realctx/sessions/<project-key>/`, outside the project. Originals can contain secrets and must never land in the committed `.pi/realctx/` memory store.
+**Where originals live:** `~/.pi/agent/realctx/sessions/<project-key>/<session-id>/` (files mode 0600), outside the project. Originals can contain secrets and must never land in the committed `.pi/realctx/` memory store. Each session has its own directory; a child session copies what it inherits (§13.6).
+
+**Retention:** originals, their index rows, vectors and verdicts are deleted once their session has had no activity for `context.retentionDays` (default 7; `0` keeps them forever). Sessions open in the current process are never pruned. The check runs at session start, at most once an hour. A placeholder whose original expired can no longer be expanded; `realctx_expand` says so and the model re-runs the tool.
 
 ## 7. Deciding what to drop
 
@@ -154,16 +162,18 @@ Results below `context.capture_min_tokens` are not stored; they're never dropped
 
 **Never drop**
 
-- Results from the last `context.protect_turns` turns
-- Results under `context.drop_min_tokens`
-- Latest todo/plan snapshot; skill loads; tools in `context.protected_tools`
-- Unresolved errors (errored, no later successful retry)
+- Results from the last `context.protectTurns` turns
+- Results under `context.dropMinTokens`
+- Latest todo/plan snapshot; skill loads; tools in `context.protectedTools`
+- Unresolved errors (errored, no later successful call of the same tool on the same paths or arguments)
+- Outputs expanded within `context.repinTurns` turns
 
 **Drop or shrink without asking**
 
 - Exact duplicate calls: keep newest
 - An older `read` of a path the tracker saw read again later
 - Older edits to a path edited again later: shrink to a marker keeping path and region
+- A `realctx_expand` result whose pin expired (the original is still restorable)
 
 Everything else is a gray-zone candidate.
 
@@ -199,7 +209,7 @@ Everything else is a gray-zone candidate.
 | `durable_fact` | yes/no | Does it reveal a lasting fact about the project (setup, conventions, constraints), not task status? |
 | `action` | choice | keep / summarize / drop |
 
-> The yes/no type is `noul` in LLM Gateway's and realmem's usage; confirm against your provider's schema.
+The yes/no type is `noul` (LLM Gateway's System One schema).
 
 `durable_fact` is the bridge to the memory layer (§13.1). Asking it costs almost nothing, because the state is already being read.
 
@@ -207,70 +217,74 @@ Everything else is a gray-zone candidate.
 
 | Condition | Verdict |
 |---|---|
-| `still_needed` < `p_drop`, `unique_info` < `p_unique`, confidence ≥ `min_confidence` | **drop** |
-| `action` = summarize, or `unique_info` ≥ `p_unique` | **summarize** (rewrite model, §7.5) |
+| `still_needed` < `pDrop`, `unique_info` < `pUnique`, confidence ≥ `minConfidence` | **drop** |
+| (`action` = summarize, or `unique_info` ≥ `pUnique`), `still_needed` < `pKeep` | **summarize** (rewrite model, §7.5) |
 | Otherwise | **keep**, re-judge later |
 
-Independently: `durable_fact` ≥ `p_durable` → queue for capture (§13.1).
+Confidence is P(drop) + P(summarize) of the `action` answer. Independently: `durable_fact` ≥ `capture.pDurable` → capture (§13.1). With `judge.shadow` on (the default), verdicts are only logged; rule and emergency drops still apply. Without a judge, only the deterministic filter and emergency reclaim drop.
 
 ### 7.4 Verdict cache
 
-- Cached per `toolCallId`; invalidated when the goal changes, not per turn.
-- An expanded item is pinned as keep for `context.repin_turns` turns.
+- Cached per session and `toolCallId`; invalidated when the goal changes, not per turn.
+- An expanded item is pinned as keep for `context.repinTurns` turns.
+- At most `judge.maxPerPass` new candidates are judged per background pass.
 
 ### 7.5 Summaries
 
-The judge returns no text. Summaries come from the rewrite model (the same model realmem uses for Edit/Merge), with a deterministic fallback: head and tail lines, error lines, and paths. Summaries are generated in the background when the verdict is cached, never during the `context` hook.
+The judge returns no text. Summaries come from the rewrite model (the same model used for memory Edit/Merge), with a deterministic fallback: head and tail lines, error lines, and paths. Summaries are generated in the background when the verdict is cached, never during the `context` hook.
 
 ## 8. Applying drops
 
 Judging is eager and cheap; applying rewrites earlier messages and costs a cache rebuild. Queued drops apply only when:
 
-1. **Pressure:** usage of the safe input window ≥ `context.apply_threshold`.
-2. **Cache cold:** time since the last response ≥ `context.cache_ttl`.
-3. **Emergency:** usage ≥ `context.emergency_threshold`: apply everything queued, then drop the largest unprotected results by age until under `apply_threshold`.
+1. **Pressure:** usage of the safe input window ≥ `context.applyThreshold`.
+2. **Cache cold:** time since the last response ≥ `context.cacheTtl` (per-model overrides in `context.cacheTtlByModel`).
+3. **Emergency:** usage ≥ `context.emergencyThreshold`: apply everything queued, then drop the largest unprotected results until under `applyThreshold`.
+4. **Flush:** `/realctx flush`, or a cancelled threshold compaction, applies at the next request.
 
-All queued drops apply in one pass. The safe input window is the model's window minus an output reservation capped at 25%.
+All queued drops apply in one pass. Usage is the last response's reported tokens plus estimates for later messages, minus what was dropped since. The safe input window is the model's window minus an output reservation capped at 25%.
 
 ## 9. Rendering and recovery
 
 ### 9.1 Placeholders
 
 ```
-[#42 dropped · read src/auth/session.ts · 3.1k tok · real_expand(42)]
-[#57 summarized · bash pnpm test · 8.4k tok · real_expand(57)]
+[#42 dropped · read src/auth/session.ts · 3.1k tok · realctx_expand(42)]
+[#57 summarized · bash pnpm test · 8.4k tok · realctx_expand(57)]
   3 failing in auth/session.test.ts: expired-token cases
-[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw]
+[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · realctx_expand(63)]
+[#71 superseded · edit src/auth/session.ts · 1.4k tok · edited again in #80 · realctx_expand(71)]
 ```
 
 - Tool name and arguments let the model decide without expanding.
 - `saved as <id>` appears when the output's durable content became a memory (§13.2).
-- Rendered once, byte-stable. Nothing derived from mutable data.
+- Rendered once, frozen and persisted in `realctx-drops`; byte-identical on every request, after reload and after resume. Nothing derived from mutable data.
 
 ### 9.2 Forged-tag stripping
 
-The renderer removes whole placeholder, header and `<realctx-path-notes>` patterns from assistant messages before sending. Never partial removal.
+The renderer removes whole placeholder lines, `<realctx-path-notes>` blocks and `<realctx…>` tags from assistant messages before sending. Never partial removal.
 
-### 9.3 `real_expand`
+### 9.3 `realctx_expand`
 
 ```ts
-real_expand({ ids: number[], lines?: string, grep?: string })
+realctx_expand({ ids: number[], lines?: string, grep?: string })
 ```
 
 - Returns the original as a **new tool result** at the end; never restores in place.
-- Capped at `context.expand_max_tokens`; overflow returns the head plus a hint to use `lines` or `grep`.
+- Capped at `context.expandMaxTokens`; overflow returns the head plus a hint to use `lines` or `grep`.
 - **Staleness:** if the path tracker or mtimes show the file changed since capture, prepend "file edited since turn N; re-read for the current version."
-- **Repeats:** a second expand of the same ID within `repin_turns` returns a pointer to the first.
+- **Repeats:** a second expand of the same ID within `repinTurns` returns a pointer to the first.
+- **Missing:** an ID that was never captured in this session, or whose original expired (§6), is reported as not found.
 - **No path notes:** expansions don't count as touching their paths, so memories aren't shown twice.
 - Logs a false-drop signal for tuning (§14).
 
-Dropped outputs are also searchable through `real_recall` (§12).
+Dropped outputs are also searchable through `realctx_recall` (§12.2): BM25 over the stored text plus, when the embedding endpoint is set and `context.embedDropped` is on, vector search over dropped outputs (embedded in the background after each apply pass), fused by reciprocal rank. Only the current session's branch is searched; other sessions' outputs never are.
 
 ---
 
 # Part B: Memory layer
 
-This part keeps realmem's design, renamed into realctx's namespace. Where behavior is unchanged it is summarized, not restated.
+This part carries over the design of realmem, realctx's predecessor, in realctx's namespace. Where behavior is unchanged it is summarized, not restated.
 
 ## 10. Memory stores
 
@@ -286,7 +300,7 @@ This part keeps realmem's design, renamed into realctx's namespace. Where behavi
 
 ## 11. Remember path and path notes
 
-### 11.1 Remember path (unchanged from realmem)
+### 11.1 Remember path
 
 1. Safety scan: refuse (or redact) secrets; refuse injection patterns.
 2. Exact duplicate → reinforce.
@@ -295,11 +309,13 @@ This part keeps realmem's design, renamed into realctx's namespace. Where behavi
 5. Decision rules (confident `covered_by` → reinforce; confident `conflict_with` → edit; disjoint paths are not a conflict; `user_requested` bypasses the importance gate; `unsafe` rejects).
 6. Edit/Merge via the rewrite model, keeping the UUID, rescanned, with a deterministic fallback.
 7. Atomic write, then background index and embed.
-8. Judge or embedder down → per-project pending queue, retried automatically.
+8. Judge configured but unreachable, or the write lock held too long → per-project pending queue, retried automatically.
 
-**New in v2:** each candidate carries a `source`: `user`, `agent`, `import`, or `capture` (from the context layer, §13.1). `capture` candidates get stricter gates (§13.1).
+**Without a judge** (no endpoint, the default): steps 1–3 run, then a deterministic gate replaces steps 4–5. A neighbour with word-set Jaccard ≥ 0.8 or cosine ≥ 0.93 is a near duplicate and is reinforced (widening its paths if needed); anything else is added, with no importance or durability gate. Nothing is queued.
 
-### 11.2 Path notes (unchanged from realmem, renamed)
+**New in v2:** each candidate carries a `source`: `user`, `agent`, `import`, or `capture` (from the context layer, §13.1), and capture candidates an `origin` (`output` or `user`). `capture` candidates get stricter gates (§13.1).
+
+### 11.2 Path notes
 
 After each tool call, memories covering the touched paths are appended to the tool result inside `<realctx-path-notes>`:
 
@@ -309,7 +325,7 @@ After each tool call, memories covering the touched paths are appended to the to
 | Mid (≥ 0.75, or unjudged) | Caption with id |
 | Low | Counted only |
 
-Each memory shows once per session branch, tracked in `realctx-shown` entries. Per-result limits (`max_full`, `max_captions`, `char_budget`) demote overflow.
+Each memory shows once per session branch, tracked in `realctx-shown` entries. Per-result limits (`paths.maxFull`, `paths.maxCaptions`, `paths.charBudget`) demote overflow.
 
 Path notes share the tool result with the output, which interacts with dropping; see §13.3.
 
@@ -323,7 +339,7 @@ One `<realctx>` section, computed on the first prompt, stored as a `realctx-snap
 - recall before work; remember proactively
 - captions of the most-used project-wide memories
 - paths with path notes, e.g. `db (4), infra/terraform (2)`
-- one line on placeholders and `real_expand`
+- one line on placeholders and `realctx_expand`
 
 AGENTS.md / CLAUDE.md are stripped from the prompt once imported.
 
@@ -331,12 +347,12 @@ AGENTS.md / CLAUDE.md are stripped from the prompt once imported.
 
 | Tool | Does |
 |---|---|
-| `real_recall(queries?, paths?, ids?, sources?, page?, scope?)` | Hybrid search over memories **and** this session's dropped outputs. `sources` filters: `memory`, `output`, or both (default). Memories rank by path, then use, then relevance; outputs rank by relevance and recency. |
-| `real_remember(caption, content, scope?, paths?, user_requested?)` | Remember path (§11.1) |
-| `real_expand(ids, lines?, grep?)` | Restore dropped outputs (§9.3) |
-| `real_forget(ids)` | Delete memories |
-| `real_list(page?, scope?)` | List memories (large; demoted) |
-| `real_status()` | Context usage, queued drops, memory counts, warnings |
+| `realctx_recall(queries?, paths?, ids?, sources?, page?, scope?)` | Hybrid search over memories **and** this session's dropped outputs (BM25 + vectors, §9.3). `sources` filters: `memory`, `output`, or both (default). Memories rank by path, then use, then relevance; outputs rank by relevance and recency. Never searches other sessions' outputs. |
+| `realctx_remember(caption, content, scope?, paths?, user_requested?)` | Remember path (§11.1) |
+| `realctx_expand(ids, lines?, grep?)` | Restore dropped outputs (§9.3) |
+| `realctx_forget(ids)` | Delete memories |
+| `realctx_list(page?, scope?)` | List memories (large; demoted) |
+| `realctx_status()` | Context usage, queued drops, memory counts, warnings |
 
 Result entries are labeled by source so the two ID shapes are unambiguous:
 
@@ -345,11 +361,11 @@ memory AZJrPlwafS-aSxwtPk9aaw  Run e2e tests with pnpm test:e2e
 output #57                     bash pnpm test (turn 22) · 3 failing in auth/session.test.ts …
 ```
 
-**Compatibility:** `realmem_*` tool names stay registered as aliases for one release. The `realmem` skill becomes the `realctx` skill, covering recall, remember, scope choice, and expansion.
+**Naming:** every tool is prefixed `realctx_`. realmem's `realmem_*` tools and `/realmem` command are not kept as aliases; realmem's data migrates (§16), and realctx warns at session start if the realmem extension is still loaded. The `realctx` skill covers recall, remember, scope choice, and expansion.
 
 ### 12.3 Conflicting plugins
 
-realctx owns context management and memory end to end. At session start it detects other context managers (Magic Context, billion-context-pi, DCP-style pruners) and other memory systems, and refuses to run its context layer while they're active, with a message naming them. Calls to known foreign memory tools (`ctx_memory` by default) are blocked with a pointer to `real_remember`.
+realctx owns context management and memory end to end. At session start it detects other context managers (Magic Context, billion-context-pi, DCP-style pruners) and other memory systems, and refuses to run its context layer while they're active, with a message naming them. Calls to known foreign memory tools (`prompt.hideTools`, `ctx_memory` by default) are blocked with a pointer to `realctx_remember`. Detection uses tool names and source paths; generic names (`prune`, `discard`) count only when the source looks like a pruner. `context.conflictTools` adds names, `context.ignoreConflicts` overrides the refusal.
 
 ---
 
@@ -363,10 +379,16 @@ A drop marks the moment an output is spent, which is exactly when its durable co
 
 1. The rewrite model extracts 0–3 candidate facts from the original output (caption, content, paths from the tracker).
 2. Each candidate enters the remember path with `source: capture`.
-3. Capture candidates require `importance` ≥ `capture.min_importance` and `durable` ≥ `capture.min_durable`, both stricter than for agent-initiated remembers.
-4. Extraction runs in the background, rate-limited to `capture.max_per_session_hour`, and never delays a drop.
+3. Capture candidates require `importance` ≥ `capture.minImportance` and `durable` ≥ `capture.minDurable`, both stricter than for agent-initiated remembers.
+4. Extraction runs in the background, rate-limited to `capture.maxPerSessionHour` per session family (§13.6), and never delays a drop.
 
-Capture can be set to `"off"`, `"suggest"` (candidates are queued for approval in `/realctx manage`, reusing realmem's quarantine), or `"auto"`. The default is `suggest` until the false-capture rate is measured.
+Capture can be set to `"off"`, `"suggest"` (candidates are queued for approval in `/realctx captures` or `/realctx manage`), or `"auto"`. The default is `suggest` until the false-capture rate is measured.
+
+**User messages** (`capture.userMessages`, default on). Users state lasting preferences, decisions and corrections ("always use pnpm here", "no, the API is v2 now") that no tool output contains. After each turn, the latest user message is considered once:
+
+1. Skipped: messages under `capture.userMinChars`, slash and `!` commands, acknowledgements ("ok", "thanks", "go ahead"), expanded skills, messages sent by extensions (`input` with source `extension`), and every message of a subagent session (its "user" is the parent agent).
+2. With a judge: one `noul` question, `durable_user_fact` (does it state a lasting preference, decision, correction or project fact, not a one-off instruction?), over the redacted message and the previous agent reply. ≥ `capture.pDurable` goes on. Without a judge: only messages with an explicit cue (*always*, *never*, *prefer*, *from now on*, *we use*, …) go on.
+3. The rewrite model extracts 0–3 standalone facts, which follow `capture.mode` and the same budget. Suggestions record `origin: user`.
 
 ### 13.2 Memory-backed drops (memory → context)
 
@@ -377,9 +399,9 @@ If an output's durable content is already a memory, the output is safer to drop:
 
 ### 13.3 Path-note survival
 
-Path notes live inside tool results, so dropping a result would drop its notes, and realmem's once-per-branch rule would stop them reappearing. realctx handles this explicitly:
+Path notes live inside tool results, so dropping a result would drop its notes, and the once-per-branch rule would stop them reappearing. realctx handles this explicitly:
 
-- When a result is dropped, its path-note memory ids are removed from `realctx-shown`. The next touch of those paths shows them again. This mirrors realmem's existing behavior after compaction.
+- When a result is dropped, its path-note memory ids are removed from `realctx-shown`. The next touch of those paths shows them again, as after a compaction.
 - The judge never sees path-note text as part of the output (it's passed as `known_memories` instead), so notes don't inflate `unique_info`.
 - Path notes don't count toward the result's size for drop thresholds.
 
@@ -391,13 +413,13 @@ The tracker computes touched paths once per tool call (path arguments, plus `bas
 |---|---|
 | Path notes | Which memories to show |
 | Drop filter | Supersession (re-read and re-edit rules) |
-| `real_expand` | Staleness warnings |
+| `realctx_expand` | Staleness warnings |
 | Capture | Default `paths` for extracted facts |
-| `real_recall` | Ranking memories about recently touched paths first |
+| `realctx_recall` | Ranking memories about recently touched paths first |
 
 ### 13.5 Shared judge budget
 
-All judge calls (drop, remember, urgency, consolidation) share one client with batching, question splitting by the server's `max_questions`, and one rate limiter. Priority, highest first: remember path, drop decisions, path urgency, consolidation.
+All judge calls (drop, user capture, remember, urgency, consolidation) share one client per process with question splitting by the server's `maxQuestions`, `judge.concurrency` parallel requests and a `judge.minIntervalMs` rate limit. Queued requests run by priority, highest first: remember path, drop decisions and user capture, path urgency, consolidation. The client calls `/v1/systemone` and falls back to `/v1/decisions` on 404 (`judge.api` pins one).
 
 Failure policy differs by layer:
 
@@ -405,6 +427,23 @@ Failure policy differs by layer:
 |---|---|
 | Context | Keep everything; deterministic rules still run; re-judge later |
 | Memory | Queue the candidate; retry automatically |
+| User capture | Skip the message |
+
+| Layer | When no judge is configured (the default) |
+|---|---|
+| Context | Deterministic rules and emergency reclaim only |
+| Memory | Deterministic gate (§11.1); nothing queued |
+| User capture | Cue words only |
+| Consolidation | Reminder only (§15) |
+
+### 13.6 Sessions and subagents
+
+Every Pi session has its own context layer; the memory layer is shared.
+
+- **Own context layer.** Registry, ordinals, drops, pins and stored originals are per session. Every database query over outputs, vectors and verdicts is keyed by session id, so two sessions with the same tool call ids never see each other's outputs.
+- **Children.** A child session is a fork or clone (its header names the `parentSession`) or a subagent: a session started while a realctx session is running, which announces its id in `REALCTX_PARENT_SESSION` for subprocesses and in-process SDK sessions alike. A child that inherits branch entries copies the referenced originals into its own directory and re-registers them, so its placeholders stay byte-identical and restorable even after the parent's originals expire.
+- **Shared memory layer.** All sessions of a process share one engine (database, index, judge and embedding clients, pending-queue drain), opened by the first session and closed by the last. Across processes the database, WAL and lease locks already make sharing safe.
+- **Family budgets.** The capture budget is per session family (root session), so subagents cannot multiply it. Subagents never capture user messages and never show the consolidation suggestion.
 
 ## 14. Telemetry and rollout
 
@@ -419,77 +458,104 @@ Failure policy differs by layer:
 
 **Rollout**
 
-1. Ship with `judge.shadow: true` for the context layer and `capture: "suggest"`.
-2. Tune `p_drop`, `min_confidence` from the false-drop rate.
+1. Ship with `judge.shadow: true` for the context layer and `capture.mode: "suggest"`.
+2. Tune `pDrop`, `minConfidence` from the false-drop rate.
 3. Move capture to `"auto"` once accepted-suggestion rate is high.
 
 ## 15. Commands
 
-`/realctx` opens a menu; `/realmem` remains an alias.
+`/realctx` opens a menu.
 
 | Subcommand | Does |
 |---|---|
 | `status` | Context usage, queued drops, memory counts, warnings |
 | `manage [query]` | Browse memories and pending captures; edit, re-scope, approve |
+| `captures` | Approve, edit or reject captured facts (from outputs or the user) |
 | `outputs` | Browse this session's captured outputs, verdicts and drops |
 | `flush` | Apply queued drops now, ignoring the cache TTL |
 | `settings` | Judge, embedder, rewrite model, thresholds; connectivity tests |
-| `debug` | Dry-run a drop decision or a remember, showing raw judge answers |
-| `add`, `import`, `prune-paths`, `consolidate`, `fix-gitignore`, `embed`, `reindex`, `retry` | As in realmem |
+| `debug [#N]` | Dry-run a drop decision (`#N`) or a remember, showing raw judge answers |
+| `add`, `import`, `prune-paths`, `consolidate`, `fix-gitignore`, `embed`, `reindex`, `retry` | Memory maintenance |
 
-Consolidation stays user-started, as in realmem: a judge review against same-store neighbours (forget, cover, supersede, merge, revise), then a path-revision pass.
+Consolidation writes only when the user runs it: a judge review against same-store neighbours (forget, cover, supersede, merge, revise), then a path-revision pass.
+
+**Scheduled suggestion** (`consolidate.schedule`). At session start (not in subagents), when the stores visible from the cwd hold at least `minMemories` memories and were last consolidated, or first seen, more than `everyDays` days ago:
+
+- `plan` (default): with a judge, make a dry-run plan in the background, store it, and notify with its summary. `/realctx consolidate` then offers to apply that stored plan as is (memories changed since are skipped) or to plan again. Without a judge it behaves like `remind`.
+- `remind`: only notify, suggesting `/realctx consolidate`.
+- `off`.
+
+Each period suggests once; running `/realctx consolidate` resets the clock. Nothing is ever written by the schedule.
 
 ## 16. Storage
 
 | Data | Location |
 |---|---|
 | Memory facts | Markdown files per scope (§10) |
-| Database (index, embeddings, usage, urgency, locks, pending, approvals, verdicts, output metadata) | `~/.pi/agent/realctx/realctx.sqlite` (WAL, lease locks) |
-| Output originals | `~/.pi/agent/realctx/sessions/<project-key>/` |
-| Session state | `appendEntry`: ID registry, drop set, `realctx-snapshot`, `realctx-shown` |
+| Database (index, embeddings, usage, urgency, locks, pending, suggestions, verdicts, output metadata and vectors, schedule, telemetry) | `~/.pi/agent/realctx/realctx.sqlite` (WAL, lease locks) |
+| Output originals | `~/.pi/agent/realctx/sessions/<project-key>/<session-id>/` (retention §6) |
+| Session state | Session entries: `realctx-ids`, `realctx-drops`, `realctx-snapshot`, `realctx-shown` |
 | Config | `~/.pi/agent/realctx/config.json` (mode 0600; keys as `$VAR` or `env:VAR`) |
 
-**Migration from realmem:** on first start, `~/.pi/agent/realmem/` is moved to `~/.pi/agent/realctx/` (database renamed, tables kept), and project stores at `.pi/realmem/` are moved to `.pi/realctx/` with a one-line notice. Memory IDs and file contents are unchanged. Session entries named `realmem-*` are read as their `realctx-*` equivalents.
+**Migration from realmem** (automatic, unless `REALCTX_HOME` points elsewhere):
+
+- On first start, `~/.pi/agent/realmem/` is moved to `~/.pi/agent/realctx/`, renaming `realmem.sqlite` (with its `-wal`/`-shm` files) to `realctx.sqlite`; tables are kept and upgraded by the normal schema migration. If both directories exist, only a missing database is brought over; an existing realctx database is never overwritten.
+- The first time a project is seen, its `.pi/realmem/` store is moved to `.pi/realctx/` (or merged file by file, leaving clashes for review), with a notice to commit the move.
+- Memory ids and file contents are unchanged. Session entries `realmem-snapshot` and `realmem-shown` are read as their `realctx-*` equivalents, so resumed sessions keep their prompt and shown notes.
+- Tool names are not aliased (§12.2).
 
 ## 17. Configuration
 
+`~/.pi/agent/realctx/config.json`, edited in `/realctx settings`. The judge connection is stored as `semif`; `judge.endpoint`, `judge.model`, `judge.key`, `judge.timeout_ms` and `judge.max_questions` are accepted as aliases.
+
 | Key | Default | Meaning |
 |---|---|---|
-| `judge.endpoint`, `judge.model`, `judge.key` | — | Shared System One judge |
-| `judge.timeout_ms` | `3000` | Per-request timeout |
-| `judge.max_questions` | server limit | Split questions across requests |
+| `semif.endpoint`, `semif.model`, `semif.apiKey` | none | Shared System One judge. Empty or `"none"` = not configured (§13.5) |
+| `semif.timeoutMs`, `semif.maxQuestions` | `180000`, `16` | Per-request timeout; split questions across requests |
+| `embedding.endpoint`, `embedding.model`, `embedding.apiKey` | none | Without it: BM25-only search and dedup |
+| `rewriteModel` | session model | Pi model for Edit/Merge, extraction, summaries |
 | `judge.shadow` | `true` | Context layer logs verdicts without acting |
-| `embedding.endpoint`, `embedding.model` | — | Without it: BM25-only search and dedup |
-| `rewrite.model` | — | Pi model for Edit/Merge, extraction, summaries |
-| `context.capture_min_tokens` | `1000` | Smaller outputs aren't stored or dropped |
-| `context.drop_min_tokens` | `1000` | Never drop below this |
-| `context.protect_turns` | `4` | Recent turns immune from dropping |
-| `context.protected_tools` | `["todo", "skill"]` | Never dropped (latest instance for snapshots) |
-| `context.p_drop` | `0.15` | Max `still_needed` to drop |
-| `context.p_unique` | `0.3` | Max `unique_info` to drop |
-| `context.min_confidence` | `0.7` | Min judge confidence to act |
-| `context.apply_threshold` | `0.65` | Safe-window usage that applies queued drops |
-| `context.emergency_threshold` | `0.9` | Emergency reclaim |
-| `context.cache_ttl` | `"5m"` | Provider cache lifetime; per-model override |
-| `context.expand_max_tokens` | `4000` | Cap per expansion |
-| `context.repin_turns` | `10` | Expanded items stay kept |
+| `judge.concurrency`, `judge.minIntervalMs` | `1`, `0` | Parallel judge requests; rate limit |
+| `judge.api` | `"auto"` | `auto` / `systemone` / `decisions` |
+| `judge.maxPerPass` | `6` | New drop candidates judged per background pass |
+| `context.enabled` | `true` | Context layer on/off |
+| `context.captureMinTokens` | `1000` | Smaller outputs aren't stored or dropped |
+| `context.dropMinTokens` | `1000` | Never drop below this |
+| `context.protectTurns` | `4` | Recent turns immune from dropping |
+| `context.protectedTools` | `["todo", "todo_write", "TodoWrite", "skill"]` | Never dropped (latest instance for snapshots) |
+| `context.pDrop`, `context.pUnique`, `context.pKeep` | `0.15`, `0.3`, `0.5` | Policy thresholds (§7.3) |
+| `context.minConfidence` | `0.7` | Min judge confidence to act |
+| `context.applyThreshold` | `0.65` | Safe-window usage that applies queued drops |
+| `context.emergencyThreshold` | `0.9` | Emergency reclaim |
+| `context.cacheTtl`, `context.cacheTtlByModel` | `"5m"`, `{}` | Provider cache lifetime; per-model override |
+| `context.expandMaxTokens` | `4000` | Cap per expansion |
+| `context.repinTurns` | `10` | Expanded items stay kept |
+| `context.retentionDays` | `7` | Originals of inactive sessions are deleted after this; `0` = forever |
+| `context.embedDropped` | `true` | Vector search over dropped outputs (needs the embedder) |
+| `context.cancelCompaction` | `true` | Cancel Pi's threshold compaction while active |
+| `context.conflictTools`, `context.ignoreConflicts` | `[]`, `false` | Conflict detection (§12.3) |
 | `capture.mode` | `"suggest"` | `off` / `suggest` / `auto` |
-| `capture.p_durable` | `0.7` | `durable_fact` needed to attempt capture |
-| `capture.min_importance` | stricter than remember | Gate for capture candidates |
-| `capture.max_per_session_hour` | `6` | Rate limit |
-| `path_notes.high`, `path_notes.mid` | `1.5`, `0.75` | Urgency tiers |
-| `path_notes.max_full`, `max_captions`, `char_budget` | as realmem | Per-result limits |
+| `capture.pDurable` | `0.7` | `durable_fact` / `durable_user_fact` needed to attempt capture |
+| `capture.minImportance`, `capture.minDurable` | `1.5`, `0.7` | Gates for capture candidates (stricter than `thresholds.*`) |
+| `capture.maxPerSessionHour` | `6` | Rate limit per session family |
+| `capture.userMessages`, `capture.userMinChars` | `true`, `24` | User-message capture (§13.1) |
+| `thresholds.urgencyHigh`, `thresholds.urgencyMid` | `1.5`, `0.75` | Path-note urgency tiers |
+| `paths.maxFull`, `paths.maxCaptions`, `paths.charBudget` | `3`, `8`, `6000` | Per-result path-note limits |
 | `consolidate.neighbors` | `12` | Same-store neighbours reviewed |
 | `consolidate.forget`, `consolidate.revise` | `0.7`, `0.7` | Probability thresholds |
-| `consolidate.min_importance` | `0.5` | Below this: forget |
+| `consolidate.minImportance` | `0.5` | Below this: forget |
+| `consolidate.schedule.mode`, `.everyDays`, `.minMemories` | `"plan"`, `14`, `20` | Scheduled suggestion (§15) |
 
 ## 18. Failure handling
 
 | Failure | Behavior |
 |---|---|
-| Judge down | Context: keep all. Memory: queue and retry |
+| Judge not configured | Deterministic paths everywhere (§13.5) |
+| Judge down | Context: keep all. Memory: queue and retry. User capture: skip |
 | Embedder down | BM25-only neighbours and search |
 | Output store unreadable | Disable dropping; never drop what can't be restored |
+| Original expired (retention) | Placeholder stays; `realctx_expand` reports it as not found |
+| realmem migration fails | Notice at session start; the old directory stays in place |
 | Memory write lock held > 2 min | Queue the candidate |
 | Foreign context manager detected | Context layer off, memory layer on, warning shown |
 | Rendering exception | Pass messages through unchanged; log loudly |
@@ -498,12 +564,20 @@ realctx never blocks the agent's turn on its own work.
 
 ## 19. Open questions
 
-1. **Capture granularity.** Should capture also consider user messages (corrections, stated preferences), or stay limited to tool outputs?
-2. **Endpoint drift.** LLM Gateway has added `/v1/decisions` and plans to deprecate `/v1/systemone` for its own service. The judge adapter should support both.
-3. **Local-first judging.** Should the default judge be local (Ollama), since drop decisions send tool output excerpts?
-4. **Idle consolidation.** realmem consolidates only on request. Is a scheduled, suggest-only run worth adding?
-5. **Subagents.** Separate context layer per child session, with the memory layer shared?
-6. **Output retention.** How long to keep originals for ended sessions, and whether `real_recall` should search other sessions' outputs.
+Resolved in the implementation:
+
+1. **Capture granularity.** User messages are captured too (§13.1), judged after each turn; subagent and extension-sent messages are excluded.
+2. **Endpoint drift.** The judge client supports both `/v1/systemone` and `/v1/decisions` (§13.5).
+3. **Idle consolidation.** A scheduled, suggest-only check exists; it can make the plan in the background but never writes (§15).
+4. **Subagents.** Separate context layer per child session, memory layer shared (§13.6).
+5. **Output retention.** Originals are kept for `context.retentionDays` (7) after a session's last activity; `realctx_recall` never searches other sessions' outputs (§6, §9.3).
+6. **Endpoints.** None by default; everything works without them, with deterministic fallbacks (§13.5).
+
+Still open:
+
+1. **Local-first judging.** Should a local judge (e.g. Ollama) be suggested, since drop decisions send tool output excerpts? Today nothing is sent until the user configures an endpoint.
+2. **Telemetry reports.** Usage, drops, expansions and captures are logged, but no false-drop-rate or cache-hit report is computed yet.
+3. **Summaries of prose.** Dropping or summarizing old user and assistant prose remains a non-goal for v2.
 
 ## 20. References
 

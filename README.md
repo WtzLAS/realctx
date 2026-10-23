@@ -413,6 +413,16 @@ Watch `/realctx outputs` and `/realctx status` for a while, then turn shadow off
 `/realctx settings` (rule-based drops of re-read, re-edited and duplicate outputs apply
 from the start).
 
+### Upgrading from realmem
+
+realctx replaces realmem: remove realmem from your Pi packages (realctx warns while it is
+still loaded). On first start realctx moves `~/.pi/agent/realmem/` to
+`~/.pi/agent/realctx/` (database renamed, tables kept; an existing realctx database is
+never overwritten), and the first time it sees a project it moves `.pi/realmem/` to
+`.pi/realctx/`, or merges it file by file (commit the move). Memory ids and file
+contents are unchanged, and resumed sessions read their `realmem-*` entries as the
+`realctx-*` ones. The tools are now `realctx_*`; there are no `realmem_*` aliases.
+
 ## Development
 
 ```bash

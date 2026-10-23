@@ -12,6 +12,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatPlan, planSummary } from "../../src/consolidate.ts";
 import type { MemoryEngine } from "../../src/engine.ts";
+import { canonicalEntryType } from "../../src/migrate.ts";
 import { checkConsolidation, markConsolidated, pruneOutputsThrottled, storedPlan } from "../../src/jobs.ts";
 import { acquireEngine, announceParent, announcedParent, closeSession, openSession, openSessions, releaseEngine, sessionIdFromRef, setParent } from "../../src/shared.ts";
 import type { ScopeKind } from "../../src/files.ts";
@@ -174,7 +175,8 @@ export default function realctx(pi: ExtensionAPI) {
 		snapshot = undefined;
 		notes.reset(ctx.sessionManager.getBranch());
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY) {
+			// realmem-snapshot entries of sessions started before the rename count as realctx-snapshot.
+			if (entry.type === "custom" && canonicalEntryType(entry.customType) === SNAPSHOT_ENTRY) {
 				const data = entry.data as SessionSnapshot | undefined;
 				if (typeof data?.v === "number" && data.v >= 1 && typeof data.prompt === "string") snapshot = data; // older snapshots stay valid: never change a running session's prompt
 			}
@@ -208,6 +210,14 @@ export default function realctx(pi: ExtensionAPI) {
 			);
 		}
 		for (const n of e.notices.splice(0)) if (ctx.hasUI) ctx.ui.notify(n, "info");
+		// realctx replaces realmem: both loaded would append path notes twice and fight over the prompt.
+		try {
+			if (pi.getAllTools().some((t) => t.name.startsWith("realmem_")) && ctx.hasUI) {
+				ctx.ui.notify("realctx: the realmem extension is still loaded. realctx replaces it (its data was migrated); remove realmem from your Pi packages.", "warning");
+			}
+		} catch {
+			// tool list unavailable
+		}
 		// Other memory systems' tools are hidden so the model only uses realctx.
 		const hide = new Set(e.settings.prompt.hideTools);
 		if (hide.size > 0) {

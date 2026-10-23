@@ -430,3 +430,7 @@ npm test          # unit + engine (mock embedding/SemIf servers, multi-process l
 npx tsc --noEmit
 REALCTX_HOME=$(mktemp -d) pi -e ./extensions/realctx/index.ts   # isolated data dir
 ```
+
+## License
+
+[MIT](LICENSE)

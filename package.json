@@ -9,7 +9,7 @@
   "pi": {
     "extensions": ["./extensions/realctx/index.ts"]
   },
-  "files": ["src", "extensions", "skills", "docs", "README.md"],
+  "files": ["src", "extensions", "skills", "docs", "README.md", "LICENSE"],
   "scripts": {
     "test": "node --test --test-timeout=60000 tests/*.test.ts",
     "typecheck": "tsc --noEmit"

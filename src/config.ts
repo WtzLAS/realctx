@@ -78,8 +78,12 @@ export interface Settings {
 		cancelCompaction: boolean;
 		/** Extra tool names that identify a foreign context manager. */
 		conflictTools: string[];
-		/** Run the context layer even when a foreign context manager is detected. */
-		ignoreConflicts: boolean;
+		/**
+		 * Other context managers in the same Pi (§12.3): `disable` = warn, deactivate and block their
+		 * tools now and turn their package off in Pi's settings (realctx's context layer runs after
+		 * /reload); `warn` = only warn, realctx's context layer stays off; `ignore` = run next to them.
+		 */
+		conflictAction: "disable" | "warn" | "ignore";
 		/** Days to keep stored originals of sessions without activity (0 = keep forever). */
 		retentionDays: number;
 		/** Embed dropped outputs so realctx_recall finds them by meaning (needs the embedding endpoint). */
@@ -236,7 +240,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		repinTurns: 10,
 		cancelCompaction: true,
 		conflictTools: [],
-		ignoreConflicts: false,
+		conflictAction: "disable",
 		retentionDays: 7,
 		embedDropped: true,
 	},
@@ -395,6 +399,10 @@ export function normalizeSettings(input: unknown): Settings {
 	c.applyThreshold = Math.min(clamp(c.applyThreshold, 0.05, 1), c.emergencyThreshold);
 	c.expandMaxTokens = Math.round(clamp(c.expandMaxTokens, 200, 200_000));
 	c.repinTurns = Math.round(clamp(c.repinTurns, 0, 1000));
+	// Older configs: `ignoreConflicts: true` meant "run next to them".
+	const rawCtx = isObject(raw) && isObject(raw.context) ? raw.context : {};
+	if (rawCtx.conflictAction === undefined && rawCtx.ignoreConflicts === true) c.conflictAction = "ignore";
+	if (!["disable", "warn", "ignore"].includes(c.conflictAction)) c.conflictAction = "disable";
 	if (!["off", "suggest", "auto"].includes(s.capture.mode)) s.capture.mode = "suggest";
 	s.capture.pDurable = clamp(s.capture.pDurable, 0, 1);
 	s.capture.minDurable = clamp(s.capture.minDurable, 0, 1);

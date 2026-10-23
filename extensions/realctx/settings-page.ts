@@ -432,6 +432,17 @@ function fields(): FieldDef[] {
 			values: ["on", "off"],
 		},
 		{
+			id: "context.conflictAction",
+			label: "Other context managers",
+			description: "disable = warn, deactivate their tools and turn their package off in Pi's settings (/reload to finish); warn = only warn (realctx's context layer stays off); ignore = run next to them. Undo with /realctx conflicts enable.",
+			get: (s) => s.context.conflictAction,
+			set: (s, v) => {
+				s.context.conflictAction = v as Settings["context"]["conflictAction"];
+			},
+			kind: "cycle",
+			values: ["disable", "warn", "ignore"],
+		},
+		{
 			id: "context.enabled",
 			label: "Context layer",
 			description: "Capture tool outputs and drop spent ones from the context (placeholders + realctx_expand). Off = memory layer only.",

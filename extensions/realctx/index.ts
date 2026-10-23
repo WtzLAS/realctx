@@ -22,7 +22,9 @@ import { describeIgnoreProblem, SHARED_REL } from "../../src/gitignore.ts";
 import { displayPath } from "../../src/paths.ts";
 import { buildSessionPrompt, SNAPSHOT_ENTRY, SNAPSHOT_VERSION, type SessionSnapshot } from "../../src/prompt.ts";
 import { sha256 } from "../../src/text.ts";
-import { ContextLayer, detectConflicts, type MessageView } from "./context-layer.ts";
+import { ContextLayer, type MessageView } from "./context-layer.ts";
+import { type ConflictPlugin, type DisabledRecord, detectConflictPlugins, disabledKey, disableInSettings, enableInSettings } from "../../src/conflicts.ts";
+import { agentDirFromEnv } from "../../src/config.ts";
 import { openDebug } from "./debug-page.ts";
 import { PathNoteState } from "./path-notes.ts";
 import { openManage } from "./manage-page.ts";
@@ -50,6 +52,7 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "prune-paths", description: "drop paths that no longer exist; delete memories whose paths are all gone" },
 	{ name: "consolidate", description: "SemIf reviews every memory to forget, merge and revise; the Edit/Merge model revises paths from a repo summary" },
 	{ name: "fix-gitignore", description: "check whether .pi/realctx is ignored by git and add the fix to .gitignore" },
+	{ name: "conflicts", description: "other context managers next to realctx; `conflicts enable <name>` / `conflicts disable <name>`" },
 ];
 
 export default function realctx(pi: ExtensionAPI) {
@@ -66,6 +69,79 @@ export default function realctx(pi: ExtensionAPI) {
 	};
 	let sessionId = "";
 	let unannounce: (() => void) | undefined;
+	/** Foreign context managers found at session start, and the tools realctx deactivated and blocks. */
+	let conflictPlugins: ConflictPlugin[] = [];
+	const blockedTools = new Map<string, string>();
+
+	/** Deactivate a plugin's tools now and block any call to them (its hooks still run until /reload). */
+	const silence = (p: ConflictPlugin) => {
+		for (const t of p.tools) blockedTools.set(t, p.name);
+		const active = pi.getActiveTools();
+		const off = new Set(p.tools);
+		if (active.some((t) => off.has(t))) pi.setActiveTools(active.filter((t) => !off.has(t)));
+	};
+
+	/**
+	 * Warn about and (per `context.conflictAction`) disable other context managers (§12.3).
+	 * Returns the names that keep realctx's context layer off for this session.
+	 */
+	const handleConflicts = async (ctx: ExtensionContext, e: MemoryEngine, subagent: boolean): Promise<string[]> => {
+		let found: ConflictPlugin[] = [];
+		try {
+			found = detectConflictPlugins(pi.getAllTools(), e.settings.context.conflictTools);
+		} catch {
+			found = [];
+		}
+		conflictPlugins = found;
+		blockedTools.clear();
+		if (found.length === 0) return [];
+		const action = e.settings.context.conflictAction;
+		const lines: string[] = [];
+		const changed: string[] = [];
+		for (const p of found) {
+			const allowed = !!e.db.getSchedule(`conflict-allowed:${p.source}`);
+			const what = p.kind === "memory" ? "a memory system realctx replaces" : "it also rewrites the context";
+			if (action === "ignore" || allowed) {
+				lines.push(`${p.name} is loaded next to realctx (${what})${allowed ? "; kept on by /realctx conflicts enable" : ""}.`);
+				continue;
+			}
+			if (action === "warn") {
+				lines.push(`${p.name} is loaded next to realctx (${what}). Remove it, or run /realctx conflicts disable "${p.name}".`);
+				continue;
+			}
+			silence(p);
+			let settings = "";
+			if (subagent) settings = "";
+			else if (p.scope === "project" && !ctx.isProjectTrusted?.()) settings = "; its project package was left on (project not trusted)";
+			else {
+				try {
+					const r = await disableInSettings(p, ctx.cwd, agentDirFromEnv());
+					if (r.ok) {
+						if (!r.unchanged) {
+							const rec: DisabledRecord = { name: p.name, source: p.source, scope: p.scope, origin: p.origin, file: r.file, previous: r.previous };
+							e.db.setSchedule(disabledKey(p.source), Date.now(), rec);
+							changed.push(p.name);
+						}
+						settings = `; its package is now off in ${displayPath(r.file, ctx.cwd)}`;
+					} else settings = `; remove it yourself (${r.reason})`;
+				} catch (err) {
+					settings = `; could not change Pi settings (${err instanceof Error ? err.message : String(err)})`;
+				}
+			}
+			lines.push(`disabled ${p.name} (${what}): ${p.tools.length} tool(s) deactivated and blocked${settings}.`);
+		}
+		const keepOff = found.filter((p) => p.kind === "context" && action !== "ignore").map((p) => p.name);
+		if (ctx.hasUI && !subagent) {
+			const tail =
+				changed.length > 0
+					? ` Run /reload to unload ${changed.join(", ")} completely; until then its hooks still run, so realctx's context layer stays off.`
+					: keepOff.length > 0
+						? " realctx's context layer stays off while it is loaded; the memory layer works."
+						: "";
+			ctx.ui.notify(`realctx: ${lines.join(" ")}${tail} Undo with /realctx conflicts enable.`, "warning");
+		}
+		return keepOff;
+	};
 
 	/** Parent of the current session: fork/clone header, else the session that spawned this process. */
 	const familyOf = (ctx: ExtensionContext): { parent?: string; subagent: boolean } => {
@@ -188,36 +264,17 @@ export default function realctx(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`realctx failed to start: ${err instanceof Error ? err.message : String(err)}`, "error");
 			return;
 		}
-		// Context layer: refuse to run next to another context manager (§12.3).
-		let conflicts: string[] = [];
-		try {
-			conflicts = detectConflicts(pi.getAllTools(), e.settings.context.conflictTools);
-		} catch {
-			conflicts = [];
-		}
+		// The engine is shared by every session of the process: pick up config edits made since it opened.
+		e.reloadSettingsIfChanged();
 		const family = familyOf(ctx);
+		// Other context managers: warn, disable them (§12.3), and keep the context layer off while they run.
+		const conflicts = await handleConflicts(ctx, e, family.subagent);
 		try {
 			layer.reset(ctx, conflicts, family);
 		} catch (err) {
 			layer.disabledReason = `failed to start: ${err instanceof Error ? err.message : String(err)}`;
 		}
-		if (conflicts.length > 0 && ctx.hasUI) {
-			ctx.ui.notify(
-				e.settings.context.ignoreConflicts
-					? `realctx: running the context layer next to ${conflicts.join(", ")} (context.ignoreConflicts); expect both to rewrite the context`
-					: `realctx: context layer off because ${conflicts.join(", ")} also manages the context; the memory layer stays on. Disable ${conflicts.join(", ")} to let realctx drop spent outputs.`,
-				"warning",
-			);
-		}
 		for (const n of e.notices.splice(0)) if (ctx.hasUI) ctx.ui.notify(n, "info");
-		// realctx replaces realmem: both loaded would append path notes twice and fight over the prompt.
-		try {
-			if (pi.getAllTools().some((t) => t.name.startsWith("realmem_")) && ctx.hasUI) {
-				ctx.ui.notify("realctx: the realmem extension is still loaded. realctx replaces it (its data was migrated); remove realmem from your Pi packages.", "warning");
-			}
-		} catch {
-			// tool list unavailable
-		}
 		// Other memory systems' tools are hidden so the model only uses realctx.
 		const hide = new Set(e.settings.prompt.hideTools);
 		if (hide.size > 0) {
@@ -434,6 +491,13 @@ export default function realctx(pi: ExtensionAPI) {
 
 	// Calls to other memory systems' tools are refused, even when they stay active.
 	pi.on("tool_call", (event) => {
+		const owner = blockedTools.get(event.toolName);
+		if (owner) {
+			return {
+				block: true,
+				reason: `${event.toolName} belongs to ${owner}, which realctx disabled: realctx manages the context and memory here. Use realctx_recall / realctx_remember / realctx_expand instead.`,
+			};
+		}
 		if (!engine) return;
 		if (!engine.settings.prompt.hideTools.includes(event.toolName)) return;
 		return {
@@ -709,6 +773,9 @@ export default function realctx(pi: ExtensionAPI) {
 					case "fix-gitignore":
 						await fixGitignore(ctx, e);
 						break;
+					case "conflicts":
+						await conflictsCommand(ctx, e, rest, conflictPlugins, silence);
+						break;
 					default:
 						ctx.ui.notify(`realctx: unknown subcommand "${sub}". Try: ${SUBCOMMANDS.map((s) => s.name).join(", ")}`, "warning");
 				}
@@ -812,4 +879,84 @@ async function fixGitignore(ctx: ExtensionCommandContext, e: MemoryEngine): Prom
 	const after = e.sharedIgnored(project.root, true);
 	if (after) ctx.ui.notify(`realctx: ${fix.file} was updated, but ${SHARED_REL}/ is still ignored:\n${describeIgnoreProblem(after)}`, "error");
 	else ctx.ui.notify(`realctx: updated ${fix.file}; ${SHARED_REL}/ is no longer ignored. Commit ${fix.file} and ${SHARED_REL}/ to share memories.`, "info");
+}
+
+/** Strip optional quotes around a plugin name argument. */
+function unquote(s: string): string {
+	return s.trim().replace(/^["'](.*)["']$/, "$1");
+}
+
+/**
+ * /realctx conflicts [enable|disable <name>]: list other context managers and the ones realctx
+ * disabled; re-enable one (restores its package entry and stops auto-disabling it) or disable one.
+ */
+async function conflictsCommand(
+	ctx: ExtensionCommandContext,
+	e: MemoryEngine,
+	args: string,
+	loaded: ConflictPlugin[],
+	silence: (p: ConflictPlugin) => void,
+): Promise<void> {
+	const [verb = "", ...restWords] = args.trim().split(/\s+/);
+	const target = unquote(restWords.join(" ")).toLowerCase();
+	const disabled = e.db.listSchedule("conflict-disabled:").map((r) => r.data as DisabledRecord).filter((r) => r && typeof r.source === "string");
+	const matches = (n: { name: string; source: string }) => !target || n.name.toLowerCase() === target || n.source.toLowerCase().includes(target);
+	if (verb === "" || verb === "list") {
+		const lines = ["Other context managers", ""];
+		for (const p of loaded) lines.push(`loaded    ${p.name}  (${p.source}, ${p.scope}) · tools: ${p.tools.join(", ")}`);
+		for (const d of disabled) if (!loaded.some((p) => p.source === d.source)) lines.push(`disabled  ${d.name}  (${d.source}) · off in ${d.file}`);
+		for (const a of e.db.listSchedule("conflict-allowed:")) lines.push(`allowed   ${a.key.slice("conflict-allowed:".length)}  (kept on by you)`);
+		if (lines.length === 2) lines.push("none detected");
+		lines.push("", `context.conflictAction = ${e.settings.context.conflictAction}`, "/realctx conflicts enable <name> · /realctx conflicts disable <name>");
+		if (ctx.mode === "tui") await showText(ctx, "realctx conflicts", () => lines);
+		else ctx.ui.notify(lines.join("\n"), "info");
+		return;
+	}
+	const agentDir = agentDirFromEnv();
+	if (verb === "enable") {
+		const todo = disabled.filter(matches);
+		const extra = loaded.filter((p) => matches(p) && !todo.some((d) => d.source === p.source));
+		if (todo.length === 0 && extra.length === 0) {
+			ctx.ui.notify(`realctx: nothing to enable${target ? ` for "${target}"` : ""}`, "info");
+			return;
+		}
+		const names = [...todo.map((d) => d.name), ...extra.map((p) => p.name)];
+		if (ctx.hasUI && !(await ctx.ui.confirm(`Re-enable ${names.join(", ")}?`, "Their package entry is restored in Pi's settings and realctx stops disabling them. realctx's context layer stays off while they are loaded; the memory layer keeps working."))) return;
+		const out: string[] = [];
+		for (const d of todo) {
+			const r = await enableInSettings(d, d.previous, ctx.cwd, agentDir);
+			e.db.deleteSchedule(disabledKey(d.source));
+			e.db.setSchedule(`conflict-allowed:${d.source}`, Date.now());
+			out.push(r.ok ? `${d.name} re-enabled in ${d.file}` : `${d.name}: ${r.reason}`);
+		}
+		for (const p of extra) {
+			e.db.setSchedule(`conflict-allowed:${p.source}`, Date.now());
+			out.push(`${p.name} allowed`);
+		}
+		ctx.ui.notify(`realctx: ${out.join("; ")}.`, "info");
+		if (ctx.hasUI && (await ctx.ui.confirm("Reload now?", "Reload extensions so the change takes effect."))) await ctx.reload();
+		return;
+	}
+	if (verb === "disable") {
+		const todo = loaded.filter(matches);
+		if (todo.length === 0) {
+			ctx.ui.notify(`realctx: no loaded context manager matches "${target}"`, "warning");
+			return;
+		}
+		const out: string[] = [];
+		for (const p of todo) {
+			e.db.deleteSchedule(`conflict-allowed:${p.source}`);
+			silence(p);
+			const r = await disableInSettings(p, ctx.cwd, agentDir);
+			if (r.ok && !r.unchanged) {
+				const rec: DisabledRecord = { name: p.name, source: p.source, scope: p.scope, origin: p.origin, file: r.file, previous: r.previous };
+				e.db.setSchedule(disabledKey(p.source), Date.now(), rec);
+			}
+			out.push(r.ok ? `${p.name} disabled (off in ${r.file})` : `${p.name}: tools deactivated, but ${r.reason}`);
+		}
+		ctx.ui.notify(`realctx: ${out.join("; ")}.`, "info");
+		if (ctx.hasUI && (await ctx.ui.confirm("Reload now?", "Reload extensions to unload them completely and turn realctx's context layer on."))) await ctx.reload();
+		return;
+	}
+	ctx.ui.notify("realctx: usage: /realctx conflicts [enable|disable <name>]", "warning");
 }

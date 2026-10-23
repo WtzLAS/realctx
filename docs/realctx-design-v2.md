@@ -108,7 +108,7 @@ From realmem:
 
 | Hook / API | Context layer | Memory layer |
 |---|---|---|
-| `session_start` | Restore ID registry, drop set, pins; adopt a parent's originals (§13.6); detect conflicts | Migrate realmem data, resolve project key, check missing paths and `.gitignore`, prune expired outputs, scheduled consolidation check |
+| `session_start` | Restore ID registry, drop set, pins; adopt a parent's originals (§13.6); warn about and disable other context managers (§12.3) | Migrate realmem data, resolve project key, check missing paths and `.gitignore`, prune expired outputs, scheduled consolidation check |
 | `before_agent_start` | — | Build or replay the `<realctx>` snapshot |
 | `tool_result` | Capture original into output store | Compute touched paths, append path notes |
 | `turn_end` | Persist registry and drops; queue drop candidates (background) | Persist shown-note ids (`realctx-shown`); user-message capture (background) |
@@ -118,7 +118,7 @@ From realmem:
 | `session_shutdown` | — | Release the shared engine; withdraw the parent announcement |
 | `context` | Apply drops, render placeholders | — (notes already in tool results) |
 | `session_before_compact` | Cancel Pi's threshold compaction (manual `/compact` and overflow recovery still run) | — |
-| `tool_call` | — | Block hidden memory tools (`ctx_memory`, …) |
+| `tool_call` | Block tools of disabled context managers | Block hidden memory tools (`ctx_memory`, …) |
 | `registerTool` | `realctx_expand` | `realctx_recall`, `realctx_remember`, `realctx_forget`, `realctx_list`, `realctx_status` |
 | `appendEntry` / `turn_end` entries | `realctx-ids` (registry), `realctx-drops` (drops, pins) | `realctx-snapshot`, `realctx-shown` |
 
@@ -361,11 +361,23 @@ memory AZJrPlwafS-aSxwtPk9aaw  Run e2e tests with pnpm test:e2e
 output #57                     bash pnpm test (turn 22) · 3 failing in auth/session.test.ts …
 ```
 
-**Naming:** every tool is prefixed `realctx_`. realmem's `realmem_*` tools and `/realmem` command are not kept as aliases; realmem's data migrates (§16), and realctx warns at session start if the realmem extension is still loaded. The `realctx` skill covers recall, remember, scope choice, and expansion.
+**Naming:** every tool is prefixed `realctx_`. realmem's `realmem_*` tools and `/realmem` command are not kept as aliases; realmem's data migrates (§16), and a still-loaded realmem extension is disabled like any other conflicting plugin (§12.3). The `realctx` skill covers recall, remember, scope choice, and expansion.
 
 ### 12.3 Conflicting plugins
 
-realctx owns context management and memory end to end. At session start it detects other context managers (Magic Context, billion-context-pi, DCP-style pruners) and other memory systems, and refuses to run its context layer while they're active, with a message naming them. Calls to known foreign memory tools (`prompt.hideTools`, `ctx_memory` by default) are blocked with a pointer to `realctx_remember`. Detection uses tool names and source paths; generic names (`prune`, `discard`) count only when the source looks like a pruner. `context.conflictTools` adds names, `context.ignoreConflicts` overrides the refusal.
+realctx owns context management and memory end to end; two context managers rewriting the same messages break each other's cache stability and placeholders. At session start realctx groups the registered tools by extension (`sourceInfo`) and identifies other context managers: Magic Context (`ctx_reduce`, `ctx_expand`, `ctx_note`), billion-context (`bc_*`), DCP-style pruners (`prune`, `discard`, `extract`, counted only when the source also looks like a pruner), names in `context.conflictTools`, and realmem (a memory system realctx replaces). It then acts per `context.conflictAction`:
+
+| Action | Effect |
+|---|---|
+| `disable` (default) | Warn; deactivate all of the plugin's tools now and block calls to them; turn its package off in Pi's settings (the entry becomes `{ "source": …, "extensions": [] }`, a standard package filter), so it is gone after `/reload`. realctx's context layer stays off until then, because the plugin's hooks still run. |
+| `warn` | Warn only; realctx's context layer stays off while it is loaded. |
+| `ignore` | Run realctx's context layer next to it. |
+
+- Settings are edited through Pi's `SettingsManager` (file lock, other keys and packages preserved): user packages in `~/.pi/agent/settings.json`, project packages in `.pi/settings.json` only when the project is trusted. Extensions loaded with `-e` or from the `extensions` setting are reported, not edited. Subagent sessions never edit settings.
+- Each change is recorded with the previous package entry. `/realctx conflicts enable <name>` restores it and marks the plugin as allowed (never auto-disabled again); `/realctx conflicts disable <name>` reverses that.
+- realmem only duplicates the memory layer, so it does not turn the context layer off; it is still disabled, since both would append path notes.
+
+Calls to known foreign memory tools (`prompt.hideTools`, `ctx_memory` by default) are blocked with a pointer to `realctx_remember`.
 
 ---
 
@@ -475,6 +487,7 @@ Every Pi session has its own context layer; the memory layer is shared.
 | `flush` | Apply queued drops now, ignoring the cache TTL |
 | `settings` | Judge, embedder, rewrite model, thresholds; connectivity tests |
 | `debug [#N]` | Dry-run a drop decision (`#N`) or a remember, showing raw judge answers |
+| `conflicts [enable\|disable <name>]` | Other context managers: list, re-enable, disable (§12.3) |
 | `add`, `import`, `prune-paths`, `consolidate`, `fix-gitignore`, `embed`, `reindex`, `retry` | Memory maintenance |
 
 Consolidation writes only when the user runs it: a judge review against same-store neighbours (forget, cover, supersede, merge, revise), then a path-revision pass.
@@ -533,7 +546,8 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `context.retentionDays` | `7` | Originals of inactive sessions are deleted after this; `0` = forever |
 | `context.embedDropped` | `true` | Vector search over dropped outputs (needs the embedder) |
 | `context.cancelCompaction` | `true` | Cancel Pi's threshold compaction while active |
-| `context.conflictTools`, `context.ignoreConflicts` | `[]`, `false` | Conflict detection (§12.3) |
+| `context.conflictTools` | `[]` | Extra tool names that identify a context manager (§12.3) |
+| `context.conflictAction` | `"disable"` | `disable` / `warn` / `ignore` other context managers (§12.3) |
 | `capture.mode` | `"suggest"` | `off` / `suggest` / `auto` |
 | `capture.pDurable` | `0.7` | `durable_fact` / `durable_user_fact` needed to attempt capture |
 | `capture.minImportance`, `capture.minDurable` | `1.5`, `0.7` | Gates for capture candidates (stricter than `thresholds.*`) |
@@ -557,7 +571,8 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | Original expired (retention) | Placeholder stays; `realctx_expand` reports it as not found |
 | realmem migration fails | Notice at session start; the old directory stays in place |
 | Memory write lock held > 2 min | Queue the candidate |
-| Foreign context manager detected | Context layer off, memory layer on, warning shown |
+| Foreign context manager detected | Warn and disable it (tools now, package on `/reload`); context layer off until it is unloaded; memory layer on |
+| Pi settings not writable | Tools still disabled; warning names the file and asks to remove the package |
 | Rendering exception | Pass messages through unchanged; log loudly |
 
 realctx never blocks the agent's turn on its own work.

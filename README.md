@@ -94,9 +94,23 @@ go on). The rewrite model extracts lasting preferences, decisions, corrections a
 project facts, which follow the same capture mode and hourly budget; suggestions are
 marked as coming from the user.
 
-**Conflicts**: if another context manager is loaded (Magic Context, billion-context,
-DCP-style pruners; extend with `context.conflictTools`), the context layer stays off and
-says so; the memory layer keeps working. `context.ignoreConflicts` overrides this.
+**Other context managers**: realctx owns the context. When Magic Context,
+billion-context, a DCP-style pruner or realmem is loaded in the same Pi (detected by its
+tools and source; extend with `context.conflictTools`), realctx warns and disables it
+(`context.conflictAction = "disable"`, the default):
+
+- its tools are deactivated and every call to them is blocked, at once;
+- its package entry in Pi's settings (`~/.pi/agent/settings.json`, or the trusted
+  project's `.pi/settings.json`) becomes `{ "source": …, "extensions": [] }`, so it no
+  longer loads after `/reload` or the next start. Other keys and packages are untouched;
+  extensions loaded with `-e` or from the `extensions` setting are only reported;
+- until it is unloaded its hooks still run, so realctx's context layer stays off for that
+  session (the memory layer works); after `/reload` both are clean.
+
+`/realctx conflicts` lists what was found and disabled, `/realctx conflicts enable <name>`
+restores the original package entry and stops disabling it, `/realctx conflicts disable
+<name>` turns it off again. `conflictAction = "warn"` only warns (realctx's context layer
+stays off), `"ignore"` runs realctx next to it. Subagent sessions never change settings.
 
 ## Scopes and storage
 
@@ -332,6 +346,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `prune-paths` | drop paths that no longer exist from memories (after a confirm listing the changes); a memory whose paths are all gone is deleted |
 | `consolidate [global] [shared] [personal] [--no-paths]` | shrink and clean the memory base (see below); fully automatic, writes the result and reports what changed |
 | `fix-gitignore` | check whether `.pi/realctx` is ignored by git and append the verified fix |
+| `conflicts [enable\|disable <name>]` | other context managers next to realctx: list, re-enable or disable them |
 | `embed`, `reindex`, `retry` | maintenance |
 
 API keys may be given as `$VAR` or `env:VAR` so they are not stored in `config.json`
@@ -415,8 +430,8 @@ from the start).
 
 ### Upgrading from realmem
 
-realctx replaces realmem: remove realmem from your Pi packages (realctx warns while it is
-still loaded). On first start realctx moves `~/.pi/agent/realmem/` to
+realctx replaces realmem. If realmem is still in your Pi packages, realctx disables it
+(see *Other context managers*; `/reload` once to unload it). On first start realctx moves `~/.pi/agent/realmem/` to
 `~/.pi/agent/realctx/` (database renamed, tables kept; an existing realctx database is
 never overwritten), and the first time it sees a project it moves `.pi/realmem/` to
 `.pi/realctx/`, or merges it file by file (commit the move). Memory ids and file

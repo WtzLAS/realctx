@@ -1071,6 +1071,24 @@ export class RealctxDB {
 		this.stmt("INSERT INTO schedule(key, at, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at, data = excluded.data").run(key, at, data === undefined ? null : JSON.stringify(data));
 	}
 
+	/** Schedule rows whose key starts with `prefix`. */
+	listSchedule(prefix: string): Array<{ key: string; at: number; data: unknown }> {
+		const rows = this.stmt("SELECT key, at, data FROM schedule WHERE substr(key, 1, ?) = ? ORDER BY key").all(prefix.length, prefix) as Row[];
+		return rows.map((r) => {
+			let data: unknown;
+			try {
+				data = r.data ? JSON.parse(String(r.data)) : undefined;
+			} catch {
+				data = undefined;
+			}
+			return { key: String(r.key), at: Number(r.at), data };
+		});
+	}
+
+	deleteSchedule(key: string): void {
+		this.stmt("DELETE FROM schedule WHERE key = ?").run(key);
+	}
+
 	/** BM25 search over one session's captured outputs, restricted to the given tool call ids. */
 	searchOutputs(session: string, ids: string[], match: string, limit: number): Array<{ toolCallId: string; score: number }> {
 		try {

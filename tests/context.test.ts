@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ let srv: Server;
 let base: string;
 let proj: string;
 let url = "";
+let agentDir = "";
 let judgeCalls = 0;
 /** P(still_needed) the mock judge answers for drop questions. */
 let stillNeeded = 0.02;
@@ -66,6 +67,9 @@ before(async () => {
 	execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", "add", "."], { cwd: proj });
 	execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: proj });
 	process.env.REALCTX_HOME = base;
+	// Pi's settings (packages) live here during tests, never in the real ~/.pi/agent.
+	agentDir = mkdtempSync(join(tmpdir(), "realctx-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	writeSettings({});
 	clearProjectCache();
 });
@@ -75,6 +79,8 @@ after(() => {
 	rmSync(base, { recursive: true, force: true });
 	rmSync(proj, { recursive: true, force: true });
 	delete process.env.REALCTX_HOME;
+	delete process.env.PI_CODING_AGENT_DIR;
+	rmSync(agentDir, { recursive: true, force: true });
 });
 
 function writeSettings(extra: Record<string, unknown>) {
@@ -98,7 +104,7 @@ let completeCalls = 0;
 /** P(durable_user_fact) the mock judge answers. */
 let userFact = 0.9;
 
-async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path: string } }>; sessionId?: string; parentSession?: string } = {}) {
+async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record<string, string> }>; sessionId?: string; parentSession?: string; active?: string[] } = {}) {
 	const { default: realctx } = await import("../extensions/realctx/index.ts");
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
@@ -115,11 +121,14 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path
 			return () => {};
 		},
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", id: nextId(), customType, data }),
-		getActiveTools: () => [],
+		getActiveTools: () => [...active],
 		getAllTools: () => opts.tools ?? [],
-		setActiveTools: () => {},
+		setActiveTools: (names: string[]) => {
+			active = [...names];
+		},
 		sendUserMessage: () => {},
 	};
+	let active = opts.active ?? (opts.tools ?? []).map((t) => t.name);
 	realctx(pi);
 	const emit = async (e: string, ev: any, ctx: any) => {
 		let last: any;
@@ -173,7 +182,7 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: { path
 	const settle = () => new Promise((r) => setTimeout(r, 150));
 	await emit("session_start", { type: "session_start", reason: "startup" }, ctx);
 	const shutdown = () => emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
-	return { tools, commands, emit, ctx, entries, turn, user, request, resultText, settle, notices, sessionId, shutdown };
+	return { tools, commands, emit, ctx, entries, turn, user, request, resultText, settle, notices, sessionId, shutdown, active: () => active };
 }
 
 test("rule drops apply only when the cache is cold, render byte-stable placeholders, and restore with realctx_expand", async () => {
@@ -289,15 +298,21 @@ test("forged placeholders in assistant text are stripped; compaction is cancelle
 	const st = await h.tools.get("realctx_status").execute("s", {}, undefined, undefined, h.ctx);
 	assert.match(st.content[0].text, /Context layer: on/);
 
+	// h announces itself as parent; a session started now would be its subagent (which stays silent).
+	delete process.env.REALCTX_PARENT_SESSION;
+	// conflictAction = warn: warn, keep the context layer off, touch nothing.
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, conflictAction: "warn" } });
 	const c = await harness({ tools: [{ name: "ctx_reduce", sourceInfo: { path: "/x/node_modules/@cortexkit/magic-context/index.js" } }] });
-	assert.ok(c.notices.some((n) => /context layer off because Magic Context/.test(n)));
+	assert.ok(c.notices.some((n) => /Magic Context is loaded next to realctx \(it also rewrites the context\)/.test(n)));
+	assert.deepEqual(c.active(), ["ctx_reduce"], "warn mode leaves its tools alone");
 	const st2 = await c.tools.get("realctx_status").execute("s", {}, undefined, undefined, c.ctx);
-	assert.match(st2.content[0].text, /Context layer: off \(another context manager is active: Magic Context\)/);
+	assert.match(st2.content[0].text, /Context layer: off \(another context manager is loaded: Magic Context\)/);
 	assert.equal(await c.emit("session_before_compact", { type: "session_before_compact", reason: "threshold" }, c.ctx), undefined);
 	const id = await c.turn("read", { path: "src/b.ts" }, big("b"));
 	await c.turn("read", { path: "src/b.ts" }, big("b again"));
 	for (let i = 0; i < 3; i++) await c.turn("bash", { command: `echo ${i}` }, big("f"));
 	assert.match(c.resultText(await c.request(), id), /b line 0/, "conflict: nothing is dropped");
+	writeSettings({});
 	// A generic tool name alone (e.g. some other "prune") is not a conflict.
 	const g = await harness({ tools: [{ name: "prune", sourceInfo: { path: "/x/my-tools/index.js" } }] });
 	assert.ok(!g.notices.some((n) => /context layer off/.test(n)));
@@ -480,4 +495,91 @@ test("scheduled consolidation: suggested after everyDays, never applied without 
 	const h = await harness();
 	h.notices.length = 0;
 	await h.shutdown();
+});
+
+test("other context managers are warned about and disabled: tools off and blocked, package off in Pi settings, undo restores", async () => {
+	delete process.env.REALCTX_PARENT_SESSION;
+	writeSettings({});
+	const pkg = "npm:@cortexkit/pi-magic-context";
+	const settingsFile = join(agentDir, "settings.json");
+	writeFileSync(settingsFile, JSON.stringify({ theme: "dark", packages: ["https://github.com/a/other", pkg] }, null, 2));
+	const info = { path: "/x/npm/node_modules/@cortexkit/pi-magic-context/dist/index.js", source: pkg, scope: "user", origin: "package" };
+	const tools = ["ctx_reduce", "ctx_expand", "ctx_memory", "ctx_search"].map((name) => ({ name, sourceInfo: info }));
+	const other = { name: "web_search", sourceInfo: { path: "/x/web/index.js", source: "https://github.com/a/other", scope: "user", origin: "package" } };
+	const h = await harness({ tools: [...tools, other] });
+	const warn = h.notices.find((n) => /disabled Magic Context/.test(n)) ?? "";
+	assert.match(warn, /4 tool\(s\) deactivated and blocked; its package is now off in .*settings\.json/);
+	assert.match(warn, /Run \/reload to unload Magic Context completely/);
+	assert.deepEqual(h.active(), ["web_search"], "only the conflicting plugin's tools are deactivated");
+	const blocked = await h.emit("tool_call", { type: "tool_call", toolName: "ctx_search", toolCallId: "z", input: {} }, h.ctx);
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /belongs to Magic Context, which realctx disabled/);
+	assert.equal(await h.emit("tool_call", { type: "tool_call", toolName: "web_search", toolCallId: "y", input: {} }, h.ctx), undefined);
+	// Pi settings: the package entry becomes an `extensions: []` filter; other keys and packages are untouched.
+	const after = JSON.parse(readFileSync(settingsFile, "utf8"));
+	assert.equal(after.theme, "dark");
+	assert.deepEqual(after.packages, ["https://github.com/a/other", { source: pkg, extensions: [] }]);
+	// Until /reload its hooks still run: the context layer stays off for this session.
+	const st = (await h.tools.get("realctx_status").execute("s", {}, undefined, undefined, h.ctx)).details.context;
+	assert.equal(st.active, false);
+	assert.match(st.reason, /disabled; \/reload to finish/);
+	// A second start does not touch the settings again.
+	const again = await harness({ tools: [...tools, other] });
+	assert.deepEqual(JSON.parse(readFileSync(settingsFile, "utf8")).packages, after.packages);
+	await again.shutdown();
+
+	// Undo: /realctx conflicts enable restores the original entry and stops auto-disabling it.
+	h.ctx.ui.confirm = async () => true;
+	h.ctx.reload = async () => {};
+	await h.commands.get("realctx").handler("conflicts enable magic context", h.ctx);
+	assert.deepEqual(JSON.parse(readFileSync(settingsFile, "utf8")).packages, ["https://github.com/a/other", pkg]);
+	delete process.env.REALCTX_PARENT_SESSION;
+	const kept = await harness({ tools: [...tools, other] });
+	assert.ok(kept.notices.some((n) => /kept on by \/realctx conflicts enable/.test(n)));
+	assert.ok(kept.active().includes("ctx_reduce"), "allowed plugin is left alone");
+	// ...and /realctx conflicts disable turns it off again.
+	kept.ctx.ui.confirm = async () => false;
+	await kept.commands.get("realctx").handler('conflicts disable "Magic Context"', kept.ctx);
+	assert.deepEqual(JSON.parse(readFileSync(settingsFile, "utf8")).packages[1], { source: pkg, extensions: [] });
+	assert.ok(!kept.active().includes("ctx_reduce"));
+	await kept.shutdown();
+	await h.shutdown();
+
+	// Loaded with -e (not a package): tools are disabled, settings are left alone with a hint.
+	delete process.env.REALCTX_PARENT_SESSION;
+	const tmp = await harness({ tools: [{ name: "bc_expand", sourceInfo: { path: "/x/billion-context/index.ts", source: "/x/billion-context/index.ts", scope: "temporary", origin: "top-level" } }] });
+	assert.ok(tmp.notices.some((n) => /disabled billion-context .*remove it yourself \(loaded with -e on the command line\)/.test(n)));
+	assert.deepEqual(tmp.active(), []);
+	await tmp.shutdown();
+
+	// conflictAction = ignore: realctx runs next to it.
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, conflictAction: "ignore" } });
+	delete process.env.REALCTX_PARENT_SESSION;
+	const ig = await harness({ tools: [{ name: "prune", sourceInfo: { path: "/x/node_modules/opencode-dcp/index.js", source: "npm:opencode-dcp", scope: "user", origin: "package" } }] });
+	assert.equal((await ig.tools.get("realctx_status").execute("s", {}, undefined, undefined, ig.ctx)).details.context.active, true);
+	assert.deepEqual(ig.active(), ["prune"]);
+	await ig.shutdown();
+	writeSettings({});
+});
+
+test("conflict detection: grouping by extension, realmem as a memory-only conflict, realctx and builtins never", async () => {
+	const { detectConflictPlugins, packageIdentity } = await import("../src/conflicts.ts");
+	const found = detectConflictPlugins([
+		{ name: "ctx_note", sourceInfo: { path: "/n/magic-context/a.js", source: "npm:@cortexkit/pi-magic-context@1.2.0", scope: "user", origin: "package" } },
+		{ name: "ctx_search", sourceInfo: { path: "/n/magic-context/a.js", source: "npm:@cortexkit/pi-magic-context@1.2.0", scope: "user", origin: "package" } },
+		{ name: "realmem_recall", sourceInfo: { path: "/p/realmem/extensions/realmem/index.ts", source: "/p/realmem", scope: "user", origin: "package" } },
+		{ name: "realctx_recall", sourceInfo: { path: "/p/realctx/extensions/realctx/index.ts", source: "/p/realctx", scope: "user", origin: "package" } },
+		{ name: "read", sourceInfo: { path: "builtin:read", source: "builtin" } },
+		{ name: "prune", sourceInfo: { path: "/x/my-tools/index.js", source: "/x/my-tools", scope: "user", origin: "package" } },
+	]);
+	assert.deepEqual(
+		found.map((f) => [f.name, f.kind, f.tools.join(",")]),
+		[
+			["Magic Context", "context", "ctx_note,ctx_search"],
+			["realmem", "memory", "realmem_recall"],
+		],
+	);
+	assert.equal(packageIdentity("npm:@cortexkit/pi-magic-context@1.2.0"), "npm:@cortexkit/pi-magic-context");
+	assert.equal(packageIdentity("git:github.com/a/b@v1"), packageIdentity("git:github.com/a/b"));
+	assert.equal(packageIdentity("https://github.com/A/b.git"), "https://github.com/a/b");
 });

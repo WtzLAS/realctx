@@ -123,24 +123,6 @@ interface IdsData {
 	metas?: OutputMeta[];
 }
 
-/** Known context managers and their tools (§12.3). */
-const CONFLICT_TOOLS: Record<string, string> = {
-	ctx_reduce: "Magic Context",
-	ctx_expand: "Magic Context",
-	ctx_note: "Magic Context",
-	bc_expand: "billion-context",
-	bc_recall: "billion-context",
-	billion_context_expand: "billion-context",
-	discard: "DCP",
-	extract: "DCP",
-	prune: "DCP",
-};
-const CONFLICT_SOURCES: Array<[RegExp, string]> = [
-	[/magic-context/i, "Magic Context"],
-	[/billion-context/i, "billion-context"],
-	[/dynamic-context-pruning|opencode-dcp|[\\/]dcp[\\/-]/i, "DCP"],
-];
-
 export interface LayerStatus {
 	active: boolean;
 	reason?: string;
@@ -276,8 +258,8 @@ export class ContextLayer {
 		const s = this.host.settings();
 		this.disabledReason = !s.context.enabled
 			? "disabled in settings"
-			: conflicts.length > 0 && !s.context.ignoreConflicts
-				? `another context manager is active: ${conflicts.join(", ")}`
+			: conflicts.length > 0 && s.context.conflictAction !== "ignore"
+				? `another context manager is loaded: ${conflicts.join(", ")}${s.context.conflictAction === "disable" ? " (disabled; /reload to finish)" : ""}`
 				: undefined;
 		const sm = ctx.sessionManager;
 		this.sessionId = typeof sm.getSessionId === "function" ? sm.getSessionId() : "";
@@ -1261,22 +1243,4 @@ export class ContextLayer {
 	get sessionKey(): string {
 		return this.sessionId;
 	}
-}
-
-/** Names of foreign context managers among the registered tools (§12.3). */
-export function detectConflicts(tools: ReadonlyArray<{ name: string; sourceInfo?: { path?: string } }>, extra: string[]): string[] {
-	const found = new Set<string>();
-	const extraSet = new Set(extra);
-	for (const t of tools) {
-		if (t.name.startsWith("realctx_")) continue;
-		const byName = CONFLICT_TOOLS[t.name];
-		const path = t.sourceInfo?.path ?? "";
-		const bySource = CONFLICT_SOURCES.find(([re]) => re.test(path))?.[1];
-		// Generic names (discard, prune, …) only count when the source also looks like a pruner.
-		const generic = ["discard", "extract", "prune"].includes(t.name);
-		if (byName && (!generic || bySource)) found.add(byName);
-		else if (bySource) found.add(bySource);
-		else if (extraSet.has(t.name)) found.add(t.name);
-	}
-	return [...found];
 }

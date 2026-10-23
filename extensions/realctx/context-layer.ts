@@ -61,7 +61,11 @@ import { parseJsonObject } from "../../src/rewrite.ts";
 import { redactSecrets, sanitizeForPrompt } from "../../src/safety.ts";
 import { estimateTokens, ftsQuery, oneLine, sha256 } from "../../src/text.ts";
 import { familyRoot, takeCaptureBudget } from "../../src/shared.ts";
+import { estimateMessage, type MessageView, textOf } from "../../src/history.ts";
+import { HistoryManager } from "./history-layer.ts";
 import { rewriterFor } from "./tools.ts";
+
+export type { MessageView };
 
 export const IDS_ENTRY = "realctx-ids";
 export const DROPS_ENTRY = "realctx-drops";
@@ -76,16 +80,6 @@ interface ToolCallPart {
 	id: string;
 	name: string;
 	arguments?: Record<string, unknown>;
-}
-export interface MessageView {
-	role: string;
-	content?: unknown;
-	toolCallId?: string;
-	toolName?: string;
-	isError?: boolean;
-	timestamp?: number;
-	usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number };
-	stopReason?: string;
 }
 
 interface BranchEntryView {
@@ -139,6 +133,7 @@ export interface LayerStatus {
 	captureMode: string;
 	pendingCaptures: number;
 	judging: boolean;
+	history?: ReturnType<HistoryManager["status"]>;
 }
 
 export interface LayerHost {
@@ -156,29 +151,6 @@ function branchEntries(ctx: ExtensionContext): BranchEntryView[] {
 	// `message` (an AgentMessage) and custom entries `customType`/`data`. BranchEntryView only
 	// names those optional fields, and every read below checks `type` before using them.
 	return ctx.sessionManager.getBranch() as unknown as BranchEntryView[];
-}
-
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((p: { type?: string; text?: string; thinking?: string }) => (p?.type === "text" ? (p.text ?? "") : p?.type === "thinking" ? (p.thinking ?? "") : ""))
-		.join("\n");
-}
-
-function estimateMessage(m: MessageView): number {
-	if (m.role === "toolResult") return contentTokens(Array.isArray(m.content) ? (m.content as TextPart[]) : []) + 8;
-	if (Array.isArray(m.content)) {
-		let n = 8;
-		for (const p of m.content as Array<{ type?: string; text?: string; thinking?: string; arguments?: unknown; name?: string }>) {
-			if (p?.type === "text") n += estimateTokens(p.text ?? "");
-			else if (p?.type === "thinking") n += estimateTokens(p.thinking ?? "");
-			else if (p?.type === "toolCall") n += estimateTokens(JSON.stringify(p.arguments ?? {})) + 12;
-			else if (p?.type === "image") n += 1200;
-		}
-		return n;
-	}
-	return estimateTokens(textOf(m.content)) + 8;
 }
 
 function usageTokens(u: NonNullable<MessageView["usage"]>): number {
@@ -222,9 +194,25 @@ export class ContextLayer {
 	conflicts: string[] = [];
 
 	private readonly host: LayerHost;
+	/** History compression (§9.4): the historian's summaries of old turns. */
+	readonly history: HistoryManager;
 
 	constructor(host: LayerHost) {
 		this.host = host;
+		this.history = new HistoryManager({
+			engine: () => host.engine(),
+			settings: () => host.settings(),
+			sessionId: () => this.sessionId,
+			subagent: () => this.subagent,
+			output: (id) => {
+				const m = this.metas.get(id);
+				if (!m) return undefined;
+				return { ord: m.ord, label: oneLine(`${m.tool}${m.args ? ` ${m.args}` : ""}`, 60), placeholder: this.applied.get(id)?.text };
+			},
+			usage: () => this.lastUsage,
+			assistants: () => this.assistants,
+			onCaptured: (ctx) => host.onCaptured?.(ctx),
+		});
 	}
 
 	get active(): boolean {
@@ -310,6 +298,7 @@ export class ContextLayer {
 		// originals into its own store, so the two context layers never share files and the
 		// parent's retention cannot break the child's placeholders.
 		if (this.files) this.adoptInherited(this.files);
+		this.history.reset(branch);
 		// Never keep a drop whose original cannot be restored.
 		for (const id of [...this.applied.keys()]) {
 			const m = this.metas.get(id);
@@ -382,6 +371,7 @@ export class ContextLayer {
 		this.unflushedMetas = [];
 		this.unflushedDrops = [];
 		this.unflushedPins = [];
+		out.push(...this.history.flushEntries());
 		return out;
 	}
 
@@ -560,17 +550,21 @@ export class ContextLayer {
 			const cold = lastResponse > 0 && now - lastResponse >= this.ttlMs(ctx);
 			const share = usage?.share ?? 0;
 			const emergency = share >= this.cfg.emergencyThreshold;
-			const apply = this.pending.size > 0 && (this.flushRequested || cold || share >= this.cfg.applyThreshold || emergency);
-			if (apply || emergency) {
+			// Drops and history summaries apply together, so the prefix is rebuilt once (§8.2).
+			const trigger = this.flushRequested || cold || share >= this.cfg.applyThreshold || emergency;
+			this.flushRequested = false;
+			if ((trigger && this.pending.size > 0) || emergency) {
 				const before = this.applied.size;
 				this.applyPending(f.turn);
 				if (emergency && usage) this.emergencyReclaim(f.gray, usage, f.turn);
-				this.flushRequested = false;
 				if (this.applied.size > before) {
 					this.lastApplyAt = now;
 					this.lastRequestApplied = true;
 				}
 			}
+			// The historian works from the transcript as Pi sent it (dropped outputs are labelled).
+			const raw = messages.slice();
+			this.history.observe(raw, this.assistants);
 
 			// Render: frozen placeholders replace dropped results.
 			if (this.applied.size > 0) {
@@ -582,6 +576,20 @@ export class ContextLayer {
 					messages[i] = { ...m, content: [{ type: "text", text: a.text }] };
 					changed = true;
 				}
+			}
+			// History: chunks the historian prepared replace old turns; at the emergency threshold a
+			// deterministic outline is used when nothing is ready (§9.4).
+			const afterDrops = usage ? this.estimateUsage(messages, ctx) : undefined;
+			const historyEmergency = !!afterDrops && afterDrops.share >= this.cfg.emergencyThreshold;
+			const appliedBefore = this.history.status().applied;
+			const withHistory = this.history.transform(messages, { apply: trigger, emergency: historyEmergency, turn: f.turn });
+			if (this.history.status().applied > appliedBefore) {
+				this.lastApplyAt = now;
+				this.lastRequestApplied = true;
+			}
+			if (withHistory) {
+				messages = withHistory;
+				changed = true;
 			}
 			this.lastUsage = usage ? this.estimateUsage(messages, ctx) : undefined;
 			return changed ? messages : undefined;
@@ -595,7 +603,7 @@ export class ContextLayer {
 	/** Request `/realctx flush`: apply queued drops at the next request, ignoring the cache TTL. */
 	requestFlush(): number {
 		this.flushRequested = true;
-		return this.pending.size;
+		return this.pending.size + this.history.status().ready;
 	}
 
 	private ttlMs(ctx: ExtensionContext): number {
@@ -625,6 +633,7 @@ export class ContextLayer {
 			for (let i = idx + 1; i < messages.length; i++) tokens += estimateMessage(messages[i]);
 			const stamp = at.timestamp ?? 0;
 			for (const a of this.applied.values()) if (a.at > stamp) tokens -= a.saved;
+			tokens -= this.history.savedSince(stamp);
 		} else {
 			tokens = estimateTokens(ctx.getSystemPrompt?.() ?? "");
 			for (const m of messages) tokens += estimateMessage(m);
@@ -970,6 +979,14 @@ export class ContextLayer {
 		return { content: parts.length ? parts : [{ type: "text", text: "nothing to expand" }], details: { restored, missing } };
 	}
 
+	/** Transcripts of history parts (realctx_expand(history=[n])). */
+	expandHistory(parts: number[], opts: { lines?: string; grep?: string }, ctx: ExtensionContext): string[] {
+		const branch = this.branchMessages(ctx);
+		const unique = [...new Set(parts.map((n) => Math.trunc(Number(n))).filter((n) => n > 0))].slice(0, 4);
+		const budget = Math.max(400, Math.floor(this.cfg.expandMaxTokens / Math.max(1, unique.length)));
+		return unique.map((n) => this.history.expand(n, branch, { ...opts, maxTokens: budget }));
+	}
+
 	/** Link a pin to the captured result of the realctx_expand call that created it. */
 	linkExpansion(toolCallId: string, ids: unknown): void {
 		const result = this.metas.get(toolCallId);
@@ -1198,6 +1215,7 @@ export class ContextLayer {
 			captureMode: s.capture.mode,
 			pendingCaptures,
 			judging: this.judging,
+			history: this.history.status(),
 		};
 	}
 

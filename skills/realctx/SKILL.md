@@ -96,6 +96,8 @@ removed output leaves a placeholder in place of the result:
   what you need: `realctx_expand(ids=[57], grep="FAIL|Error")` or `lines="120-260"`.
   If the file may have changed, re-read it instead; expand warns when it was edited.
 - `saved as <id>`: the durable part is a memory now; `realctx_recall(ids=["<id>"])` reads it.
+- Old turns may be replaced by a `<realctx-history part="h3">` summary. Treat it as your own
+  history; call `realctx_expand(history=[3])` when you need the exact earlier exchange.
 - `realctx_recall(queries=[...], sources=["output"])` searches this session's dropped outputs
   (by keywords and meaning). Other sessions' outputs are never searchable, and originals
   older than the retention period may be gone: then re-run the tool.

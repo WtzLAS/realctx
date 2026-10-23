@@ -14,7 +14,7 @@ export interface Suggestion {
 	session: string;
 	toolCallId?: string;
 	/** Where the fact came from: a dropped tool output or a user message. */
-	origin: "output" | "user";
+	origin: "output" | "user" | "history";
 	caption: string;
 	content: string;
 	paths?: string[];
@@ -1183,7 +1183,7 @@ export class RealctxDB {
 			seq: Number(r.seq),
 			session: String(r.session),
 			toolCallId: (r.tool_call_id as string | null) ?? undefined,
-			origin: r.origin === "user" ? "user" : "output",
+			origin: r.origin === "user" ? "user" : r.origin === "history" ? "history" : "output",
 			caption: String(r.caption),
 			content: String(r.content),
 			paths: parseStringArray(r.paths),

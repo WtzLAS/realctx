@@ -54,6 +54,16 @@ function fields(): FieldDef[] {
 			kind: "model",
 		},
 		{
+			id: "history.model",
+			label: "Historian model",
+			description: "Pi model that summarizes old conversation turns (history compression). Empty = the Edit/Merge model, else the session's current model. A cheap, fast model with a large context works well.",
+			get: (s) => s.history.model || "(Edit/Merge model)",
+			set: (s, v) => {
+				s.history.model = v === "(Edit/Merge model)" || v === "(session model)" ? "" : v;
+			},
+			kind: "model",
+		},
+		{
 			id: "embedding.endpoint",
 			label: "Embedding endpoint",
 			description: "Base URL of the OpenAI-compatible embeddings API (…/v1/embeddings). Changing it clears the embedding cache.",
@@ -186,6 +196,20 @@ function fields(): FieldDef[] {
 		get: (s) => String(s.context[id]),
 		set: (s, v) => {
 			s.context[id] = num(v);
+		},
+		kind: "number",
+		min,
+		max,
+		integer,
+	});
+	type HNumKey = "prepareThreshold" | "protectTurns" | "minChunkTokens" | "maxChunkTokens" | "summaryMaxTokens";
+	const hNum = (id: HNumKey, label: string, description: string, min = 0, max = 1, integer = false): FieldDef => ({
+		id: `history.${id}`,
+		label,
+		description,
+		get: (s) => String(s.history[id]),
+		set: (s, v) => {
+			s.history[id] = num(v);
 		},
 		kind: "number",
 		min,
@@ -442,6 +466,22 @@ function fields(): FieldDef[] {
 			kind: "cycle",
 			values: ["disable", "warn", "ignore"],
 		},
+		{
+			id: "history.enabled",
+			label: "History compression",
+			description: "The historian summarizes old turns in the background; summaries replace them together with queued drops (cold cache, pressure, flush). Originals stay restorable with realctx_expand(history=[n]).",
+			get: (s) => (s.history.enabled ? "on" : "off"),
+			set: (s, v) => {
+				s.history.enabled = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		hNum("prepareThreshold", "History: prepare at", "Share of the safe input window at which the historian starts summarizing old turns (background).", 0.05, 1),
+		hNum("protectTurns", "History: protect turns", "The last N agent turns are never summarized.", 1, 1000, true),
+		hNum("minChunkTokens", "History: min chunk tokens", "Summarize at least this much old conversation at once.", 500, 500_000, true),
+		hNum("maxChunkTokens", "History: max chunk tokens", "Summarize at most this much per historian call.", 500, 1_000_000, true),
+		hNum("summaryMaxTokens", "History: summary tokens", "Upper bound for one chunk's summary.", 100, 20_000, true),
 		{
 			id: "context.enabled",
 			label: "Context layer",

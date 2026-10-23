@@ -39,6 +39,19 @@ export function rewriterFor(engine: MemoryEngine, ctx: ExtensionContext): { rewr
 	};
 }
 
+/**
+ * The historian (§9.4): `history.model`, else `rewriteModel`, else the session model. A model that
+ * is set but cannot be found is reported, never silently replaced by the session model.
+ */
+export function historianFor(engine: MemoryEngine, ctx: ExtensionContext): { completer?: Completer; model?: string; error?: string } {
+	const spec = engine.settings.history.model || engine.settings.rewriteModel;
+	const source = engine.settings.history.model ? "history model" : "rewrite model";
+	if (spec && !spec.includes("/")) return { error: `${source} "${spec}" must be provider/model` };
+	const model = resolveModel(spec, ctx.modelRegistry, ctx.model);
+	if (!model) return { error: spec ? `${source} ${spec} not found` : "no model selected for the historian" };
+	return { completer: createCompleter(ctx.modelRegistry, model), model: `${model.provider}/${model.id}` };
+}
+
 function text(t: string) {
 	return [{ type: "text" as const, text: t }];
 }
@@ -205,17 +218,32 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_expand",
 		label: "realctx expand",
 		description:
-			"Restore tool outputs that realctx dropped or summarized from the context. Placeholders look like `[#42 dropped · read src/x.ts · 3.1k tok · realctx_expand(42)]`: pass their numbers as ids. The original is returned as a new result (not restored in place), capped in size; use `lines` (e.g. \"120-260\") or `grep` (regex) to fetch only part of a large output.",
+			"Restore what realctx removed from the context. Tool outputs: placeholders look like `[#42 dropped · read src/x.ts · 3.1k tok · realctx_expand(42)]`, pass their numbers as `ids`. Old conversation: a `<realctx-history part=\"h3\">` summary replaced turns; pass `history=[3]` for the transcript of that part. Originals are returned as a new result (not restored in place), capped in size; use `lines` (e.g. \"120-260\") or `grep` (regex) to fetch only part.",
 		promptSnippet: "Restore a dropped tool output shown as a [#N dropped …] placeholder",
 		parameters: Type.Object({
-			ids: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 16, description: "Output numbers from placeholders, e.g. [42] for [#42 …]" }),
+			ids: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 16, description: "Output numbers from placeholders, e.g. [42] for [#42 …]" })),
+			history: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 4, description: "History parts to restore, e.g. [3] for <realctx-history part=\"h3\">" })),
 			lines: Type.Optional(Type.String({ maxLength: 200, description: "Line ranges of the original, e.g. \"1-80\" or \"200-260,400-420\"" })),
 			grep: Type.Optional(Type.String({ maxLength: 300, description: "Only lines matching this regex (case-insensitive), with 2 lines of context" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const layer = host.context();
 			if (!layer) throw new Error("the realctx context layer is not loaded");
-			return layer.expand(params, ctx.cwd, ctx);
+			const ids = params.ids ?? [];
+			const parts = params.history ?? [];
+			if (ids.length === 0 && parts.length === 0) throw new Error("pass ids (e.g. ids=[42] for [#42 …]) or history (e.g. history=[3] for part h3)");
+			const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+			const details: Record<string, unknown> = {};
+			if (ids.length > 0) {
+				const r = layer.expand({ ids, lines: params.lines, grep: params.grep }, ctx.cwd, ctx);
+				content.push(...r.content);
+				Object.assign(details, r.details);
+			}
+			if (parts.length > 0) {
+				for (const t of layer.expandHistory(parts, { lines: params.lines, grep: params.grep }, ctx)) content.push({ type: "text", text: t });
+				details.history = parts;
+			}
+			return { content, details };
 		},
 	});
 

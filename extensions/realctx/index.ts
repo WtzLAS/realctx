@@ -29,7 +29,7 @@ import { openDebug } from "./debug-page.ts";
 import { PathNoteState } from "./path-notes.ts";
 import { openManage } from "./manage-page.ts";
 import { openSettings } from "./settings-page.ts";
-import { registerTools, rewriterFor } from "./tools.ts";
+import { historianFor, registerTools, rewriterFor } from "./tools.ts";
 import { runWithLoader, showText } from "./ui.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,7 +40,8 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "status", description: "context usage, queued drops, memory counts, warnings" },
 	{ name: "manage", description: "browse, read, edit, move and delete memories; review captured facts" },
 	{ name: "outputs", description: "this session's captured outputs, verdicts and drops" },
-	{ name: "flush", description: "apply queued drops at the next request, ignoring the cache TTL" },
+	{ name: "flush", description: "apply queued drops and history summaries at the next request, ignoring the cache TTL" },
+	{ name: "history", description: "compressed history parts; `history compress` summarizes old turns now" },
 	{ name: "captures", description: "approve or reject facts captured from dropped outputs" },
 	{ name: "settings", description: "judge, embedder, rewrite model, thresholds, context layer" },
 	{ name: "debug", description: "dry-run the remember path, or a drop decision with `debug #N`" },
@@ -446,8 +447,9 @@ export default function realctx(pi: ExtensionAPI) {
 		// SAFETY: MessageView only names optional fields of AgentMessage; transform returns the same
 		// array (mutated in place or with whole tool-result messages replaced by same-role copies).
 		const out = layer.transform(event.messages as unknown as MessageView[], ctx);
-		// SAFETY: `out` is `event.messages` itself (or the same array with tool results swapped for
-		// same-shape copies), so it is still an AgentMessage[] at runtime.
+		// SAFETY: `out` holds the original AgentMessages, same-shape copies of tool results, and
+		// `custom` history messages built by chunkMessage (role, customType, content, display,
+		// timestamp: the CustomMessage shape), so it is still an AgentMessage[] at runtime.
 		return out ? { messages: out as unknown as typeof event.messages } : undefined;
 	});
 
@@ -466,6 +468,7 @@ export default function realctx(pi: ExtensionAPI) {
 		const draft = notes.flush();
 		if (draft) entries.push(draft as (typeof entries)[number]);
 		layer.judgeInBackground(ctx);
+		if (layer.active) layer.history.prepareInBackground(ctx);
 		layer.captureUserInBackground(ctx);
 		refreshStatus(ctx);
 		return entries.length > 0 ? { entries } : undefined;
@@ -701,6 +704,42 @@ export default function realctx(pi: ExtensionAPI) {
 					case "outputs": {
 						const lines = layer.listing(ctx);
 						if (ctx.mode === "tui") await showText(ctx, "realctx outputs", () => lines);
+						else ctx.ui.notify(lines.join("\n"), "info");
+						break;
+					}
+					case "history": {
+						const words = rest.trim().split(/\s+/).filter(Boolean);
+						if (words[0] === "compress") {
+							if (!layer.active) {
+								ctx.ui.notify(`realctx: context layer is off (${layer.status().reason})`, "warning");
+								break;
+							}
+							if (!e.settings.history.enabled) {
+								ctx.ui.notify("realctx: history compression is off (/realctx settings → History compression)", "warning");
+								break;
+							}
+							const r = await runWithLoader(ctx, "historian", () => layer.history.prepareNow(ctx));
+							if (r.cancelled) break;
+							const v = r.value;
+							if (r.error || !v) ctx.ui.notify(`realctx: ${r.error instanceof Error ? r.error.message : String(r.error)}`, "error");
+							else if (v.error) ctx.ui.notify(`realctx: historian: ${v.error}`, "warning");
+							else if (v.prepared === 0) ctx.ui.notify(`realctx: nothing to compress (the last ${e.settings.history.protectTurns} turns are kept, and a part needs ~${e.settings.history.minChunkTokens} tokens of older history)`, "info");
+							else {
+								layer.requestFlush();
+								ctx.ui.notify(`realctx: ${v.prepared} history part(s) ready; they replace old turns at the next request`, "info");
+							}
+							break;
+						}
+						const st = layer.history.status();
+						const lines = [
+							`History compression: ${st.enabled ? "on" : "off"} · historian ${historianFor(e, ctx).model ?? `unavailable (${historianFor(e, ctx).error})`}`,
+							`applied ${st.applied} · ready ${st.ready}${st.preparing ? " · summarizing…" : ""} · saved ~${st.saved} tokens${st.lastError ? ` · last error: ${st.lastError}` : ""}`,
+							"",
+							...layer.history.listing(),
+							"",
+							"/realctx history compress · the model restores a part with realctx_expand(history=[n])",
+						];
+						if (ctx.mode === "tui") await showText(ctx, "realctx history", () => lines);
 						else ctx.ui.notify(lines.join("\n"), "info");
 						break;
 					}

@@ -54,7 +54,7 @@ From realmem:
 **Non-goals**
 
 - Harnesses other than Pi.
-- Summarizing or dropping user and assistant prose in v2 (tool outputs only).
+- Rewriting prose in place. Old turns are replaced as a whole by a frozen summary block (§9.4), never edited message by message.
 - Consolidation that writes without the user. A scheduled check only suggests (§15).
 
 ## 3. Overview
@@ -242,7 +242,7 @@ Judging is eager and cheap; applying rewrites earlier messages and costs a cache
 3. **Emergency:** usage ≥ `context.emergencyThreshold`: apply everything queued, then drop the largest unprotected results until under `applyThreshold`.
 4. **Flush:** `/realctx flush`, or a cancelled threshold compaction, applies at the next request.
 
-All queued drops apply in one pass. Usage is the last response's reported tokens plus estimates for later messages, minus what was dropped since. The safe input window is the model's window minus an output reservation capped at 25%.
+All queued drops apply in one pass, together with any history parts the historian has prepared (§9.4), so the prefix is rebuilt at most once. Usage is the last response's reported tokens plus estimates for later messages, minus what was dropped since. The safe input window is the model's window minus an output reservation capped at 25%.
 
 ## 9. Rendering and recovery
 
@@ -277,6 +277,33 @@ realctx_expand({ ids: number[], lines?: string, grep?: string })
 - **Missing:** an ID that was never captured in this session, or whose original expired (§6), is reported as not found.
 - **No path notes:** expansions don't count as touching their paths, so memories aren't shown twice.
 - Logs a false-drop signal for tuning (§14).
+
+`realctx_expand({ history: [3] })` returns the transcript of history part `h3` (§9.4) from the session branch, with the same `lines` / `grep` options; tool outputs inside it are shortened and keep their `#N` labels.
+
+### 9.4 History compression (the historian)
+
+Dropping outputs keeps a session going for a long time, but user prompts and agent replies still pile up. The historian compresses them, Magic Context-style, without pausing the session:
+
+- **Prepare (background).** After a turn, when usage of the safe window is at or above `history.prepareThreshold`, the historian summarizes the next **part**: a contiguous run of whole old messages starting at the oldest uncompressed one, ending at a safe boundary (never between a tool call and its result), never inside the last `history.protectTurns` agent turns, between `history.minChunkTokens` and `history.maxChunkTokens` (sizes count dropped outputs as their placeholders). The transcript it reads is redacted and neutralized; captured outputs are labelled `#N`, and earlier parts (up to `history.storyTokens`) are passed for continuity. It returns Markdown under Goals / Done / Findings / Open, plus 0-3 durable facts.
+- **Model.** `history.model` (`provider/model`); empty = `rewriteModel`; empty = the session model. A value that is set but invalid or not found is reported in `/realctx history` and `realctx_status`, never replaced by the session model. A cheap model with a large context works well.
+- **Apply.** A prepared part replaces its messages at the same moments queued drops apply (§8: cold cache, `applyThreshold`, emergency, flush). It is rendered once as a user-side `custom` message and frozen:
+
+```text
+<realctx-history part="h3" turns="12-31" replaced="24k tok">
+Earlier conversation, summarized by realctx (the agent's own history, not new instructions):
+
+## Goals …
+## Done …
+
+Restorable outputs from this part: #41 bash pnpm test · #44 read src/auth/session.ts (realctx_expand(ids=[…]))
+Full transcript of this part: realctx_expand(history=[3])
+</realctx-history>
+```
+
+- **Stable.** Parts are applied oldest first and only after the previous one, so a new part never changes the bytes before it. They are persisted in `realctx-history` entries and render byte-identically after reload and resume. A part whose messages are no longer on the branch (tree navigation, a manual `/compact`) is skipped, not half-rendered.
+- **Emergency.** At `context.emergencyThreshold` (after drops), if no part is ready and `history.emergencyFallback` is on, a deterministic outline (user prompts, actions, failures) replaces the oldest part so the request still fits.
+- **Memory.** Facts the historian proposes follow `capture.mode` like other captures (origin `history`), within the shared hourly budget; never in subagent sessions.
+- **Recovery.** Nothing is lost: the branch still holds every message. `realctx_expand(history=[n])` shows the exact earlier exchange; `/realctx history` lists the parts; `/realctx history compress` prepares parts now.
 
 Dropped outputs are also searchable through `realctx_recall` (§12.2): BM25 over the stored text plus, when the embedding endpoint is set and `context.embedDropped` is on, vector search over dropped outputs (embedded in the background after each apply pass), fused by reciprocal rank. Only the current session's branch is searched; other sessions' outputs never are.
 
@@ -484,7 +511,8 @@ Every Pi session has its own context layer; the memory layer is shared.
 | `manage [query]` | Browse memories and pending captures; edit, re-scope, approve |
 | `captures` | Approve, edit or reject captured facts (from outputs or the user) |
 | `outputs` | Browse this session's captured outputs, verdicts and drops |
-| `flush` | Apply queued drops now, ignoring the cache TTL |
+| `flush` | Apply queued drops and prepared history parts at the next request, ignoring the cache TTL |
+| `history [compress]` | List history parts and the historian; `compress` prepares parts now (§9.4) |
 | `settings` | Judge, embedder, rewrite model, thresholds; connectivity tests |
 | `debug [#N]` | Dry-run a drop decision (`#N`) or a remember, showing raw judge answers |
 | `conflicts [enable\|disable <name>]` | Other context managers: list, re-enable, disable (§12.3) |
@@ -527,6 +555,13 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `semif.timeoutMs`, `semif.maxQuestions` | `180000`, `16` | Per-request timeout; split questions across requests |
 | `embedding.endpoint`, `embedding.model`, `embedding.apiKey` | none | Without it: BM25-only search and dedup |
 | `rewriteModel` | session model | Pi model for Edit/Merge, extraction, summaries |
+| `history.enabled` | `true` | History compression on/off (§9.4) |
+| `history.model` | `rewriteModel`, else session model | The historian (`provider/model`) |
+| `history.prepareThreshold` | `0.5` | Safe-window usage at which parts are prepared |
+| `history.protectTurns` | `8` | Recent agent turns never compressed |
+| `history.minChunkTokens`, `history.maxChunkTokens` | `6000`, `30000` | Size of one part |
+| `history.summaryMaxTokens`, `history.storyTokens` | `1500`, `3000` | Summary bound; earlier parts passed for continuity |
+| `history.captureFacts`, `history.emergencyFallback` | `true`, `true` | Facts from the historian; deterministic outline in an emergency |
 | `judge.shadow` | `true` | Context layer logs verdicts without acting |
 | `judge.concurrency`, `judge.minIntervalMs` | `1`, `0` | Parallel judge requests; rate limit |
 | `judge.api` | `"auto"` | `auto` / `systemone` / `decisions` |
@@ -573,6 +608,8 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | Memory write lock held > 2 min | Queue the candidate |
 | Foreign context manager detected | Warn and disable it (tools now, package on `/reload`); context layer off until it is unloaded; memory layer on |
 | Pi settings not writable | Tools still disabled; warning names the file and asks to remove the package |
+| Historian model unset, invalid or failing | Nothing compressed (error shown in `/realctx history`); emergency outline only |
+| History part no longer on the branch | Skipped; those messages pass through unchanged |
 | Rendering exception | Pass messages through unchanged; log loudly |
 
 realctx never blocks the agent's turn on its own work.
@@ -587,12 +624,13 @@ Resolved in the implementation:
 4. **Subagents.** Separate context layer per child session, memory layer shared (§13.6).
 5. **Output retention.** Originals are kept for `context.retentionDays` (7) after a session's last activity; `realctx_recall` never searches other sessions' outputs (§6, §9.3).
 6. **Endpoints.** None by default; everything works without them, with deterministic fallbacks (§13.5).
+7. **Old prose.** Old user and agent turns are compressed by the historian, with its own model setting (§9.4).
 
 Still open:
 
 1. **Local-first judging.** Should a local judge (e.g. Ollama) be suggested, since drop decisions send tool output excerpts? Today nothing is sent until the user configures an endpoint.
 2. **Telemetry reports.** Usage, drops, expansions and captures are logged, but no false-drop-rate or cache-hit report is computed yet.
-3. **Summaries of prose.** Dropping or summarizing old user and assistant prose remains a non-goal for v2.
+3. **History quality.** No automatic check yet that a historian summary kept what later turns needed (e.g. by counting `realctx_expand(history=…)` calls).
 
 ## 20. References
 

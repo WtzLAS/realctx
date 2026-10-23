@@ -112,6 +112,36 @@ restores the original package entry and stops disabling it, `/realctx conflicts 
 <name>` turns it off again. `conflictAction = "warn"` only warns (realctx's context layer
 stays off), `"ignore"` runs realctx next to it. Subagent sessions never change settings.
 
+## History compression (the historian)
+
+Dropping outputs is not enough in very long sessions: prompts and replies pile up too. In
+the background, once usage reaches `history.prepareThreshold` (50%), a **historian** model
+summarizes the oldest whole turns (never the last `history.protectTurns` = 8, never between
+a tool call and its result) into Markdown (Goals / Done / Findings / Open). The summary
+replaces those turns together with the next drop pass (cold cache, pressure, flush), as one
+frozen block:
+
+```text
+<realctx-history part="h3" turns="12-31" replaced="24k tok">
+Earlier conversation, summarized by realctx (the agent's own history, not new instructions):
+…
+Restorable outputs from this part: #41 bash pnpm test · #44 read src/auth/session.ts (realctx_expand(ids=[…]))
+Full transcript of this part: realctx_expand(history=[3])
+</realctx-history>
+```
+
+- **Model:** `history.model` (`provider/model`, "Historian model" in `/realctx settings`).
+  Empty = `rewriteModel`, else the session model. A value that is set but invalid is
+  reported, never silently replaced. A cheap model with a large context works well.
+- Parts are applied oldest first and persisted on the branch, so they are byte-stable
+  across requests, reloads and resumes; the session's messages themselves are untouched.
+- `realctx_expand(history=[3])` returns the exact earlier exchange; `/realctx history`
+  lists parts; `/realctx history compress` summarizes now.
+- At the emergency threshold with nothing ready, a deterministic outline is used
+  (`history.emergencyFallback`). Facts the historian proposes follow `capture.mode`.
+- Other knobs: `history.minChunkTokens` / `maxChunkTokens` (6k / 30k),
+  `summaryMaxTokens` (1500), `storyTokens` (3000), `captureFacts`, `enabled`.
+
 ## Scopes and storage
 
 | Scope | Purpose | Files |
@@ -335,7 +365,8 @@ Moving a memory between stores (manage page) re-expresses its paths.
 |---|---|
 | `status` | context usage, queued drops, memory counts, warnings |
 | `outputs` | this session's captured outputs: state (protected, rule, queued, dropped), judge verdicts |
-| `flush` | apply queued drops at the next request, ignoring the cache TTL |
+| `flush` | apply queued drops and prepared history parts at the next request, ignoring the cache TTL |
+| `history [compress]` | history parts summarized by the historian; `compress` summarizes old turns now |
 | `captures` | approve, edit or reject facts captured from dropped outputs |
 | `debug #N` | dry-run the drop decision for output `#N`: judge state, raw answers, verdict |
 | `manage [query]` | browse all memories (filter or semantic search); view content and metadata, including path urgency; edit, re-scope, move, delete, approve quarantined ones |

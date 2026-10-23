@@ -82,7 +82,7 @@ export interface Candidate {
 	scopeHint?: ScopeKind;
 	source: CandidateSource;
 	/** For `capture`: where the fact was extracted from (§13.1). */
-	origin?: "output" | "user";
+	origin?: "output" | "user" | "history";
 	/** The user explicitly asked to remember this: bypass the importance/durability gate. */
 	force?: boolean;
 }
@@ -140,7 +140,7 @@ export function buildJudgeRequest(
 		"Content:",
 		sanitizeForPrompt(c.content.trim()),
 		"",
-		`Context: ${where}; proposed by ${c.source === "user" ? "the user" : c.source === "import" ? "an import of project instruction files" : c.source === "capture" ? (c.origin === "user" ? "realctx, extracted from what the user said in the conversation (be strict: keep only lasting preferences, decisions, corrections and project facts, not one-off instructions)" : "realctx, extracted from a spent tool output (be strict: keep only durable, important project facts)") : "the coding agent"}.${pathsLine}`,
+		`Context: ${where}; proposed by ${c.source === "user" ? "the user" : c.source === "import" ? "an import of project instruction files" : c.source === "capture" ? (c.origin === "user" ? "realctx, extracted from what the user said in the conversation (be strict: keep only lasting preferences, decisions, corrections and project facts, not one-off instructions)" : c.origin === "history" ? "realctx's historian, extracted while compressing old conversation turns (be strict: keep only durable, important project facts and user preferences)" : "realctx, extracted from a spent tool output (be strict: keep only durable, important project facts)") : "the coding agent"}.${pathsLine}`,
 	].join("\n");
 
 	const optionCost = 18; // approx tokens per id option, repeated in three questions

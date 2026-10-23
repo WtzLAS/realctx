@@ -101,6 +101,10 @@ const big = (tag: string) => Array.from({ length: 200 }, (_, i) => `${tag} line 
 /** Answers of the mock rewrite model (fact extraction, summaries). */
 let completeText = '{"facts": []}';
 let completeCalls = 0;
+/** Answer of the mock historian, and the models the mock registry was asked for. */
+let historianText = '{"summary": "## Done\\n- ran the auth tests (#1 failed on token expiry)", "facts": []}';
+let historianCalls = 0;
+const completeModels: string[] = [];
 /** P(durable_user_fact) the mock judge answers. */
 let userFact = 0.9;
 
@@ -143,8 +147,13 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 		ui: { setStatus() {}, notify: (t: string) => notices.push(t) },
 		sessionManager: { getBranch: () => entries, getSessionId: () => sessionId, getHeader: () => ({ type: "session", id: sessionId, parentSession: opts.parentSession }) },
 		modelRegistry: {
-			find: () => undefined,
-			complete: async () => {
+			find: (provider: string, id: string) => (provider === "h" ? { provider, id, contextWindow: 1_000_000, maxTokens: 8000 } : undefined),
+			complete: async (model: any, req: any) => {
+				completeModels.push(`${model.provider}/${model.id}`);
+				if (String(req?.systemPrompt ?? "").startsWith("You are the historian")) {
+					historianCalls++;
+					return { stopReason: "stop", content: [{ type: "text", text: historianText }], usage: {} };
+				}
 				completeCalls++;
 				return { stopReason: "stop", content: [{ type: "text", text: completeText }], usage: {} };
 			},
@@ -582,4 +591,102 @@ test("conflict detection: grouping by extension, realmem as a memory-only confli
 	assert.equal(packageIdentity("npm:@cortexkit/pi-magic-context@1.2.0"), "npm:@cortexkit/pi-magic-context");
 	assert.equal(packageIdentity("git:github.com/a/b@v1"), packageIdentity("git:github.com/a/b"));
 	assert.equal(packageIdentity("https://github.com/A/b.git"), "https://github.com/a/b");
+});
+
+test("history compression: the historian (own model setting) summarizes old turns; frozen block, persisted, restorable", async () => {
+	delete process.env.REALCTX_PARENT_SESSION;
+	writeSettings({
+		capture: { mode: "suggest" },
+		history: { model: "h/historian", prepareThreshold: 0.05, protectTurns: 2, minChunkTokens: 500, maxChunkTokens: 100_000 },
+	});
+	historianCalls = 0;
+	completeModels.length = 0;
+	historianText = '{"summary": "## Done\\n- ran the auth tests (#1 failed on token expiry)", "facts": [{"caption": "Auth tests need TZ=UTC", "content": "Run `TZ=UTC npm test` for the auth suite."}]}';
+	const h = await harness();
+	// A small window, so a few outputs pass the prepare threshold.
+	h.ctx.model = { provider: "p", id: "m", contextWindow: 20_000, maxTokens: 2000 };
+	h.user("fix the flaky auth test");
+	for (let i = 0; i < 5; i++) {
+		await h.request();
+		await h.turn("bash", { command: `npm test -- part ${i}` }, big(`run ${i}`));
+	}
+	await h.settle();
+	assert.ok(historianCalls >= 1, "the historian ran in the background (one call per part)");
+	assert.ok(completeModels.includes("h/historian"), "history.model picks the historian, not the session model");
+
+	// The cache is cold (old timestamps): the prepared part applies at the next request.
+	const m1 = await h.request();
+	const block = m1.find((m) => m.role === "custom" && m.customType === "realctx-history");
+	assert.ok(block, "a history block replaces old turns");
+	assert.match(block.content, /^<realctx-history part="h1" turns="1-\d+" replaced="[\d.]+k tok">/);
+	assert.match(block.content, /ran the auth tests/);
+	assert.match(block.content, /realctx_expand\(history=\[1\]\)/);
+	assert.ok(!m1.some((m) => m.role === "user" && m.content === "fix the flaky auth test"), "the old prompt is inside the part");
+	const assistants = m1.filter((m) => m.role === "assistant").length;
+	assert.ok(assistants >= 2, "the last protectTurns turns stay raw");
+	// Byte-stable on the next request.
+	const m2 = await h.request();
+	assert.deepEqual(m2.find((m) => m.role === "custom"), block);
+
+	// Persisted at turn end; a reloaded instance renders the same bytes without calling the historian.
+	await h.turn("bash", { command: "echo after" }, "after");
+	assert.ok(h.entries.some((e) => e.customType === "realctx-history" && e.data.chunks.some((c: any) => c.n === 1 && c.appliedAt)));
+	const calls = historianCalls;
+	const { default: realctx } = await import("../extensions/realctx/index.ts");
+	const handlers = new Map<string, Handler[]>();
+	realctx({
+		registerTool() {},
+		registerCommand() {},
+		on: (e: string, fn: Handler) => void handlers.set(e, [...(handlers.get(e) ?? []), fn]),
+		appendEntry() {},
+		getActiveTools: () => [],
+		getAllTools: () => [],
+		setActiveTools() {},
+		sendUserMessage() {},
+	} as any);
+	for (const fn of handlers.get("session_start") ?? []) await fn({ type: "session_start", reason: "reload" }, h.ctx);
+	const messages = structuredClone(h.entries.filter((e) => e.type === "message").map((e) => e.message));
+	let out: any;
+	for (const fn of handlers.get("context") ?? []) out = (await fn({ type: "context", messages }, h.ctx)) ?? out;
+	assert.deepEqual((out?.messages ?? messages).find((m: any) => m.role === "custom"), block, "same block after reload");
+	assert.equal(historianCalls, calls);
+
+	// The model can restore the exact earlier exchange.
+	const ex = await h.tools.get("realctx_expand").execute("x", { history: [1] }, undefined, undefined, h.ctx);
+	assert.match(ex.content[0].text, /^h1 · turns 1-/);
+	assert.match(ex.content[0].text, /USER: fix the flaky auth test/);
+	assert.match(ex.content[0].text, /→ bash command=npm test -- part 0/);
+	await assert.rejects(h.tools.get("realctx_expand").execute("x", {}, undefined, undefined, h.ctx), /pass ids/);
+
+	// Facts the historian found follow capture.mode (suggest).
+	const { MemoryEngine } = await import("../src/engine.ts");
+	const e = new MemoryEngine();
+	try {
+		const root = e.scopes(proj).project?.root;
+		assert.ok(e.db.listSuggestions(root).some((x) => x.origin === "history" && x.caption === "Auth tests need TZ=UTC"));
+	} finally {
+		e.close();
+	}
+	const st = await h.tools.get("realctx_status").execute("s", {}, undefined, undefined, h.ctx);
+	assert.match(st.content[0].text, /history: \d+ part\(s\) summarized/);
+	await h.shutdown();
+
+	// A historian model that is set but invalid is reported, never replaced by the session model.
+	delete process.env.REALCTX_PARENT_SESSION;
+	writeSettings({ history: { model: "nonsense", prepareThreshold: 0.05, protectTurns: 2, minChunkTokens: 500 } });
+	historianCalls = 0;
+	const bad = await harness();
+	bad.ctx.model = { provider: "p", id: "m", contextWindow: 20_000, maxTokens: 2000 };
+	bad.user("go");
+	for (let i = 0; i < 5; i++) {
+		await bad.request();
+		await bad.turn("bash", { command: `echo ${i}` }, big(`b ${i}`));
+	}
+	await bad.settle();
+	assert.equal(historianCalls, 0);
+	const bst = (await bad.tools.get("realctx_status").execute("s", {}, undefined, undefined, bad.ctx)).details.context.history;
+	assert.match(bst.lastError, /history model "nonsense" must be provider\/model/);
+	assert.ok(!(await bad.request()).some((m) => m.role === "custom"));
+	await bad.shutdown();
+	writeSettings({});
 });

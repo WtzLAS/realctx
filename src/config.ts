@@ -89,6 +89,27 @@ export interface Settings {
 		/** Embed dropped outputs so realctx_recall finds them by meaning (needs the embedding endpoint). */
 		embedDropped: boolean;
 	};
+	/** History compression (§9.4): old conversation turns are replaced by a historian's summary. */
+	history: {
+		enabled: boolean;
+		/** `provider/model` of the historian. Empty = `rewriteModel`, else the session model. */
+		model: string;
+		/** Share of the safe input window at which the historian prepares the next chunk (background). */
+		prepareThreshold: number;
+		/** The last N assistant turns are never compressed. */
+		protectTurns: number;
+		/** Chunk size bounds, in tokens of the messages it replaces. */
+		minChunkTokens: number;
+		maxChunkTokens: number;
+		/** Upper bound for one chunk's summary. */
+		summaryMaxTokens: number;
+		/** Earlier summaries passed to the historian for continuity (tokens). */
+		storyTokens: number;
+		/** Let the historian propose durable facts (they follow capture.mode). */
+		captureFacts: boolean;
+		/** At the emergency threshold, compress with a deterministic summary when no chunk is ready. */
+		emergencyFallback: boolean;
+	};
 	/** Drop-time capture of durable facts (§13.1). */
 	capture: {
 		mode: "off" | "suggest" | "auto";
@@ -243,6 +264,18 @@ export const DEFAULT_SETTINGS: Settings = {
 		conflictAction: "disable",
 		retentionDays: 7,
 		embedDropped: true,
+	},
+	history: {
+		enabled: true,
+		model: "",
+		prepareThreshold: 0.5,
+		protectTurns: 8,
+		minChunkTokens: 6000,
+		maxChunkTokens: 30000,
+		summaryMaxTokens: 1500,
+		storyTokens: 3000,
+		captureFacts: true,
+		emergencyFallback: true,
 	},
 	capture: {
 		mode: "suggest",
@@ -399,6 +432,14 @@ export function normalizeSettings(input: unknown): Settings {
 	c.applyThreshold = Math.min(clamp(c.applyThreshold, 0.05, 1), c.emergencyThreshold);
 	c.expandMaxTokens = Math.round(clamp(c.expandMaxTokens, 200, 200_000));
 	c.repinTurns = Math.round(clamp(c.repinTurns, 0, 1000));
+	const h = s.history;
+	h.model = typeof h.model === "string" ? h.model.trim() : "";
+	h.prepareThreshold = clamp(h.prepareThreshold, 0.05, 1);
+	h.protectTurns = Math.round(clamp(h.protectTurns, 1, 1000));
+	h.minChunkTokens = Math.round(clamp(h.minChunkTokens, 500, 500_000));
+	h.maxChunkTokens = Math.round(clamp(h.maxChunkTokens, h.minChunkTokens, 1_000_000));
+	h.summaryMaxTokens = Math.round(clamp(h.summaryMaxTokens, 100, 20_000));
+	h.storyTokens = Math.round(clamp(h.storyTokens, 0, 50_000));
 	// Older configs: `ignoreConflicts: true` meant "run next to them".
 	const rawCtx = isObject(raw) && isObject(raw.context) ? raw.context : {};
 	if (rawCtx.conflictAction === undefined && rawCtx.ignoreConflicts === true) c.conflictAction = "ignore";

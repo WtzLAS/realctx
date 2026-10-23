@@ -188,6 +188,7 @@ export function formatContextStatus(s: {
 	captureMode: string;
 	pendingCaptures: number;
 	judging: boolean;
+	history?: { enabled: boolean; applied: number; ready: number; preparing: boolean; saved: number; model?: string; lastError?: string };
 }): string[] {
 	if (!s.active) return [`Context layer: off (${s.reason ?? "unknown"})`];
 	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
@@ -197,5 +198,13 @@ export function formatContextStatus(s: {
 		`  outputs captured ${s.captured} · dropped/summarized ${s.applied} (−${k(s.reclaimed)} tok) · queued ${s.queued}${s.judging ? " · judging" : ""}`,
 		`  capture: ${s.captureMode}${s.pendingCaptures ? ` (${s.pendingCaptures} suggestion(s) awaiting approval in /realctx manage)` : ""}`,
 	];
+	const h = s.history;
+	if (h) {
+		lines.push(
+			h.enabled
+				? `  history: ${h.applied} part(s) summarized (−${k(h.saved)} tok) · ${h.ready} ready${h.preparing ? " · historian running" : ""}${h.model ? ` · ${h.model}` : ""}${h.lastError ? ` · last error: ${h.lastError}` : ""}`
+				: "  history: compression off",
+		);
+	}
 	return lines;
 }

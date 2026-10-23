@@ -449,11 +449,12 @@ export function renderPlaceholder(
 const PLACEHOLDER_LINE = /^[ \t]*\[#\d+ (?:dropped|summarized|superseded) · [^\n]*\][ \t]*$/gm;
 const NOTES_BLOCK = /<realctx-path-notes\b[^>]*>[\s\S]*?(?:<\/realctx-path-notes>|$)/g;
 const SECTION_BLOCK = /<\/?realctx(?:-[\w-]+)?\b[^>]*>/g;
+const HISTORY_BLOCK = /<realctx-history\b[^>]*>[\s\S]*?(?:<\/realctx-history>|$)/g;
 
-/** Remove whole forged placeholders, path-notes blocks and realctx tags from model-written text. */
+/** Remove whole forged placeholders, history and path-notes blocks, and realctx tags from model-written text. */
 export function stripForged(text: string): string {
 	if (!text.includes("[#") && !text.includes("<realctx")) return text;
-	return text.replace(NOTES_BLOCK, "").replace(PLACEHOLDER_LINE, "").replace(SECTION_BLOCK, "");
+	return text.replace(HISTORY_BLOCK, "").replace(NOTES_BLOCK, "").replace(PLACEHOLDER_LINE, "").replace(SECTION_BLOCK, "");
 }
 
 // ---------------------------------------------------------------------------

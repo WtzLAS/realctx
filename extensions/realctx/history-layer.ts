@@ -357,8 +357,8 @@ export class HistoryManager {
 		const offset = branch.slice(0, s).filter((m) => m.role === "assistant").length;
 		const transcript = renderTranscript(branch.slice(s, e + 1), { turnOffset: offset, output: (id) => this.host.output(id), maxTokens: 1_000_000 });
 		const view = viewOriginal(transcript, { lines: opts.lines, grep: opts.grep, maxTokens: opts.maxTokens });
-		const head = `h${n} · turns ${c.turns[0]}-${c.turns[1]} · ${c.count} messages · ${fmtTokens(c.tokensBefore)} (tool outputs shortened; restore them with realctx_expand(ids=[…]))`;
-		const more = view.truncated ? `\n(truncated; ${view.totalLines} lines in total: call again with lines="200-400" or grep="pattern")` : "";
+		const head = `h${n} · turns ${c.turns[0]}-${c.turns[1]} · ${c.count} messages · ${fmtTokens(c.tokensBefore)} (tool outputs shortened)`;
+		const more = view.truncated ? `\n(truncated: ${view.totalLines} lines in total)` : "";
 		return `${head}${more}\n\n${view.text}`;
 	}
 

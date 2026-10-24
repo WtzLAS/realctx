@@ -79,7 +79,7 @@ test("transcript labels captured outputs, shortens long ones, redacts secrets an
 	assert.ok(!out.includes("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
 	assert.ok(!out.includes("<realctx-history"));
 	// A dropped output shows its placeholder instead.
-	const d = renderTranscript(m, { turnOffset: 0, maxTokens: 2000, output: () => ({ ord: 7, label: "bash", placeholder: "[#7 dropped · bash npm test · 6k tok · realctx_expand(7)]" }) });
+	const d = renderTranscript(m, { turnOffset: 0, maxTokens: 2000, output: () => ({ ord: 7, label: "bash", placeholder: "[#7 dropped · bash npm test · 6k tok]" }) });
 	assert.match(d, /← #7 bash \(error\): \[#7 dropped/);
 });
 
@@ -105,8 +105,8 @@ test("chunks render as frozen blocks only where they still match; later chunks f
 	assert.equal(r.messages.length, m.length - 10 + 2);
 	assert.equal(r.messages[0].role, "custom");
 	assert.match(String(r.messages[0].content), /^<realctx-history part="h1" turns="1-2" replaced="3k tok">/);
-	assert.match(String(r.messages[0].content), /Restorable outputs from this part: #7 bash npm test/);
-	assert.match(String(r.messages[0].content), /realctx_expand\(history=\[1\]\)/);
+	assert.match(String(r.messages[0].content), /Tool outputs in this part: #7 bash npm test\n<\/realctx-history>$/);
+	assert.ok(!String(r.messages[0].content).includes("realctx_expand"));
 	assert.equal(r.messages[2].content, "now the docs");
 	// Same input, same bytes.
 	assert.deepEqual(renderHistory(m, [c1, c2]).messages, r.messages);

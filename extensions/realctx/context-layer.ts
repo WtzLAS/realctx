@@ -648,7 +648,6 @@ export class ContextLayer {
 			savedAs: p.savedAs,
 			reason: p.reason,
 			by: p.by,
-			expandOf: meta.expandOf,
 		});
 	}
 
@@ -963,7 +962,7 @@ export class ContextLayer {
 			const view = viewOriginal(text, { lines: params.lines, grep: params.grep, maxTokens: budget });
 			if (view.truncated) {
 				head.push(
-					`(truncated to ~${fmtTokens(budget)} of ${view.totalLines} lines; call realctx_expand(ids=[${ord}], lines="200-400") or grep="pattern" for the rest)`,
+					`(truncated: first ~${fmtTokens(budget)} of ${view.totalLines} lines shown)`,
 				);
 			}
 			parts.push({ type: "text", text: `${head.join("\n")}\n\n${view.text}` });

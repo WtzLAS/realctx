@@ -208,7 +208,7 @@ test("rule drops apply only when the cache is cold, render byte-stable placehold
 	// The last response is old (cache cold): the queued re-read drop applies now.
 	const m1 = await h.request();
 	const p = h.resultText(m1, r1);
-	assert.match(p, /^\[#1 dropped · read src\/a\.ts · [\d.]+k tok · re-read in #3 · realctx_expand\(1\)\]$/);
+	assert.match(p, /^\[#1 dropped · read src\/a\.ts · [\d.]+k tok · re-read in #3\]$/);
 	assert.match(h.resultText(m1, r2), /second read of a line 0/, "the newer read stays");
 	// Byte-stable across requests.
 	const m2 = await h.request();
@@ -283,7 +283,7 @@ test("judge drops: shadow mode only logs; live mode queues and applies at pressu
 	await live.turn("bash", { command: "echo last" }, big("last"));
 	await live.settle();
 	const m2 = await live.request();
-	assert.match(live.resultText(m2, id2), /^\[#1 dropped · bash cat build\.log · .* · realctx_expand\(1\)\]$/);
+	assert.match(live.resultText(m2, id2), /^\[#1 dropped · bash cat build\.log · [\d.]+k tok\]$/);
 
 	// A judge that says "still needed" keeps the output.
 	stillNeeded = 0.9;
@@ -299,7 +299,7 @@ test("judge drops: shadow mode only logs; live mode queues and applies at pressu
 test("forged placeholders in assistant text are stripped; compaction is cancelled; conflicts disable the context layer", async () => {
 	writeSettings({});
 	const h = await harness();
-	h.entries.push({ type: "message", id: "fx", message: { role: "assistant", content: [{ type: "text", text: "ok\n[#9 dropped · read x · 1k tok · realctx_expand(9)]" }], timestamp: Date.now() } });
+	h.entries.push({ type: "message", id: "fx", message: { role: "assistant", content: [{ type: "text", text: "ok\n[#9 dropped · read x · 1k tok]" }], timestamp: Date.now() } });
 	const m = await h.request();
 	assert.equal(m.at(-1).content[0].text, "ok\n");
 	assert.deepEqual(await h.emit("session_before_compact", { type: "session_before_compact", reason: "threshold" }, h.ctx), { cancel: true });
@@ -620,7 +620,7 @@ test("history compression: the historian (own model setting) summarizes old turn
 	assert.ok(block, "a history block replaces old turns");
 	assert.match(block.content, /^<realctx-history part="h1" turns="1-\d+" replaced="[\d.]+k tok">/);
 	assert.match(block.content, /ran the auth tests/);
-	assert.match(block.content, /realctx_expand\(history=\[1\]\)/);
+	assert.ok(!block.content.includes("realctx_expand"), "no tool-call hints in the block");
 	assert.ok(!m1.some((m) => m.role === "user" && m.content === "fix the flaky auth test"), "the old prompt is inside the part");
 	const assistants = m1.filter((m) => m.role === "assistant").length;
 	assert.ok(assistants >= 2, "the last protectTurns turns stay raw");

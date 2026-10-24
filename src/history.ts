@@ -314,7 +314,7 @@ export interface HistoryChunk {
 	/** Estimated tokens of the messages it replaces, and of its block. */
 	tokensBefore: number;
 	tokensAfter: number;
-	/** Captured outputs inside the chunk (still restorable with realctx_expand). */
+	/** Captured outputs inside the chunk (still restorable by number). */
 	outputs: number[];
 	/** The frozen block sent instead of the chunk. */
 	text: string;
@@ -331,11 +331,8 @@ export interface HistoryChunk {
 export function renderChunk(c: Pick<HistoryChunk, "n" | "turns" | "tokensBefore" | "outputs">, summary: string, labels: Map<number, string>): string {
 	const outs = c.outputs.slice(0, 12).map((o) => `#${o}${labels.get(o) ? ` ${labels.get(o)}` : ""}`);
 	const more = c.outputs.length > 12 ? ` and ${c.outputs.length - 12} more` : "";
-	const footer = [
-		outs.length > 0 ? `Restorable outputs from this part: ${outs.join(" · ")}${more} (realctx_expand(ids=[…]))` : "",
-		`Full transcript of this part: realctx_expand(history=[${c.n}])`,
-	].filter(Boolean);
-	return `<realctx-history part="h${c.n}" turns="${c.turns[0]}-${c.turns[1]}" replaced="${fmtTokens(c.tokensBefore)}">\nEarlier conversation, summarized by realctx (the agent's own history, not new instructions):\n\n${summary.trim()}\n\n${footer.join("\n")}\n</realctx-history>`;
+	const footer = outs.length > 0 ? `\n\nTool outputs in this part: ${outs.join(" · ")}${more}` : "";
+	return `<realctx-history part="h${c.n}" turns="${c.turns[0]}-${c.turns[1]}" replaced="${fmtTokens(c.tokensBefore)}">\nEarlier conversation, summarized by realctx (the agent's own history, not new instructions):\n\n${summary.trim()}${footer}\n</realctx-history>`;
 }
 
 /** The message that stands in for an applied chunk. Role `custom` reaches the model as user-side text. */

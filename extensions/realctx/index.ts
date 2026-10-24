@@ -737,7 +737,7 @@ export default function realctx(pi: ExtensionAPI) {
 							"",
 							...layer.history.listing(),
 							"",
-							"/realctx history compress · the model restores a part with realctx_expand(history=[n])",
+							"/realctx history compress summarizes old turns now",
 						];
 						if (ctx.mode === "tui") await showText(ctx, "realctx history", () => lines);
 						else ctx.ui.notify(lines.join("\n"), "info");

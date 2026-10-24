@@ -249,14 +249,15 @@ All queued drops apply in one pass, together with any history parts the historia
 ### 9.1 Placeholders
 
 ```
-[#42 dropped · read src/auth/session.ts · 3.1k tok · realctx_expand(42)]
-[#57 summarized · bash pnpm test · 8.4k tok · realctx_expand(57)]
+[#42 dropped · read src/auth/session.ts · 3.1k tok]
+[#57 summarized · bash pnpm test · 8.4k tok]
   3 failing in auth/session.test.ts: expired-token cases
-[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · realctx_expand(63)]
-[#71 superseded · edit src/auth/session.ts · 1.4k tok · edited again in #80 · realctx_expand(71)]
+[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw]
+[#71 superseded · edit src/auth/session.ts · 1.4k tok · edited again in #80]
 ```
 
 - Tool name and arguments let the model decide without expanding.
+- No tool-call hints (such as `realctx_expand(42)`) in rendered text: the `#N` / `hN` numbers are enough, and the system-prompt section and the tool description say how to restore them.
 - `saved as <id>` appears when the output's durable content became a memory (§13.2).
 - Rendered once, frozen and persisted in `realctx-drops`; byte-identical on every request, after reload and after resume. Nothing derived from mutable data.
 
@@ -295,8 +296,7 @@ Earlier conversation, summarized by realctx (the agent's own history, not new in
 ## Goals …
 ## Done …
 
-Restorable outputs from this part: #41 bash pnpm test · #44 read src/auth/session.ts (realctx_expand(ids=[…]))
-Full transcript of this part: realctx_expand(history=[3])
+Tool outputs in this part: #41 bash pnpm test · #44 read src/auth/session.ts
 </realctx-history>
 ```
 

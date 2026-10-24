@@ -431,7 +431,7 @@ const REASON: Record<RuleReason, (by?: number) => string> = {
 export function renderPlaceholder(
 	meta: Pick<OutputMeta, "ord" | "tool" | "args" | "tokens" | "isError">,
 	kind: AppliedDrop["kind"],
-	opts: { summary?: string; savedAs?: string[]; reason?: RuleReason; by?: number; expandOf?: number[] } = {},
+	opts: { summary?: string; savedAs?: string[]; reason?: RuleReason; by?: number } = {},
 ): string {
 	const what = oneLine(`${meta.tool}${meta.args ? ` ${meta.args}` : ""}`, 100).replace(/[[\]]/g, "");
 	const label = kind === "summary" ? "summarized" : kind === "shrink" ? "superseded" : "dropped";
@@ -439,8 +439,6 @@ export function renderPlaceholder(
 	if (meta.isError) parts.push("error");
 	if (opts.reason) parts.push(REASON[opts.reason](opts.by));
 	if (opts.savedAs && opts.savedAs.length > 0) parts.push(`saved as ${opts.savedAs.join(", ")}`);
-	const target = opts.expandOf && opts.expandOf.length > 0 ? opts.expandOf : [meta.ord];
-	parts.push(`realctx_expand(${target.join(", ")})`);
 	const head = `[${parts.join(" · ")}]`;
 	if (kind === "summary" && opts.summary) return `${head}\n${opts.summary.split("\n").map((l) => `  ${l}`).join("\n")}`;
 	return head;

@@ -469,7 +469,7 @@ function fields(): FieldDef[] {
 		{
 			id: "history.enabled",
 			label: "History compression",
-			description: "The historian summarizes old turns in the background; summaries replace them together with queued drops (cold cache, pressure, flush). Originals stay restorable with realctx_expand(history=[n]).",
+			description: "The historian summarizes old turns in the background; summaries replace them together with queued drops (cold cache, pressure, flush). Originals stay on the session branch and remain restorable.",
 			get: (s) => (s.history.enabled ? "on" : "off"),
 			set: (s, v) => {
 				s.history.enabled = v === "on";

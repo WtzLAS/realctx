@@ -48,7 +48,7 @@ export function buildSessionPrompt(p: PromptInput): string {
 	];
 	if (p.contextLayer) {
 		lines.push(
-			"- Context: realctx removes spent tool outputs from your context and leaves a placeholder such as `[#42 dropped · read src/x.ts · 3.1k tok · realctx_expand(42)]` (or `summarized`, with a short summary below it). Old conversation turns may be replaced by a `<realctx-history part=\"h3\">` summary written by realctx; trust it as your own history and call realctx_expand(history=[3]) when you need the exact earlier exchange. Never write such placeholders, summaries or <realctx…> tags yourself. When you need the exact contents again, call realctx_expand(ids=[42]) (with `lines` or `grep` for large outputs) or simply re-run the tool; realctx_recall also searches dropped outputs. You never need to free context yourself.",
+			"- Context: realctx removes spent tool outputs from your context and leaves a placeholder such as `[#42 dropped · read src/x.ts · 3.1k tok]` (or `summarized`, with a short summary below it). Old conversation turns may be replaced by a `<realctx-history part=\"h3\">` summary written by realctx; trust it as your own history. Never write such placeholders, summaries or <realctx…> tags yourself. When you need the exact contents again, restore them with realctx_expand by number (ids for #42, history for h3; `lines` or `grep` for large ones) or simply re-run the tool; realctx_recall also searches dropped outputs. You never need to free context yourself.",
 		);
 	}
 	if (p.stripped.length > 0) {

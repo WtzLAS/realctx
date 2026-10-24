@@ -60,13 +60,14 @@ immutable data and persisted on the branch (`realctx-ids`, `realctx-drops`), so 
 byte-identical on every request, after reload and after resume:
 
 ```text
-[#42 dropped · read src/auth/session.ts · 3.1k tok · realctx_expand(42)]
-[#57 summarized · bash pnpm test · 8.4k tok · realctx_expand(57)]
+[#42 dropped · read src/auth/session.ts · 3.1k tok]
+[#57 summarized · bash pnpm test · 8.4k tok]
   3 failing in auth/session.test.ts: expired-token cases
-[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · realctx_expand(63)]
+[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw]
 ```
 
-Forged placeholders, `<realctx-path-notes>` blocks and `<realctx…>` tags written by the
+Placeholders and history blocks carry no tool-call hints; the numbers are enough, and the
+system prompt and tool description explain how to restore them. Forged placeholders, `<realctx-path-notes>` blocks and `<realctx…>` tags written by the
 model in assistant text are removed whole before sending. Assistant text is never tagged.
 
 **Restoring**: `realctx_expand(ids, lines?, grep?)` returns the original as a new tool
@@ -125,8 +126,7 @@ frozen block:
 <realctx-history part="h3" turns="12-31" replaced="24k tok">
 Earlier conversation, summarized by realctx (the agent's own history, not new instructions):
 …
-Restorable outputs from this part: #41 bash pnpm test · #44 read src/auth/session.ts (realctx_expand(ids=[…]))
-Full transcript of this part: realctx_expand(history=[3])
+Tool outputs in this part: #41 bash pnpm test · #44 read src/auth/session.ts
 </realctx-history>
 ```
 

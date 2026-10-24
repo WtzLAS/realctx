@@ -85,10 +85,10 @@ realctx keeps your context small by removing tool outputs you no longer need. A
 removed output leaves a placeholder in place of the result:
 
 ```text
-[#42 dropped · read src/auth/session.ts · 3.1k tok · realctx_expand(42)]
-[#57 summarized · bash pnpm test · 8.4k tok · realctx_expand(57)]
+[#42 dropped · read src/auth/session.ts · 3.1k tok]
+[#57 summarized · bash pnpm test · 8.4k tok]
   3 failing in auth/session.test.ts: expired-token cases
-[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw · realctx_expand(63)]
+[#63 dropped · read docs/setup.md · 2.2k tok · saved as AZJrPlwafS-aSxwtPk9aaw]
 ```
 
 - The tool name and arguments usually tell you enough. Do not expand just in case.

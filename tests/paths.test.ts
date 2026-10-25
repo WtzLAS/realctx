@@ -24,6 +24,8 @@ import {
 	scopeExists,
 	suggestRename,
 	touchedPaths,
+	resultPaths,
+	patchFiles,
 } from "../src/paths.ts";
 
 test("scopes: files, directories and globs", () => {
@@ -242,4 +244,24 @@ test("path notes: High full, Mid caption, Low counted, budget demotes", () => {
 	const tight = formatPathNotes(["db"], [{ memory: hi, tier: "high" }], { maxFull: 0, maxCaptions: 8, charBudget: 6000 });
 	assert.match(tight?.text ?? "", /- \[HHHHHHHHHHHHHHHHHHHHHH\]/, "no full slots: caption");
 	assert.equal(formatPathNotes(["db"], [], { maxFull: 3, maxCaptions: 8, charBudget: 6000 }), undefined);
+});
+
+test("result paths: snapshotId, patch headers (both files of a move), explicit path keys; existing files only", () => {
+	const root = mkdtempSync(join(tmpdir(), "realctx-result-"));
+	try {
+		mkdirSync(join(root, "src"), { recursive: true });
+		writeFileSync(join(root, "src", "a.ts"), "a\n");
+		writeFileSync(join(root, "src", "b.ts"), "b\n");
+		const R = resolvePathArg(".", root) as string;
+		const rel = (xs: string[]) => xs.map((x) => (x.startsWith(`${R}/`) ? x.slice(R.length + 1) : x)).sort();
+		assert.deepEqual(rel(resultPaths({ snapshotId: `v2|${join(root, "src/a.ts")}|1|2.5|3.5|4` }, root)), ["src/a.ts"]);
+		const move = "--- src/a.ts\n+++ src/a.ts\n@@ -1,3 +1,1 @@\n-x\n--- src/gone.ts\n-+++ src/gone.ts\n+y\n--- src/b.ts\n+++ src/b.ts\n@@ -0,0 +1 @@\n+x\n";
+		assert.deepEqual(rel(resultPaths({ patch: move }, root)), ["src/a.ts", "src/b.ts"], "hunk lines are never headers");
+		assert.deepEqual(patchFiles("--- a/x.ts\t2024\n+++ b/y.ts\n@@ -1 +1 @@\n-a\n+b\n"), ["x.ts", "y.ts"]);
+		assert.deepEqual(rel(resultPaths({ path: "src/b.ts", paths: ["src/a.ts", "nope.ts"] }, root)), ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(resultPaths({ snapshotId: "garbage" }, root), []);
+		assert.deepEqual(resultPaths(undefined, root), []);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });

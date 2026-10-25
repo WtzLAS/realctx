@@ -20,6 +20,8 @@ export interface MessageView {
 	toolCallId?: string;
 	toolName?: string;
 	isError?: boolean;
+	/** Tool-result `details` (machine-readable, never shown to the model). */
+	details?: unknown;
 	timestamp?: number;
 	usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number };
 	stopReason?: string;

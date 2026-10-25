@@ -26,7 +26,7 @@ import {
 	storedExists,
 	summarizeArgs,
 } from "../../src/outputs.ts";
-import { displayPath, touchedPaths } from "../../src/paths.ts";
+import { displayPath, resultPaths, touchedPaths } from "../../src/paths.ts";
 import {
 	type AppliedDrop,
 	buildExtractPrompt,
@@ -166,7 +166,7 @@ export class ContextLayer {
 	private pending = new Map<string, PendingDrop>();
 	private pins = new Map<string, Pin>();
 	/** Tracker cache: paths and signature of every tool call seen (captured or not). */
-	private callPaths = new Map<string, { paths: string[]; sig: string }>();
+	private callPaths = new Map<string, { paths: string[]; sig: string; result?: boolean }>();
 	private unflushedMetas: OutputMeta[] = [];
 	private unflushedDrops: AppliedDrop[] = [];
 	private unflushedPins: Pin[] = [];
@@ -379,18 +379,27 @@ export class ContextLayer {
 	// capture (§6)
 	// -------------------------------------------------------------------------
 
-	/** Path tracker: paths touched by a call, computed once and cached (§13.4). */
-	trackCall(toolCallId: string, tool: string, input: Record<string, unknown>, cwd: string): string[] {
+	/**
+	 * Path tracker: paths touched by a call, computed once and cached (§13.4). Path
+	 * arguments first; tools that address files by other means (anchor-based edits such as
+	 * pi-hashline-edit-pro's `replace` / `insert` / `move`) are resolved from the files
+	 * their result `details` report, once a result is known.
+	 */
+	trackCall(toolCallId: string, tool: string, input: Record<string, unknown>, cwd: string, details?: unknown): string[] {
 		const sig = argsSignature(tool, input);
 		const hit = this.callPaths.get(toolCallId);
-		if (hit && hit.sig === sig) return hit.paths;
+		if (hit && hit.sig === sig && (hit.result || details === undefined)) return hit.paths;
 		let paths: string[] = [];
 		try {
 			paths = touchedPaths(tool, input, cwd);
+			if (details !== undefined && (paths.length === 0 || isMutating(tool))) {
+				const extra = resultPaths(details, cwd).filter((p) => !paths.includes(p));
+				paths = [...paths, ...extra].slice(0, 32);
+			}
 		} catch {
 			paths = [];
 		}
-		this.callPaths.set(toolCallId, { paths, sig });
+		this.callPaths.set(toolCallId, { paths, sig, result: details !== undefined });
 		return paths;
 	}
 
@@ -451,6 +460,48 @@ export class ContextLayer {
 		}
 	}
 
+	/**
+	 * The result the model got differs from the one captured at `tool_result`: a handler of
+	 * another extension rewrote it later (pi-hashline-edit-pro replaces an edit's summary with
+	 * its post-edit diff and fresh anchors). Store that final version, so a restore gives back
+	 * what the model actually saw.
+	 */
+	recapture(
+		ev: { toolCallId: string; toolName: string; input: Record<string, unknown>; content: ContentPart[]; isError: boolean },
+		paths: string[],
+		noteIds: string[],
+		cwd: string,
+	): void {
+		const meta = this.metas.get(ev.toolCallId);
+		if (!meta) return this.capture(ev, paths, noteIds, cwd);
+		if (!this.active || !this.files || this.applied.has(meta.id) || this.pending.has(meta.id)) return;
+		try {
+			this.files.write(meta.file, { v: 1, id: ev.toolCallId, tool: ev.toolName, input: ev.input, content: ev.content, isError: ev.isError, capturedAt: meta.capturedAt });
+		} catch {
+			return; // the first capture is still restorable
+		}
+		meta.tokens = contentTokens(ev.content);
+		meta.isError = ev.isError;
+		meta.paths = paths.slice(0, 32);
+		meta.mtimes = mtimesOf(paths);
+		if (!this.unflushedMetas.includes(meta)) this.unflushedMetas.push(meta);
+		try {
+			const text = contentText(ev.content);
+			this.host.engine().db.putOutput({
+				toolCallId: ev.toolCallId,
+				session: this.sessionId,
+				project: this.projectKey,
+				ord: meta.ord,
+				meta,
+				file: meta.file,
+				head: `${ev.toolName} ${meta.args}`,
+				body: text.length > 200_000 ? `${text.slice(0, 150_000)}\n…\n${text.slice(-50_000)}` : text,
+			});
+		} catch {
+			// index unavailable: the branch registry still restores it
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	// transcript view
 	// -------------------------------------------------------------------------
@@ -480,6 +531,11 @@ export class ContextLayer {
 				const c = byId.get(m.toolCallId);
 				if (!c) continue;
 				c.isError = m.isError === true;
+				// Anchor-addressed edits name their file only in the result (after a reload, too).
+				if (m.details !== undefined && m.details !== null) {
+					c.paths = this.trackCall(c.id, c.tool, c.input, cwd, m.details);
+					c.sig = this.callPaths.get(c.id)?.sig ?? c.sig;
+				}
 				const first = textOf(m.content)
 					.split("\n")
 					.find((l) => l.trim());

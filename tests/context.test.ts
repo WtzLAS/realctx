@@ -163,15 +163,22 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 	};
 	let now = Date.now() - 3_600_000;
 	/** One assistant turn calling one tool, then its result. */
-	const turn = async (name: string, input: Record<string, unknown>, text: string, isError = false) => {
+	/**
+	 * `details` is the tool's result details; `after` stands for a tool_result handler of an
+	 * extension loaded after realctx (pi-hashline-edit-pro rewrites edit results there).
+	 */
+	const turn = async (name: string, input: Record<string, unknown>, text: string, isError = false, opts: { details?: unknown; after?: (content: any[]) => any[] } = {}) => {
 		const id = `call${++seq}`;
 		now += 1000;
 		const assistant = { role: "assistant", content: [{ type: "toolCall", id, name, arguments: input }], timestamp: now, usage: { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 1010 }, stopReason: "toolUse" };
 		entries.push({ type: "message", id: nextId(), message: assistant });
 		await emit("message_end", { type: "message_end", message: assistant }, ctx);
-		const r = await emit("tool_result", { type: "tool_result", toolName: name, toolCallId: id, input, content: [{ type: "text", text }], isError, details: undefined }, ctx);
-		const content = r?.content ?? [{ type: "text", text }];
-		entries.push({ type: "message", id: nextId(), message: { role: "toolResult", toolCallId: id, toolName: name, content, isError, timestamp: now } });
+		const r = await emit("tool_result", { type: "tool_result", toolName: name, toolCallId: id, input, content: [{ type: "text", text }], isError, details: opts.details }, ctx);
+		let content = r?.content ?? [{ type: "text", text }];
+		if (opts.after) content = opts.after(content);
+		let message: any = { role: "toolResult", toolCallId: id, toolName: name, content, details: opts.details, isError, timestamp: now };
+		message = (await emit("message_end", { type: "message_end", message }, ctx))?.message ?? message;
+		entries.push({ type: "message", id: nextId(), message });
 		const te = await emit("turn_end", { type: "turn_end" }, ctx);
 		for (const d of te?.entries ?? []) entries.push({ ...d, id: nextId() });
 		return id;
@@ -689,4 +696,38 @@ test("history compression: the historian (own model setting) summarizes old turn
 	assert.ok(!(await bad.request()).some((m) => m.role === "custom"));
 	await bad.shutdown();
 	writeSettings({});
+});
+
+test("pi-hashline-edit-pro: anchor edits are tracked by their result details; rewritten results are stored as shown, path notes survive", async () => {
+	writeSettings({});
+	const h = await harness();
+	const abs = (rel: string) => join(proj, rel);
+	const hashline = (rel: string) => ({
+		snapshotId: `v2|${abs(rel)}|123|1700000000000.5|1700000000000.5|42`,
+		patch: `--- ${rel}\n+++ ${rel}\n@@ -1,2 +1,2 @@\n--- not a header\n+++ not a header\n`,
+		metrics: { classification: "applied" },
+	});
+	// A later extension (hashline) swaps the summary for its post-edit diff and drops whatever came before.
+	const diff = (tag: string) => () => [{ type: "text", text: big(`post-edit diff ${tag}`) }];
+	const memo = await h.tools.get("realctx_remember").execute("m", { caption: "B owns the build flags", content: "Keep b.ts flags in sync with CI.", paths: ["src/b.ts"] }, undefined, undefined, h.ctx);
+	assert.equal(memo.details.status, "added");
+
+	h.user("edit b.ts");
+	const e1 = await h.turn("replace", { remove_from: "abcde", remove_to: "abcde", text: "x" }, big("Replaced 1 line"), false, { details: hashline("src/b.ts"), after: diff("one") });
+	const shown = h.entries.find((e) => e.message?.toolCallId === e1).message.content.map((c: any) => c.text).join("\n");
+	assert.match(shown, /post-edit diff one line 0/);
+	assert.match(shown, /realctx-path-notes[\s\S]*B owns the build flags/, "path notes put back after the rewrite");
+
+	const e2 = await h.turn("insert", { anchor: "fghij", direction: "after", text: "y" }, big("Inserted 1 line"), false, { details: hashline("src/b.ts"), after: diff("two") });
+	await h.turn("bash", { command: "echo 1" }, big("x"));
+	await h.turn("bash", { command: "echo 2" }, big("y"));
+	await h.settle();
+	const m = await h.request();
+	assert.match(h.resultText(m, e1), /edited again in #2/, "anchor edits of one file supersede each other");
+	assert.match(h.resultText(m, e2), /post-edit diff two line 0/);
+
+	// The stored original is what the model saw (the diff), not the summary hashline replaced.
+	const ex = await h.tools.get("realctx_expand").execute("x", { ids: [1] }, undefined, undefined, h.ctx);
+	assert.match(ex.content[0].text, /post-edit diff one line 0/);
+	assert.doesNotMatch(ex.content[0].text, /Replaced 1 line/);
 });

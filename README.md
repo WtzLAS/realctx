@@ -290,6 +290,8 @@ Moving a memory between stores (manage page) re-expresses its paths.
 
 - **Shown on touch.** After every tool call, realctx works out which paths it
   touched: path arguments of any tool, and words of `bash` commands that exist on disk.
+  A call that names no path (anchor-addressed edits) is resolved from the files its result
+  `details` report: `path` / `paths`, a `snapshotId`, or the headers of a unified `patch`.
   Memories whose scope covers those paths are appended to the end of the tool result,
   inside `<realctx-path-notes>`, most specific scope first, then most used. The path
   urgency decides how much is shown:
@@ -458,6 +460,29 @@ The context layer starts in shadow mode (`judge.shadow`) with capture in `sugges
 Watch `/realctx outputs` and `/realctx status` for a while, then turn shadow off in
 `/realctx settings` (rule-based drops of re-read, re-edited and duplicate outputs apply
 from the start).
+
+### With pi-hashline-edit-pro
+
+[pi-hashline-edit-pro](https://github.com/YuGiMob/pi-hashline-edit-pro) replaces `read`
+with anchored rows and edits by anchor (`replace`, `replace_match`, `insert`, `copy`,
+`move`, `undo_last_change`), mostly without a `path` argument. realctx works with it
+in any load order:
+
+- **Edited files** are taken from the edit's result details (`snapshotId`, and the
+  `patch` headers, so a cross-file `move` counts for both files). Path notes, re-edit
+  drops ("edited again in #N") and staleness warnings on `realctx_expand` all see
+  anchor edits, also after a reload.
+- **What the model saw is what gets stored.** pi-hashline-edit-pro rewrites an edit's
+  result after it ran (the summary becomes the post-edit diff with fresh anchors). When a
+  result changes after realctx captured it, realctx stores the final version at
+  `message_end`, so a placeholder restores the diff, not the summary, and appends the path
+  notes again if the rewrite removed them.
+- **Structured content** (anchors for codemode scripts) is kept when path notes are
+  appended to a result.
+
+A restored output carries the anchors of its time. pi-hashline-edit-pro refuses stale
+anchors with fresh ones, so an edit from an old restore never lands on the wrong line;
+re-`read` the file when the restore says it was edited since.
 
 ### Upgrading from realmem
 

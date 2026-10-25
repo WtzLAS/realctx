@@ -233,6 +233,66 @@ export function touchedPaths(toolName: string, input: Record<string, unknown> | 
 	return [...out].slice(0, 32);
 }
 
+const SNAPSHOT_ID = /^v\d+\|(.+)\|\d+\|[\d.]+\|[\d.]+\|\d+$/;
+
+/**
+ * Files a tool reports in its result `details`, for calls whose arguments name no path:
+ * anchor-addressed edits (pi-hashline-edit-pro's `replace`, `replace_match`, `insert`,
+ * `copy`, `move`) resolve the file from the anchors alone. Read from `details.path` /
+ * `details.paths`, a `v2|<path>|ino|mtime|ctime|size` `snapshotId`, and the file headers
+ * of a unified `patch` (both files of a cross-file move). Only files that exist count.
+ */
+export function resultPaths(details: unknown, cwd: string): string[] {
+	if (!details || typeof details !== "object" || Array.isArray(details)) return [];
+	const d = details as Record<string, unknown>;
+	const out = new Set<string>();
+	const add = (p: unknown) => {
+		if (out.size >= 32 || typeof p !== "string" || !p || p === "." || p === ".." || /[*?[\]{}\n]/.test(p)) return;
+		const abs = resolvePathArg(p, cwd);
+		if (!abs || abs === "/" || !existsSync(abs)) return;
+		out.add(abs);
+	};
+	for (const k of ["path", "file", "filePath", "file_path"]) add(d[k]);
+	if (Array.isArray(d.paths)) for (const p of d.paths.slice(0, 32)) add(p);
+	if (typeof d.snapshotId === "string") add(SNAPSHOT_ID.exec(d.snapshotId)?.[1]);
+	if (typeof d.patch === "string" && d.patch.length <= 4 * 1024 * 1024) for (const p of patchFiles(d.patch)) add(p);
+	return [...out];
+}
+
+/**
+ * File names in the headers of a unified patch. Hunks are skipped by their line counts,
+ * so a removed `-- x` line followed by an added `++ x` line is never taken for a header.
+ */
+export function patchFiles(patch: string): string[] {
+	const out: string[] = [];
+	const lines = patch.split("\n");
+	const name = (s: string) => s.replace(/\t.*$/, "").replace(/^[ab]\/(?=.)/, "");
+	for (let i = 0; i < lines.length && out.length < 32; i++) {
+		const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(lines[i]);
+		if (hunk) {
+			let old = hunk[1] === undefined ? 1 : Number(hunk[1]);
+			let neu = hunk[2] === undefined ? 1 : Number(hunk[2]);
+			while ((old > 0 || neu > 0) && i + 1 < lines.length) {
+				const l = lines[++i];
+				if (l.startsWith("\\")) continue; // "\ No newline at end of file"
+				if (l.startsWith("-")) old--;
+				else if (l.startsWith("+")) neu--;
+				else {
+					old--;
+					neu--;
+				}
+			}
+			continue;
+		}
+		const a = /^--- (.+)$/.exec(lines[i]);
+		const b = a && i + 1 < lines.length ? /^\+\+\+ (.+)$/.exec(lines[i + 1]) : null;
+		if (!a || !b) continue;
+		for (const f of [name(a[1]), name(b[1])]) if (f !== "/dev/null" && !out.includes(f)) out.push(f);
+		i++;
+	}
+	return out;
+}
+
 // ---------------------------------------------------------------------------
 // Stale path detection
 // ---------------------------------------------------------------------------

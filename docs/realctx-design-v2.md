@@ -446,7 +446,7 @@ Path notes live inside tool results, so dropping a result would drop its notes, 
 
 ### 13.4 Shared path tracker
 
-The tracker computes touched paths once per tool call (path arguments, plus `bash` words that exist on disk). Its output feeds:
+The tracker computes touched paths once per tool call (path arguments, plus `bash` words that exist on disk). A call without path arguments, and every mutating call, also gets the files its result `details` report (`path` / `paths`, a `v2|<path>|…` `snapshotId`, unified `patch` headers), so anchor-addressed edits (pi-hashline-edit-pro) are tracked; the result-based paths are recomputed from the stored tool-result messages after a reload. When a later `tool_result` handler of another extension rewrites a result, realctx stores the final version at `message_end` and re-appends its path notes if they were removed. Its output feeds:
 
 | Consumer | Uses it for |
 |---|---|

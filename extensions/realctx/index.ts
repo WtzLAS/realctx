@@ -56,12 +56,51 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "conflicts", description: "other context managers next to realctx; `conflicts enable <name>` / `conflicts disable <name>`" },
 ];
 
+/** A tool result as realctx saw it at `tool_result`, kept until its `message_end`. */
+interface PendingResult {
+	toolName: string;
+	input: Record<string, unknown>;
+	/** Content before path notes. */
+	original: ContentPart[];
+	touched: string[];
+	noteIds: string[];
+	/** The path-notes block appended to the result, if any. */
+	notes?: string;
+	cwd: string;
+}
+
+/** Insertion-ordered map that forgets its oldest entries (nested codemode calls never reach message_end). */
+class BoundedMap<K, V> extends Map<K, V> {
+	private readonly max: number;
+	constructor(max: number) {
+		super();
+		this.max = max;
+	}
+	override set(k: K, v: V): this {
+		super.delete(k);
+		super.set(k, v);
+		while (this.size > this.max) this.delete(this.keys().next().value as K);
+		return this;
+	}
+}
+
+function sameContent(a: ContentPart[], b: ContentPart[]): boolean {
+	if (a.length !== b.length) return false;
+	return a.every((x, i) => {
+		const y = b[i];
+		if (x?.type !== y?.type) return false;
+		return x.type === "text" ? x.text === (y as typeof x).text : x.data === (y as typeof x).data;
+	});
+}
+
 export default function realctx(pi: ExtensionAPI) {
 	let engine: MemoryEngine | undefined;
 	let snapshot: SessionSnapshot | undefined;
 	let pendingImport: { files: Array<{ path: string; hash: string }>; results: string[] } | undefined;
 	let draining = false;
 	const notes = new PathNoteState();
+	/** What tool_result saw of each call, until its message_end (see there). */
+	const results = new BoundedMap<string, PendingResult>(256);
 
 	/** The memory layer is shared by every session of the process (one engine, one database). */
 	const getEngine = (): MemoryEngine => {
@@ -405,7 +444,8 @@ export default function realctx(pi: ExtensionAPI) {
 		let noteIds: string[] = [];
 		let appended: string | undefined;
 		// Path tracker: computed once per call and shared by notes, drop rules and expansion (§13.4).
-		const touched = layer.trackCall(event.toolCallId, event.toolName, event.input, ctx.cwd);
+		// Result details name the file of anchor-addressed edits (pi-hashline-edit-pro).
+		const touched = layer.trackCall(event.toolCallId, event.toolName, event.input, ctx.cwd, event.details);
 		if (!own && e.settings.paths.inject && touched.length > 0) {
 			notes.touch(touched);
 			// Pick up memories pulled via git or edited by hand (cheap when nothing changed).
@@ -433,13 +473,35 @@ export default function realctx(pi: ExtensionAPI) {
 		// The original is stored without path notes: they do not count towards its size (§13.3).
 		layer.capture({ toolCallId: event.toolCallId, toolName: event.toolName, input: event.input, content: original, isError: event.isError }, touched, noteIds, ctx.cwd);
 		if (event.toolName === "realctx_expand") layer.linkExpansion(event.toolCallId, event.input.ids);
+		// Another extension's tool_result handler may still rewrite the result after this one
+		// (pi-hashline-edit-pro swaps an edit's summary for its post-edit diff): message_end
+		// stores the final version and puts lost path notes back.
+		results.set(event.toolCallId, { toolName: event.toolName, input: event.input, original, touched, noteIds, notes: appended, cwd: ctx.cwd });
 		if (!appended) return;
-		return { content: [...event.content, { type: "text" as const, text: appended }] };
+		// Path notes only add text: structured content (codemode, pi-hashline-edit-pro's anchors) still holds.
+		return {
+			content: [...event.content, { type: "text" as const, text: appended }],
+			...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),
+		};
 	});
 
 	pi.on("message_end", (event) => {
 		const m = event.message as MessageView;
 		if (m.role === "assistant") layer.onAssistant(m);
+		if (m.role !== "toolResult" || !m.toolCallId) return;
+		const r = results.get(m.toolCallId);
+		if (!r) return;
+		results.delete(m.toolCallId);
+		if (!Array.isArray(m.content)) return;
+		const content = m.content as ContentPart[];
+		const at = r.notes === undefined ? -1 : content.findIndex((c) => c?.type === "text" && c.text === r.notes);
+		const body = at < 0 ? content : content.filter((_, i) => i !== at);
+		if (!sameContent(body, r.original)) {
+			layer.recapture({ toolCallId: m.toolCallId, toolName: r.toolName, input: r.input, content: body, isError: m.isError === true }, r.touched, r.noteIds, r.cwd);
+		}
+		// A later handler replaced the content and the path notes with it: put them back.
+		if (r.notes === undefined || at >= 0) return;
+		return { message: { ...event.message, content: [...content, { type: "text" as const, text: r.notes }] } as typeof event.message };
 	});
 
 	// Apply queued drops (when the cache is cold or the window is filling) and render placeholders.
@@ -511,6 +573,7 @@ export default function realctx(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		pendingImport = undefined;
+		results.clear();
 		snapshot = undefined;
 		if (sessionId) {
 			closeSession(sessionId);

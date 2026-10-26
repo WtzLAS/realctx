@@ -352,14 +352,14 @@ export function clearRepoCache(): void {
 	repoCache.clear();
 }
 
-/** Does a scope still refer to something in the project? */
+/** Does a scope still refer to something? Relative scopes are resolved against `root`, absolute ones taken as is. */
 export function scopeExists(root: string, scope: string, repo: RepoFiles): boolean {
 	if (scope === ".") return true;
 	if (isGlob(scope)) {
 		if (!repo.files) return true; // unknown without git: do not flag
 		return repo.files.some((f) => globMatch(f, scope));
 	}
-	return existsSync(join(root, scope));
+	return existsSync(isAbsolute(scope) ? scope : join(root, scope));
 }
 
 /** Suggest where a missing plain scope moved to, from git rename history. */

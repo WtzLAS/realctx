@@ -64,6 +64,7 @@ import {
 	scopeCovers,
 	scopeExists,
 	suggestRename,
+	toAbsoluteScope,
 } from "./paths.ts";
 
 export const WRITE_LOCK = "write";
@@ -554,8 +555,9 @@ export class MemoryEngine {
 				// scopes against the file system (globs are not checked without an index).
 				const root = m.kind === "global" ? homeRoot() : ctx.project?.root;
 				if (!root) continue;
-				const rel = (p: string) => (m.kind === "global" ? (p.startsWith("~/") ? p.slice(2) : p) : p);
-				const missing = m.paths.filter((p) => !scopeExists(root, rel(p), m.kind === "global" ? noGit : repo));
+				// Global scopes are `~`, `~/…` or absolute: resolve them, never join an absolute path onto `~`.
+				const target = (p: string) => (m.kind === "global" ? (toAbsoluteScope(p, "global", undefined) ?? p) : p);
+				const missing = m.paths.filter((p) => !scopeExists(root, target(p), m.kind === "global" ? noGit : repo));
 				const suggestion = m.kind !== "global" && missing.length === 1 ? suggestRename(missing[0], repo, root) : undefined;
 				this.db.setPathState(m.store, m.id, m.hash, missing, suggestion);
 				if (missing.length > 0) stale++;

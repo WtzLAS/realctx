@@ -304,6 +304,33 @@ test("prunePaths drops missing paths and deletes memories whose paths are all go
 	}
 });
 
+test("global absolute paths outside the user directory are checked as absolute, not under ~", async () => {
+	clearProjectCache();
+	const e = new MemoryEngine();
+	try {
+		const dir = join(base, "global");
+		mkdirSync(dir, { recursive: true });
+		const outside = join(proj, "db"); // exists, outside the user directory
+		writeFileSync(
+			join(dir, "01900000-0000-7000-8000-0000000000c1.md"),
+			`---\nid: 01900000-0000-7000-8000-0000000000c1\ncaption: GLOBAL abs paths\npaths:\n  - ${outside}\n  - "~/.config/tool"\n  - /nonexistent-realctx/xyz\n---\n\nAbsolute scopes.\n`,
+		);
+		e.sync(proj);
+		const m = e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 999, offset: 0 }).find((x) => x.caption === "GLOBAL abs paths");
+		assert.ok(m);
+		assert.ok(m.paths?.includes(outside), `kept absolute: ${m.paths?.join(", ")}`);
+		assert.ok(!m.paths?.some((p) => p.startsWith("~/") && p.includes(outside.slice(1))), "not re-rooted under ~");
+		e.checkPaths(proj, true);
+		assert.deepEqual(e.db.getPathState(m.store, m.id)?.missing, ["/nonexistent-realctx/xyz"]);
+		const pruned = await e.prunePaths(proj);
+		const after = pruned.updated.find((u) => u.memory.id === m.id)?.memory;
+		assert.deepEqual([...(after?.paths ?? [])].sort(), [outside, "~/.config/tool"].sort());
+		await e.deleteMemory(after ?? m);
+	} finally {
+		e.close();
+	}
+});
+
 test("compaction resets the shown set; touching a parent directory does not trigger notes", async () => {
 	clearProjectCache();
 	const h = await harness();

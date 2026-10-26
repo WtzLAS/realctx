@@ -144,7 +144,7 @@ test("remember → add, reinforce, edit, merge; files and recall", async () => {
 		const id1 = o1.memory!.id;
 		nextAnswers = (q) => ({ covered_by: choice(q.covered_by, id1), action: choice(q.action, "Reinforce") });
 		const o3 = await e.remember({ caption: "pnpm builds the project", content: "The build uses pnpm build.", source: "agent" }, { cwd: proj });
-		assert.equal(o3.status, "reinforced", o3.decision?.reasons.join("; "));
+		assert.equal(o3.status, "reinforced", o3.decision?.reasons.join("; ") ?? "");
 		assert.ok(lastSemif!.state.includes(`[${id1}]`), "state has UUID-prefixed memories");
 
 		// Conflict → edit via rewriter.
@@ -153,7 +153,7 @@ test("remember → add, reinforce, edit, merge; files and recall", async () => {
 			{ caption: "Build with bun", content: "The project switched to bun: run `bun install` and `bun run build`.", source: "agent" },
 			{ cwd: proj, rewriter: async (r) => ({ caption: "Build with bun", content: `Use bun (was: ${r.target.caption}).`, model: "mock" }) },
 		);
-		assert.equal(o4.status, "edited", o4.decision?.reasons.join("; "));
+		assert.equal(o4.status, "edited", o4.decision?.reasons.join("; ") ?? "");
 		assert.equal(o4.memory?.id, id1, "edit keeps the UUID");
 		assert.equal(o4.memory?.caption, "Build with bun");
 		assert.match(readFileSync(o4.memory!.file, "utf8"), /Use bun \(was: Build with pnpm\)/);
@@ -172,7 +172,7 @@ test("remember → add, reinforce, edit, merge; files and recall", async () => {
 		// Merge.
 		nextAnswers = (q) => ({ merge_with: choice(q.merge_with, o5.memory!.id), action: choice(q.action, "Merge"), scope: choice(q.scope, "Project Personal") });
 		const o6 = await e.remember({ caption: "colima needs to be started", content: "Run `colima start` after a reboot before using Docker.", source: "agent" }, { cwd: proj });
-		assert.equal(o6.status, "merged", o6.decision?.reasons.join("; "));
+		assert.equal(o6.status, "merged", o6.decision?.reasons.join("; ") ?? "");
 		assert.match(o6.memory!.content, /colima start/);
 		assert.match(o6.memory!.content, /DOCKER_HOST/);
 

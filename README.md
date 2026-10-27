@@ -50,7 +50,7 @@ their "user" messages, which are the parent agent's prompts.
 **Applying** rewrites earlier messages, which costs a prompt-cache rebuild, so queued
 drops are applied together, in one pass, only when the cache is cold (`context.cacheTtl`,
 per-model overrides in `context.cacheTtlByModel`), when usage of the safe input window
-reaches `context.applyThreshold`, or on `/realctx flush`. At
+reaches `context.applyThreshold` (25%), or on `/realctx flush`. At
 `context.emergencyThreshold` everything queued applies and the largest old unprotected
 outputs are dropped until usage is under the apply threshold. Pi's threshold compaction is
 cancelled while the layer is active (manual `/compact` and overflow recovery still run).
@@ -116,7 +116,7 @@ stays off), `"ignore"` runs realctx next to it. Subagent sessions never change s
 ## History compression (the historian)
 
 Dropping outputs is not enough in very long sessions: prompts and replies pile up too. In
-the background, once usage reaches `history.prepareThreshold` (50%), a **historian** model
+the background, once usage reaches `history.prepareThreshold` (20%), a **historian** model
 summarizes the oldest whole turns (never the last `history.protectTurns` = 8, never between
 a tool call and its result) into Markdown (Goals / Done / Findings / Open). The summary
 replaces those turns together with the next drop pass (cold cache, pressure, flush), as one

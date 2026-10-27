@@ -253,7 +253,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		pUnique: 0.3,
 		pKeep: 0.5,
 		minConfidence: 0.7,
-		applyThreshold: 0.65,
+		applyThreshold: 0.25,
 		emergencyThreshold: 0.9,
 		cacheTtl: "5m",
 		cacheTtlByModel: {},
@@ -268,7 +268,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	history: {
 		enabled: true,
 		model: "",
-		prepareThreshold: 0.5,
+		prepareThreshold: 0.2,
 		protectTurns: 8,
 		minChunkTokens: 6000,
 		maxChunkTokens: 30000,

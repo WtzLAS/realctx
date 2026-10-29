@@ -17,7 +17,7 @@ import { checkConsolidation, markConsolidated, pruneOutputsThrottled, storedPlan
 import { acquireEngine, announceParent, announcedParent, closeSession, openSession, openSessions, releaseEngine, sessionIdFromRef, setParent } from "../../src/shared.ts";
 import type { ScopeKind } from "../../src/files.ts";
 import { formatContextStatus, formatPathNotes, formatStatus } from "../../src/format.ts";
-import { type ContentPart, fmtTokens } from "../../src/outputs.ts";
+import type { ContentPart } from "../../src/outputs.ts";
 import { describeIgnoreProblem, SHARED_REL } from "../../src/gitignore.ts";
 import { displayPath } from "../../src/paths.ts";
 import { buildSessionPrompt, SNAPSHOT_ENTRY, SNAPSHOT_VERSION, type SessionSnapshot } from "../../src/prompt.ts";
@@ -36,10 +36,20 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SKILLS_DIR = join(HERE, "..", "..", "skills");
 const CONTEXT_FILE_RE = /(?:^|[\\/])(?:AGENTS(?:\.override)?|CLAUDE)\.md$/i;
 
+/** Same frames and pace as Pi's working loader. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
+
+/** `950`, `1.2k`, `130.4k`: token counts for the status line. */
+function compactTokens(n: number): string {
+	return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
+}
+
 const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "status", description: "context usage, queued drops, memory counts, warnings" },
 	{ name: "manage", description: "browse, read, edit, move and delete memories; review captured facts" },
 	{ name: "outputs", description: "this session's captured outputs, verdicts and drops" },
+	{ name: "recent", description: "latest drops, judge verdicts, summaries and history parts in this session" },
 	{ name: "flush", description: "apply queued drops and history summaries at the next request, ignoring the cache TTL" },
 	{ name: "history", description: "compressed history parts; `history compress` summarizes old turns now" },
 	{ name: "captures", description: "approve or reject facts captured from dropped outputs" },
@@ -200,6 +210,52 @@ export default function realctx(pi: ExtensionAPI) {
 		return announced ? { parent: announced, subagent: true } : { subagent: false };
 	};
 
+	/** Status line `🧠 <memories> · 📉 −<reclaimed> <spinner>`; the spinner runs while a background request is in flight. */
+	let statusBase: { ctx: ExtensionContext; text: string; setup: string } | undefined;
+	let spinTimer: ReturnType<typeof setInterval> | undefined;
+	let spinFrame = 0;
+	const busy = () => draining || layer.busy();
+	const stopSpinner = () => {
+		if (spinTimer) clearInterval(spinTimer);
+		spinTimer = undefined;
+	};
+	const renderStatus = () => {
+		const b = statusBase;
+		if (!b) return;
+		let spin = "";
+		if (spinTimer) {
+			const frame = SPINNER_FRAMES[spinFrame % SPINNER_FRAMES.length];
+			try {
+				spin = ` ${b.ctx.ui.theme?.fg("accent", frame) ?? frame}`;
+			} catch {
+				spin = ` ${frame}`;
+			}
+		}
+		try {
+			b.ctx.ui.setStatus("realctx", `${b.text}${spin}${b.setup}`);
+		} catch {
+			// session replaced meanwhile
+			stopSpinner();
+			statusBase = undefined;
+		}
+	};
+	const syncSpinner = () => {
+		if (busy()) {
+			if (spinTimer) return;
+			spinTimer = setInterval(() => {
+				if (!busy()) {
+					stopSpinner();
+					// The background work may have changed counts (drops queued, facts captured).
+					if (statusBase) refreshStatus(statusBase.ctx);
+					return;
+				}
+				spinFrame = (spinFrame + 1) % SPINNER_FRAMES.length;
+				renderStatus();
+			}, SPINNER_INTERVAL_MS);
+			spinTimer.unref?.();
+		} else stopSpinner();
+	};
+
 	const refreshStatus = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		try {
@@ -209,9 +265,13 @@ export default function realctx(pi: ExtensionAPI) {
 			const pending = e.db.countPending(sc.project?.root);
 			const setup = e.semifClient.configured ? "" : " · setup: /realctx settings";
 			const st = layer.status();
-			const ctxPart = st.active ? ` · ctx ${st.applied ? `−${fmtTokens(st.reclaimed)}` : "0"}${st.queued ? ` (+${st.queued} queued)` : ""}${st.shadow ? " shadow" : ""}` : "";
-			ctx.ui.setStatus("realctx", `🧠 ${n}${pending ? ` (+${pending} queued)` : ""}${ctxPart}${setup}`);
+			const ctxPart = st.active ? ` · 📉 ${st.applied ? `−${compactTokens(st.reclaimed)}` : "0"}${st.queued ? ` (+${st.queued} queued)` : ""}` : "";
+			statusBase = { ctx, text: `🧠 ${n}${pending ? ` (+${pending} queued)` : ""}${ctxPart}`, setup };
+			syncSpinner();
+			renderStatus();
 		} catch {
+			stopSpinner();
+			statusBase = undefined;
 			ctx.ui.setStatus("realctx", "🧠 !");
 		}
 	};
@@ -221,6 +281,7 @@ export default function realctx(pi: ExtensionAPI) {
 		const e = getEngine();
 		if (e.pendingCount(ctx.cwd) === 0) return;
 		draining = true;
+		syncSpinner();
 		const rw = rewriterFor(e, ctx);
 		const cwd = ctx.cwd;
 		void e
@@ -578,6 +639,8 @@ export default function realctx(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		pendingImport = undefined;
+		stopSpinner();
+		statusBase = undefined;
 		results.clear();
 		snapshot = undefined;
 		if (sessionId) {
@@ -659,7 +722,6 @@ export default function realctx(pi: ExtensionAPI) {
 		else if (r.value) {
 			lines.push("Raw answers:", ...JSON.stringify(r.value.answers, null, 2).split("\n"), "");
 			lines.push("Verdict:", ...(r.value.verdict?.reasons ?? ["(answers incomplete: keep)"]));
-			if (getEngine().settings.judge.shadow) lines.push("", "judge.shadow is on: judge verdicts are only logged.");
 		}
 		if (ctx.mode === "tui") await showText(ctx, `realctx debug #${ord}`, () => lines);
 		else ctx.ui.notify(lines.join("\n"), "info");
@@ -715,7 +777,7 @@ export default function realctx(pi: ExtensionAPI) {
 	};
 
 	const realctxCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
-		description: "realctx context + memory: status, outputs, flush, manage, settings, debug, add, import, embed, reindex, retry, prune-paths, consolidate",
+		description: "realctx context + memory: status, outputs, recent, flush, manage, settings, debug, add, import, embed, reindex, retry, prune-paths, consolidate",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const p = prefix.trim().toLowerCase();
 			if (p.includes(" ")) return null;
@@ -772,6 +834,13 @@ export default function realctx(pi: ExtensionAPI) {
 					case "outputs": {
 						const lines = layer.listing(ctx);
 						if (ctx.mode === "tui") await showText(ctx, "realctx outputs", () => lines);
+						else ctx.ui.notify(lines.join("\n"), "info");
+						break;
+					}
+					case "recent": {
+						const n = /^\d+$/.test(rest) ? Math.max(1, Math.min(500, Number(rest))) : 40;
+						const lines = layer.recent(n);
+						if (ctx.mode === "tui") await showText(ctx, "realctx recent", () => lines);
 						else ctx.ui.notify(lines.join("\n"), "info");
 						break;
 					}

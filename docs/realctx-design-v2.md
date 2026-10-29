@@ -227,7 +227,7 @@ The yes/no type is `noul` (LLM Gateway's System One schema).
 
 Outputs with images are never summarized (no model reads them): a summarize verdict becomes a drop, and no facts are captured from them.
 
-Confidence is P(drop) + P(summarize) of the `action` answer. Independently: `durable_fact` ≥ `capture.pDurable` → capture (§13.1). With `judge.shadow` on (the default), verdicts are only logged; rule and emergency drops still apply. Without a judge, only the deterministic filter and emergency reclaim drop.
+Confidence is P(drop) + P(summarize) of the `action` answer. Independently: `durable_fact` ≥ `capture.pDurable` → capture (§13.1). Drop and summarize verdicts are queued and apply with the next pass (§8.2). Without a judge, only the deterministic filter and emergency reclaim drop.
 
 ### 7.4 Verdict cache
 
@@ -504,7 +504,7 @@ Every Pi session has its own context layer; the memory layer is shared.
 
 **Rollout**
 
-1. Ship with `judge.shadow: true` for the context layer and `capture.mode: "suggest"`.
+1. Ship with `capture.mode: "suggest"`; judge verdicts act from the start (`/realctx recent` shows them).
 2. Tune `pDrop`, `minConfidence` from the false-drop rate.
 3. Move capture to `"auto"` once accepted-suggestion rate is high.
 
@@ -518,6 +518,7 @@ Every Pi session has its own context layer; the memory layer is shared.
 | `manage [query]` | Browse memories and pending captures; edit, re-scope, approve |
 | `captures` | Approve, edit or reject captured facts (from outputs or the user) |
 | `outputs` | Browse this session's captured outputs, verdicts and drops |
+| `recent [N]` | The latest drops, verdicts, summaries, history parts, expansions and captures, newest first |
 | `flush` | Apply queued drops and prepared history parts at the next request, ignoring the cache TTL |
 | `history [compress]` | List history parts and the historian; `compress` prepares parts now (§9.4) |
 | `settings` | Judge, embedder, rewrite model, thresholds; connectivity tests |
@@ -569,7 +570,6 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `history.minChunkTokens`, `history.maxChunkTokens` | `6000`, `30000` | Size of one part |
 | `history.summaryMaxTokens`, `history.storyTokens` | `1500`, `3000` | Summary bound; earlier parts passed for continuity |
 | `history.captureFacts`, `history.emergencyFallback` | `true`, `true` | Facts from the historian; deterministic outline in an emergency |
-| `judge.shadow` | `true` | Context layer logs verdicts without acting |
 | `judge.concurrency`, `judge.minIntervalMs` | `1`, `0` | Parallel judge requests; rate limit |
 | `judge.api` | `"auto"` | `auto` / `systemone` / `decisions` |
 | `judge.maxPerPass` | `6` | New drop candidates judged per background pass |

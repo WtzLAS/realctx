@@ -126,7 +126,6 @@ export interface LayerStatus {
 	session?: string;
 	parent?: string;
 	subagent?: boolean;
-	shadow: boolean;
 	captured: number;
 	applied: number;
 	queued: number;
@@ -136,6 +135,8 @@ export interface LayerStatus {
 	captureMode: string;
 	pendingCaptures: number;
 	judging: boolean;
+	/** A background model request is running (judge pass, historian, user-fact capture). */
+	busy: boolean;
 	history?: ReturnType<HistoryManager["status"]>;
 }
 
@@ -179,6 +180,8 @@ export class ContextLayer {
 	private projectKey = "";
 	private generation = 0;
 	private judging = false;
+	/** User-message fact captures in flight. */
+	private userCaptures = 0;
 	private flushRequested = false;
 	private lastApplyAt = 0;
 	private lastRequestApplied = false;
@@ -1005,9 +1008,9 @@ export class ContextLayer {
 				}
 				if (verdict.action === "summarize") verdict.summary = await this.summarize(ctx, meta);
 				db.putVerdict(this.verdictKey(meta.id), goal.key, verdict);
-				db.logEvent(this.sessionId, s.judge.shadow ? "shadow" : "verdict", meta.id, meta.tokens, { action: verdict.action, reasons: verdict.reasons });
+				db.logEvent(this.sessionId, "verdict", meta.id, meta.tokens, { action: verdict.action, reasons: verdict.reasons });
 			}
-			if (gen !== this.generation || s.judge.shadow || verdict.action === "keep") continue;
+			if (gen !== this.generation || verdict.action === "keep") continue;
 			this.pending.set(meta.id, {
 				id: meta.id,
 				kind: verdict.action === "summarize" && !meta.images ? "summary" : "drop",
@@ -1311,7 +1314,12 @@ export class ContextLayer {
 		if (!userMessageWorthJudging(user.text, s.capture.userMinChars)) return;
 		const gen = this.generation;
 		const u = user;
-		void this.captureUser(ctx, u.key, u.text, prevReply, gen).catch((err) => console.error(`[realctx] user capture failed: ${err instanceof Error ? err.message : String(err)}`));
+		this.userCaptures++;
+		void this.captureUser(ctx, u.key, u.text, prevReply, gen)
+			.catch((err) => console.error(`[realctx] user capture failed: ${err instanceof Error ? err.message : String(err)}`))
+			.finally(() => {
+				this.userCaptures--;
+			});
 	}
 
 	private async captureUser(ctx: ExtensionContext, key: string, text: string, prevReply: string | undefined, gen: number): Promise<void> {
@@ -1372,7 +1380,6 @@ export class ContextLayer {
 			session: this.sessionId,
 			parent: this.parent,
 			subagent: this.subagent,
-			shadow: s.judge.shadow,
 			captured: this.metas.size,
 			applied: this.applied.size,
 			queued: this.pending.size,
@@ -1382,6 +1389,7 @@ export class ContextLayer {
 			captureMode: s.capture.mode,
 			pendingCaptures,
 			judging: this.judging,
+			busy: this.busy(),
 			history: this.history.status(),
 		};
 	}
@@ -1404,10 +1412,63 @@ export class ContextLayer {
 			else if (rules.has(m.id)) state = `rule: ${rules.get(m.id)?.reason}`;
 			else if (prot.has(m.id)) state = `protected: ${prot.get(m.id)}`;
 			else state = "gray zone";
-			const verdict = v ? ` · judge: ${v.action}${this.host.settings().judge.shadow ? " (shadow)" : ""}` : "";
+			const verdict = v ? ` · judge: ${v.action}` : "";
 			lines.push(`#${m.ord}  ${m.tool} ${m.args}  · turn ${m.turn} · ${fmtTokens(m.tokens)}  → ${state}${verdict}`);
 		}
 		if (lines.length === 0) lines.push(`No outputs captured yet (outputs under ${this.cfg.captureMinTokens} tokens are not captured).`);
+		return lines;
+	}
+
+	/** A background model request is running: judge pass, historian or user-fact capture. */
+	busy(): boolean {
+		return this.judging || this.userCaptures > 0 || this.history.status().preparing;
+	}
+
+	/** Lines for `/realctx recent`: the latest drops, verdicts, summaries and history parts, newest first. */
+	recent(limit = 40): string[] {
+		const db = this.safeDb();
+		if (!db || !this.sessionId) return ["No session yet."];
+		const events = db.recentEvents(this.sessionId, ["rule", "judge", "emergency", "verdict", "shadow", "history", "expand", "capture"], limit);
+		const label = (id: string | null): string => {
+			const m = id ? this.metas.get(id) : undefined;
+			if (!m) return id ? "(output not on this branch)" : "";
+			return `#${m.ord} ${m.tool} ${m.args}`;
+		};
+		const time = (at: number) => new Date(at).toTimeString().slice(0, 8);
+		const lines: string[] = [];
+		for (const ev of events) {
+			const d = (ev.data ?? {}) as Record<string, unknown>;
+			const head = `${time(ev.at)}  `;
+			switch (ev.kind) {
+				case "rule":
+				case "judge":
+				case "emergency": {
+					const kind = d.kind === "summary" ? "summarized" : d.kind === "shrink" ? "superseded" : "dropped";
+					const why = ev.kind === "rule" && typeof d.reason === "string" ? `rule: ${d.reason}` : ev.kind;
+					lines.push(`${head}${kind.padEnd(10)} ${label(ev.toolCallId)} · −${fmtTokens(ev.tokens)} · ${why}`);
+					break;
+				}
+				case "verdict":
+				case "shadow": {
+					const reasons = Array.isArray(d.reasons) ? (d.reasons as unknown[]).map(String) : [];
+					lines.push(`${head}${"judged".padEnd(10)} ${label(ev.toolCallId)} (${fmtTokens(ev.tokens)}) → ${String(d.action ?? "?")}${ev.kind === "shadow" ? " (logged only)" : ""}`);
+					if (reasons[0]) lines.push(`            ${reasons[0]}`);
+					break;
+				}
+				case "history": {
+					const t = Array.isArray(d.turns) ? ` (turns ${d.turns[0]}-${d.turns[1]})` : "";
+					lines.push(`${head}${"history".padEnd(10)} h${String(d.n ?? "?")}${t} prepared · −${fmtTokens(ev.tokens)}${d.model ? ` · ${String(d.model)}` : ""}`);
+					break;
+				}
+				case "expand":
+					lines.push(`${head}${"expanded".padEnd(10)} ${label(ev.toolCallId)} · ${fmtTokens(ev.tokens)}${d.partial ? " (partial)" : ""}`);
+					break;
+				case "capture":
+					lines.push(`${head}${"captured".padEnd(10)} ${String(d.facts ?? 0)} fact(s) from ${d.origin === "user" ? "a user message" : label(ev.toolCallId)} · ${String(d.mode ?? "")}`);
+					break;
+			}
+		}
+		if (lines.length === 0) lines.push("Nothing dropped, judged or summarized in this session yet.");
 		return lines;
 	}
 

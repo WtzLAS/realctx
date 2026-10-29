@@ -32,8 +32,6 @@ export interface Settings {
 	rewriteModel: string;
 	/** Shared System One judge behaviour (the connection lives in `semif`). */
 	judge: {
-		/** Context layer logs judge verdicts without acting on them (rule and emergency drops still act). */
-		shadow: boolean;
 		/** Parallel judge requests across all layers. */
 		concurrency: number;
 		/** Minimum milliseconds between two judge requests (rate limit). */
@@ -239,7 +237,6 @@ export const DEFAULT_SETTINGS: Settings = {
 	},
 	rewriteModel: "",
 	judge: {
-		shadow: true,
 		concurrency: 1,
 		minIntervalMs: 0,
 		api: "auto",

@@ -445,17 +445,6 @@ function fields(): FieldDef[] {
 			values: ["on", "off"],
 		},
 		{
-			id: "judge.shadow",
-			label: "Context: shadow mode",
-			description: "on = the judge's drop verdicts are only logged (see /realctx outputs); rule-based and emergency drops still apply. Turn off once the false-drop rate looks good.",
-			get: (s) => (s.judge.shadow ? "on" : "off"),
-			set: (s, v) => {
-				s.judge.shadow = v === "on";
-			},
-			kind: "cycle",
-			values: ["on", "off"],
-		},
-		{
 			id: "context.conflictAction",
 			label: "Other context managers",
 			description: "disable = warn, deactivate their tools and turn their package off in Pi's settings (/reload to finish); warn = only warn (realctx's context layer stays off); ignore = run next to them. Undo with /realctx conflicts enable.",
@@ -658,7 +647,7 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryE
 							if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
 							if (d.kind === "action") {
 								if (d.id === "reset") {
-									const keep = { embedding: draft.embedding, semif: draft.semif, rewriteModel: draft.rewriteModel, judge: { ...DEFAULT_SETTINGS.judge, shadow: draft.judge.shadow } };
+									const keep = { embedding: draft.embedding, semif: draft.semif, rewriteModel: draft.rewriteModel };
 									draft = normalizeSettings({ ...structuredClone(DEFAULT_SETTINGS), ...keep });
 									dirty = true;
 									for (const x of defs) list.updateValue(x.id, x.get(draft));

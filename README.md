@@ -59,8 +59,10 @@ their "user" messages, which are the parent agent's prompts.
   to the paths, and answers `still_needed`, `unique_info`, `durable_fact` and
   `action` (keep / summarize / drop). Verdicts are cached per output until the goal
   changes. Summaries come from the rewrite model, with a deterministic fallback.
-- `judge.shadow` (default **on**) only logs judge verdicts (see `/realctx outputs`);
-  rule and emergency drops still apply.
+- Drop and summarize verdicts are queued and applied with the next pass (below).
+  `/realctx recent` lists the latest drops, verdicts, summaries and history parts.
+- The status line reads `🧠 <memories> · 📉 −<reclaimed>`, followed by a spinner while
+  realctx is judging or calling a model in the background.
 
 **Applying** rewrites earlier messages, which costs a prompt-cache rebuild, so queued
 drops are applied together, in one pass, only when the cache is cold (`context.cacheTtl`,
@@ -382,6 +384,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 |---|---|
 | `status` | context usage, queued drops, memory counts, warnings |
 | `outputs` | this session's captured outputs: state (protected, rule, queued, dropped), judge verdicts |
+| `recent [N]` | the latest N (default 40) drops, judge verdicts, summaries, history parts, expansions and captures, newest first |
 | `flush` | apply queued drops and prepared history parts at the next request, ignoring the cache TTL |
 | `history [compress]` | history parts summarized by the historian; `compress` summarizes old turns now |
 | `captures` | approve, edit or reject facts captured from dropped outputs |
@@ -471,10 +474,9 @@ doc's `judge.endpoint` / `judge.model` / `judge.key` / `judge.timeout_ms` /
 `judge.max_questions` keys are accepted as aliases of the SemIf connection. Then run
 `/realctx import` in each project that has an AGENTS.md or CLAUDE.md.
 
-The context layer starts in shadow mode (`judge.shadow`) with capture in `suggest` mode.
-Watch `/realctx outputs` and `/realctx status` for a while, then turn shadow off in
-`/realctx settings` (rule-based drops of re-read, re-edited and duplicate outputs apply
-from the start).
+Capture starts in `suggest` mode. Watch `/realctx recent`, `/realctx outputs` and
+`/realctx status` to see what the judge drops; tune `context.pDrop` /
+`context.minConfidence` in `/realctx settings` if it drops too eagerly.
 
 ### With pi-hashline-edit-pro
 

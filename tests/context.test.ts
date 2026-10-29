@@ -1,6 +1,6 @@
 /**
  * Context layer end to end through the extension hooks: capture, rule drops, judge drops
- * (shadow vs live), apply timing, byte-stable placeholders, realctx_expand, persistence,
+ * apply timing, byte-stable placeholders, realctx_expand, persistence,
  * path-note survival, compaction cancel, conflicts.
  */
 import assert from "node:assert/strict";
@@ -23,7 +23,7 @@ let url = "";
 let agentDir = "";
 let judgeCalls = 0;
 /** P(still_needed) the mock judge answers for drop questions. */
-let stillNeeded = 0.02;
+let stillNeeded = 0.9;
 /** P(unique_info) the mock judge answers (high = summarize instead of drop). */
 let uniqueInfo = 0.05;
 /** States the mock judge received for drop questions. */
@@ -278,31 +278,24 @@ test("rule drops apply only when the cache is cold, render byte-stable placehold
 	assert.equal(h.resultText(out?.messages ?? messages, r1), p, "same placeholder bytes after reload");
 });
 
-test("judge drops: shadow mode only logs; live mode queues and applies at pressure, path notes are re-shown", async () => {
-	writeSettings({ judge: { shadow: true } });
+test("judge drops: verdicts queue and apply at pressure; /realctx recent lists them", async () => {
+	writeSettings({});
 	judgeCalls = 0;
 	stillNeeded = 0.02;
-	const h = await harness();
-	h.user("fix the build");
-	const id = await h.turn("bash", { command: "cat build.log" }, big("build log"));
-	for (let i = 0; i < 3; i++) await h.turn("bash", { command: `echo ${i}` }, big(`filler ${i}`));
-	await h.settle();
-	assert.ok(judgeCalls > 0, "the judge was asked in the background");
-	const m = await h.request();
-	assert.match(h.resultText(m, id), /build log line 0/, "shadow mode: nothing dropped");
-	const listing = h.commands.get("realctx");
-	assert.ok(listing);
-
-	writeSettings({ judge: { shadow: false } });
 	const live = await harness();
 	live.user("fix the build");
 	const id2 = await live.turn("bash", { command: "cat build.log" }, big("build log"));
 	for (let i = 0; i < 3; i++) await live.turn("bash", { command: `echo ${i}` }, big(`filler ${i}`));
 	await live.settle();
+	assert.ok(judgeCalls > 0, "the judge was asked in the background");
 	await live.turn("bash", { command: "echo last" }, big("last"));
 	await live.settle();
 	const m2 = await live.request();
 	assert.match(live.resultText(m2, id2), /^\[#1 dropped · bash cat build\.log · [\d.]+k tok\]$/);
+	await live.commands.get("realctx").handler("recent", live.ctx);
+	const recent = live.notices.at(-1) ?? "";
+	assert.match(recent, /dropped +#1 bash cat build\.log · −[\d.]+k tok · judge/);
+	assert.match(recent, /judged +#1 bash cat build\.log \([\d.]+k tok\) → drop/);
 
 	// A judge that says "still needed" keeps the output.
 	stillNeeded = 0.9;
@@ -312,7 +305,7 @@ test("judge drops: shadow mode only logs; live mode queues and applies at pressu
 	for (let i = 0; i < 3; i++) await keep.turn("bash", { command: `echo ${i}` }, big(`filler ${i}`));
 	await keep.settle();
 	assert.match(keep.resultText(await keep.request(), id3), /build log line 0/);
-	stillNeeded = 0.02;
+	stillNeeded = 0.9;
 });
 
 test("forged placeholders in assistant text are stripped; compaction is cancelled; conflicts disable the context layer", async () => {
@@ -830,7 +823,7 @@ test("images: user and tool images drop after imageMaxTurns, placeholders say so
 });
 
 test("images: the judge sees an image count, image outputs are dropped instead of summarized", async () => {
-	writeSettings({ judge: { shadow: false }, context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, imageMaxTurns: 0 } });
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, imageMaxTurns: 0 } });
 	stillNeeded = 0.02;
 	uniqueInfo = 0.9; // the judge would summarize
 	judgeStates.length = 0;
@@ -855,6 +848,7 @@ test("images: the judge sees an image count, image outputs are dropped instead o
 		assert.ok(!completePrompts.some((p) => p.includes("localhost:3000")), "the image output never was");
 	} finally {
 		uniqueInfo = 0.05;
+		stillNeeded = 0.9;
 	}
 });
 

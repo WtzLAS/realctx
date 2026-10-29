@@ -1164,6 +1164,22 @@ export class RealctxDB {
 		});
 	}
 
+	/** The latest events of the given kinds for a session, newest first. */
+	recentEvents(session: string, kinds: string[], limit = 50): Array<{ kind: string; toolCallId: string | null; tokens: number; at: number; data: unknown }> {
+		if (kinds.length === 0) return [];
+		const marks = kinds.map(() => "?").join(", ");
+		const rows = this.stmt(`SELECT kind, tool_call_id, tokens, at, data FROM ctx_events WHERE session = ? AND kind IN (${marks}) ORDER BY seq DESC LIMIT ?`).all(session, ...kinds, limit) as Row[];
+		return rows.map((r) => {
+			let data: unknown;
+			try {
+				data = r.data === null ? undefined : JSON.parse(String(r.data));
+			} catch {
+				data = undefined;
+			}
+			return { kind: String(r.kind), toolCallId: (r.tool_call_id as string | null) ?? null, tokens: Number(r.tokens), at: Number(r.at), data };
+		});
+	}
+
 	addSuggestion(s: { projectRoot: string | undefined; session: string; toolCallId?: string; origin?: Suggestion["origin"]; caption: string; content: string; paths?: string[]; cwd: string }): number {
 		const dup = this.stmt("SELECT seq FROM suggestions WHERE project_root IS ? AND caption = ? AND content = ?").get(s.projectRoot ?? null, s.caption, s.content) as Row | undefined;
 		if (dup) return Number(dup.seq);

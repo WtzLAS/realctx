@@ -161,9 +161,8 @@ test("summaries, fact parsing, settings, durations", () => {
 	assert.equal(s.semif.endpoint, "http://j", "judge.endpoint from the design doc maps to the judge connection");
 	assert.equal(s.semif.apiKey, "env:K");
 	assert.equal(s.semif.timeoutMs, 3000);
-	assert.equal(s.judge.shadow, false);
+	assert.equal("shadow" in s.judge, false, "the removed judge.shadow setting is dropped from old settings files");
 	assert.equal(s.context.applyThreshold, 0.8, "apply threshold never exceeds the emergency threshold");
-	assert.equal(normalizeSettings({}).judge.shadow, true, "shadow mode is the default (§14)");
 	assert.equal(normalizeSettings({}).capture.mode, "suggest");
 });
 

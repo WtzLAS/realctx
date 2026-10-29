@@ -179,7 +179,6 @@ export function formatPathNotes(
 export function formatContextStatus(s: {
 	active: boolean;
 	reason?: string;
-	shadow: boolean;
 	captured: number;
 	applied: number;
 	queued: number;
@@ -193,7 +192,7 @@ export function formatContextStatus(s: {
 	if (!s.active) return [`Context layer: off (${s.reason ?? "unknown"})`];
 	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 	const lines = [
-		`Context layer: on${s.shadow ? " (judge in shadow mode: verdicts are logged, only rule and emergency drops apply)" : ""}`,
+		"Context layer: on",
 		`  usage: ${s.usage ? `${k(s.usage.tokens)} of ${k(s.usage.window)} safe input tokens (${Math.round(s.usage.share * 100)}%)` : "unknown until the first request"}`,
 		`  outputs captured ${s.captured} · dropped/summarized ${s.applied} (−${k(s.reclaimed)} tok) · queued ${s.queued}${s.judging ? " · judging" : ""}`,
 		`  capture: ${s.captureMode}${s.pendingCaptures ? ` (${s.pendingCaptures} suggestion(s) awaiting approval in /realctx manage)` : ""}`,

@@ -83,6 +83,23 @@ test("boundaries: a call that never got a result (Pi restarted while it ran) doe
 	assert.deepEqual([...boundaries(late)].sort((x, y) => x - y), [0, 1, 4, 5]);
 });
 
+test("pickChunk: a branch summary mid-transcript (after /tree) does not block later chunks", () => {
+	const summary = (): MessageView => ({ role: "branchSummary", summary: "abandoned path", timestamp: t++ }) as MessageView;
+	const m: MessageView[] = [user("a"), reply("small"), summary()];
+	for (let i = 0; i < 6; i++) m.push(user(`q${i}`), call(`s${i}`, "bash", {}), result(`s${i}`, "z".repeat(4000)), reply("ok"));
+	const protect = protectFrom(m, 2);
+	// The run before the summary is too small: the pick continues after it and never contains it.
+	const c = pickChunk(m, 0, protect, 500, 1_000_000);
+	assert.ok(c && c.start === 3 && c.end <= protect, `chunk: ${JSON.stringify(c)}`);
+	assert.ok(!m.slice(c.start, c.end).some((x) => x.role === "branchSummary"));
+	// Already compressed up to the summary: same.
+	assert.equal(pickChunk(m, 2, protect, 500, 1_000_000)?.start, 3);
+	// A run before the summary that is big enough is still taken first, ending before it.
+	const big = [user("a"), reply("x".repeat(4000)), summary(), ...m.slice(3)];
+	const first = pickChunk(big, 0, protectFrom(big, 2), 500, 1_000_000);
+	assert.ok(first && first.start === 0 && first.end === 2, `chunk: ${JSON.stringify(first)}`);
+});
+
 test("pickChunk: whole turns from the start, before the protected tail, within bounds", () => {
 	const m = transcript();
 	const tail = protectFrom(m, 2); // last two agent turns' prompt: "now the docs"

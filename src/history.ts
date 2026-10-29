@@ -140,23 +140,35 @@ export interface ChunkPick {
 /**
  * Pick the next chunk: from `start`, the longest run of whole messages that ends at a boundary
  * before `protectFrom`, holds at least `minTokens` and (when possible) at most `maxTokens`.
- * Stops before any summary message. Undefined when there is not enough old history yet.
+ * A chunk never contains a summary message. When the run before one cannot form a chunk (too
+ * small, or already compressed up to it), the pick continues after it: Pi places a branch
+ * summary mid-transcript (where `/tree` branched), and stopping there for good would block
+ * history compression for the rest of the session. That small run stays raw. Undefined when
+ * there is not enough old history yet.
  */
 export function pickChunk(messages: MessageView[], start: number, protectFrom: number, minTokens: number, maxTokens: number, tokensOf: (i: number) => number = (i) => estimateMessage(messages[i])): ChunkPick | undefined {
 	const cuts = boundaries(messages);
-	if (!cuts.has(start)) return undefined;
-	let tokens = 0;
-	let best: ChunkPick | undefined;
-	for (let i = start; i < Math.min(protectFrom, messages.length); i++) {
-		if (isSummaryMessage(messages[i])) break;
-		tokens += tokensOf(i);
-		const end = i + 1;
-		if (!cuts.has(end) || end > protectFrom) continue;
-		if (tokens > maxTokens && best) break; // never overshoot once something fits
-		best = { start, end, tokens };
-		if (tokens > maxTokens) break; // one oversized turn: take it alone
+	const limit = Math.min(protectFrom, messages.length);
+	let from = start;
+	while (cuts.has(from)) {
+		let tokens = 0;
+		let best: ChunkPick | undefined;
+		let i = from;
+		for (; i < limit; i++) {
+			if (isSummaryMessage(messages[i])) break;
+			tokens += tokensOf(i);
+			const end = i + 1;
+			if (!cuts.has(end) || end > protectFrom) continue;
+			if (tokens > maxTokens && best) break; // never overshoot once something fits
+			best = { start: from, end, tokens };
+			if (tokens > maxTokens) break; // one oversized turn: take it alone
+		}
+		if (best && best.tokens >= minTokens) return best;
+		if (i >= limit || !isSummaryMessage(messages[i])) return undefined;
+		from = i;
+		while (from < limit && isSummaryMessage(messages[from])) from++;
 	}
-	return best && best.tokens >= minTokens ? best : undefined;
+	return undefined;
 }
 
 /** Where the next chunk starts: after the last chunk, else after leading summaries. */

@@ -710,6 +710,33 @@ test("history compression: the historian (own model setting) summarizes old turn
 	writeSettings({});
 });
 
+test("history compression continues past a tool call that never got a result (Pi restarted while it ran)", async () => {
+	delete process.env.REALCTX_PARENT_SESSION;
+	writeSettings({ history: { model: "h/historian", prepareThreshold: 0.05, protectTurns: 2, minChunkTokens: 500, maxChunkTokens: 100_000 } });
+	historianCalls = 0;
+	historianText = '{"summary": "## Done\\n- watched the release, then tailed the logs", "facts": []}';
+	const h = await harness();
+	h.ctx.model = { provider: "p", id: "m", contextWindow: 20_000, maxTokens: 2000 };
+	h.user("watch the release");
+	// The call Pi was waiting on when it restarted: no toolResult ever follows it.
+	const orphan = { role: "assistant", content: [{ type: "toolCall", id: "orphan", name: "task_output", arguments: { id: "job", wait_ms: 600_000 } }], timestamp: Date.now() - 3_599_500, stopReason: "toolUse" };
+	h.entries.push({ type: "message", id: "orphan-entry", message: orphan });
+	h.user("continue");
+	for (let i = 0; i < 5; i++) {
+		await h.request();
+		await h.turn("bash", { command: `tail release.log -- ${i}` }, big(`log ${i}`));
+	}
+	await h.settle();
+	assert.ok(historianCalls >= 1, "the historian found a part to summarize");
+	const m = await h.request();
+	const block = m.find((x) => x.role === "custom" && x.customType === "realctx-history");
+	assert.ok(block, "a history block replaces old turns");
+	assert.ok(!m.some((x) => x.role === "assistant" && x.content.some((p: any) => p.id === "orphan")), "the orphaned call is inside the part");
+	assert.ok(!m.some((x) => x.role === "user" && x.content === "continue"), "turns after the orphaned call are compressible");
+	await h.shutdown();
+	writeSettings({});
+});
+
 test("pi-hashline-edit-pro: anchor edits are tracked by their result details; rewritten results are stored as shown, path notes survive", async () => {
 	writeSettings({});
 	const h = await harness();

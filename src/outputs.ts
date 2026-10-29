@@ -5,14 +5,22 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { GENERIC_IMAGE_COST, type ImageCost, imageTokens } from "./images.ts";
 import { displayPath } from "./paths.ts";
 import { redactSecrets } from "./safety.ts";
 import { estimateTokens, oneLine, sha256 } from "./text.ts";
 
 export type ContentPart = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
-/** Tokens counted for one image in a tool result (rough; providers differ). */
-export const IMAGE_TOKENS = 1200;
+/** Tool name of the outputs that hold the images of a user message. */
+export const USER_IMAGE_TOOL = "user";
+
+/** Number of image parts in a content list. */
+export function imageCount(content: ReadonlyArray<{ type?: string }> | undefined): number {
+	let n = 0;
+	for (const p of content ?? []) if (p?.type === "image") n++;
+	return n;
+}
 
 /** Immutable facts about one captured output. Persisted in the `realctx-ids` registry. */
 export interface OutputMeta {
@@ -41,6 +49,8 @@ export interface OutputMeta {
 	capturedAt: number;
 	/** For realctx_expand results: ordinals of the outputs they restored. */
 	expandOf?: number[];
+	/** Image parts in the original (never summarized, no fact capture, `· image` in placeholders). */
+	images?: number;
 }
 
 export interface StoredOutput {
@@ -105,9 +115,10 @@ export function contentText(content: ReadonlyArray<{ type: string; text?: string
 	return content.map((p) => (p.type === "text" ? (p.text ?? "") : `[${p.type}]`)).join("\n");
 }
 
-export function contentTokens(content: ReadonlyArray<{ type: string; text?: string }>): number {
+/** Tokens of content parts as sent to the provider; images by pixel size under `cost`. */
+export function contentTokens(content: ReadonlyArray<{ type: string; text?: string; data?: string }>, cost: ImageCost = GENERIC_IMAGE_COST): number {
 	let n = 0;
-	for (const p of content) n += p.type === "text" ? estimateTokens(p.text ?? "") : IMAGE_TOKENS;
+	for (const p of content) n += p.type === "text" ? estimateTokens(p.text ?? "") : p.type === "image" ? imageTokens(p, cost) : 0;
 	return n;
 }
 

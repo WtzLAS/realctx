@@ -19,13 +19,16 @@ import {
 	contentText,
 	contentTokens,
 	fmtTokens,
+	imageCount,
 	mtimesOf,
 	type OutputMeta,
 	OutputFiles,
 	readStored,
 	storedExists,
 	summarizeArgs,
+	USER_IMAGE_TOOL,
 } from "../../src/outputs.ts";
+import { GENERIC_IMAGE_COST, type ImageCost, imageCostFor } from "../../src/images.ts";
 import { displayPath, resultPaths, touchedPaths } from "../../src/paths.ts";
 import {
 	type AppliedDrop,
@@ -61,7 +64,7 @@ import { parseJsonObject } from "../../src/rewrite.ts";
 import { redactSecrets, sanitizeForPrompt } from "../../src/safety.ts";
 import { estimateTokens, ftsQuery, oneLine, sha256 } from "../../src/text.ts";
 import { familyRoot, takeCaptureBudget } from "../../src/shared.ts";
-import { estimateMessage, type MessageView, textOf } from "../../src/history.ts";
+import { estimateMessage, imageMarker, type MessageView, messageKey, textOf, userImageId } from "../../src/history.ts";
 import { HistoryManager } from "./history-layer.ts";
 import { rewriterFor } from "./tools.ts";
 
@@ -189,6 +192,10 @@ export class ContextLayer {
 	private userSeen = new Set<string>();
 	private embedding = false;
 	private lastUsage: LayerStatus["usage"];
+	/** Image token cost of the session model (updated on every request). */
+	private imageCost: ImageCost = GENERIC_IMAGE_COST;
+	/** When this session's store was last marked active (retention clock). */
+	private touchedAt = 0;
 	/** Why the layer is off (conflict, disabled, store unavailable); undefined = active. */
 	disabledReason: string | undefined;
 	conflicts: string[] = [];
@@ -207,9 +214,11 @@ export class ContextLayer {
 			output: (id) => {
 				const m = this.metas.get(id);
 				if (!m) return undefined;
-				return { ord: m.ord, label: oneLine(`${m.tool}${m.args ? ` ${m.args}` : ""}`, 60), placeholder: this.applied.get(id)?.text };
+				const label = m.tool === USER_IMAGE_TOOL ? (m.images === 1 ? "user image" : `${m.images ?? 0} user images`) : oneLine(`${m.tool}${m.args ? ` ${m.args}` : ""}${m.images ? ` ${imageMarker(m.images)}` : ""}`, 60);
+				return { ord: m.ord, label, placeholder: this.applied.get(id)?.text };
 			},
 			usage: () => this.lastUsage,
+			imageCost: () => this.imageCost,
 			assistants: () => this.assistants,
 			onCaptured: (ctx) => host.onCaptured?.(ctx),
 		});
@@ -243,6 +252,7 @@ export class ContextLayer {
 		this.flushRequested = false;
 		this.lastUsage = undefined;
 		this.conflicts = conflicts;
+		this.imageCost = imageCostFor(ctx.model);
 		const s = this.host.settings();
 		this.disabledReason = !s.context.enabled
 			? "disabled in settings"
@@ -257,6 +267,7 @@ export class ContextLayer {
 			this.projectKey = e.scopes(ctx.cwd).project?.key ?? `cwd-${sha256(ctx.cwd).slice(0, 16)}`;
 			this.files = new OutputFiles(join(e.paths.base, "sessions"), this.projectKey, this.sessionId);
 			e.db.touchOutputSession(this.sessionId, this.projectKey, this.files.dir);
+			this.touchedAt = Date.now();
 		} catch (err) {
 			this.files = undefined;
 			this.disabledReason ??= `output store unavailable: ${err instanceof Error ? err.message : String(err)}`;
@@ -268,6 +279,8 @@ export class ContextLayer {
 			if (entry.type === "message" && entry.message) {
 				if (entry.message.role === "assistant") this.assistants++;
 				if (entry.message.role === "toolResult" && entry.message.toolCallId) resultIds.push(entry.message.toolCallId);
+				const userImages = userImageId(entry.message);
+				if (userImages) resultIds.push(userImages);
 			}
 			if (entry.type !== "custom") continue;
 			if (entry.customType === IDS_ENTRY) for (const m of (entry.data as IdsData | undefined)?.metas ?? []) this.addMeta(m);
@@ -411,7 +424,8 @@ export class ContextLayer {
 		cwd: string,
 	): void {
 		if (!this.active || !this.files || this.metas.has(ev.toolCallId)) return;
-		const tokens = contentTokens(ev.content);
+		const tokens = contentTokens(ev.content, this.imageCost);
+		const images = imageCount(ev.content);
 		if (tokens < this.cfg.captureMinTokens) return;
 		const ord = this.nextOrd();
 		const file = this.files.fileFor(ord, ev.toolCallId);
@@ -435,6 +449,7 @@ export class ContextLayer {
 			file,
 			capturedAt,
 			...(expandOf && expandOf.length > 0 ? { expandOf } : {}),
+			...(images > 0 ? { images } : {}),
 		};
 		try {
 			this.files.write(file, { v: 1, id: ev.toolCallId, tool: ev.toolName, input: ev.input, content: ev.content, isError: ev.isError, capturedAt });
@@ -480,7 +495,10 @@ export class ContextLayer {
 		} catch {
 			return; // the first capture is still restorable
 		}
-		meta.tokens = contentTokens(ev.content);
+		meta.tokens = contentTokens(ev.content, this.imageCost);
+		const images = imageCount(ev.content);
+		if (images > 0) meta.images = images;
+		else delete meta.images;
 		meta.isError = ev.isError;
 		meta.paths = paths.slice(0, 32);
 		meta.mtimes = mtimesOf(paths);
@@ -499,6 +517,57 @@ export class ContextLayer {
 			});
 		} catch {
 			// index unavailable: the branch registry still restores it
+		}
+	}
+
+	/**
+	 * Images attached to user messages (§6): stored as one restorable output per message (tool
+	 * `user`), so they can be dropped like tool images and restored after history compression.
+	 * Stored whatever their size; only the images are stored and dropped, the text stays.
+	 */
+	private captureUserImages(messages: MessageView[]): void {
+		if (!this.files) return;
+		const offset = Math.max(0, this.assistants - messages.filter((m) => m.role === "assistant").length);
+		let turn = offset;
+		for (const m of messages) {
+			if (m.role === "assistant") turn++;
+			const id = userImageId(m);
+			if (!id || this.metas.has(id)) continue;
+			const images = (m.content as ContentPart[]).filter((p) => p?.type === "image" && typeof p.data === "string");
+			if (images.length === 0) continue;
+			const text = textOf(m.content).trim();
+			const ord = this.nextOrd();
+			const file = this.files.fileFor(ord, id);
+			const capturedAt = Date.now();
+			const input = { message: oneLine(redactSecrets(text), 400) };
+			const meta: OutputMeta = {
+				id,
+				ord,
+				tool: USER_IMAGE_TOOL,
+				args: "",
+				sig: argsSignature(USER_IMAGE_TOOL, { id }),
+				tokens: contentTokens(images, this.imageCost),
+				turn,
+				isError: false,
+				paths: [],
+				mtimes: {},
+				noteIds: [],
+				file,
+				capturedAt,
+				images: images.length,
+			};
+			try {
+				this.files.write(file, { v: 1, id, tool: USER_IMAGE_TOOL, input, content: images, isError: false, capturedAt });
+			} catch {
+				continue; // never register what cannot be restored
+			}
+			this.addMeta(meta);
+			this.unflushedMetas.push(meta);
+			try {
+				this.host.engine().db.putOutput({ toolCallId: id, session: this.sessionId, project: this.projectKey, ord, meta, file, head: `user image ${imageMarker(images.length)}`, body: text.slice(0, 20_000) });
+			} catch {
+				// index unavailable: the branch registry still restores it
+			}
 		}
 	}
 
@@ -570,6 +639,10 @@ export class ContextLayer {
 		const turn = this.assistants + 1;
 		const calls = this.buildCalls(messages, cwd);
 		const inView = new Set(calls.map((c) => c.id));
+		for (const m of messages) {
+			const id = userImageId(m);
+			if (id) inView.add(id);
+		}
 		const outputs = [...this.metas.values()].filter((m) => inView.has(m.id)).sort((a, b) => a.ord - b.ord);
 		const done = new Set<string>([...this.applied.keys(), ...this.pending.keys()]);
 		return { turn, calls, outputs, ...filterOutputs({ outputs, calls, turn, done, pinned: this.activePins(turn), settings: this.cfg }) };
@@ -596,6 +669,10 @@ export class ContextLayer {
 				}
 			}
 			if (!this.active) return changed ? messages : undefined;
+			this.imageCost = imageCostFor(ctx.model);
+			// Keys of the messages as Pi sent them (rendering a dropped user image changes its key).
+			const keys = messages.map(messageKey);
+			this.captureUserImages(messages);
 
 			const f = this.filter(messages, ctx.cwd);
 			for (const r of f.rules) this.pending.set(r.id, { id: r.id, kind: r.kind, source: "rule", reason: r.reason, by: r.by });
@@ -626,6 +703,24 @@ export class ContextLayer {
 			if (this.applied.size > 0) {
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
+					if (m.role === "user") {
+						const id = userImageId(m);
+						const a = id ? this.applied.get(id) : undefined;
+						if (!a) continue;
+						// The text stays; the images become one placeholder where the first one was.
+						const parts: unknown[] = [];
+						let placed = false;
+						for (const p of m.content as Array<{ type?: string }>) {
+							if (p?.type !== "image") parts.push(p);
+							else if (!placed) {
+								parts.push({ type: "text", text: a.text });
+								placed = true;
+							}
+						}
+						messages[i] = { ...m, content: parts };
+						changed = true;
+						continue;
+					}
 					if (m.role !== "toolResult" || !m.toolCallId) continue;
 					const a = this.applied.get(m.toolCallId);
 					if (!a) continue;
@@ -638,7 +733,7 @@ export class ContextLayer {
 			const afterDrops = usage ? this.estimateUsage(messages, ctx) : undefined;
 			const historyEmergency = !!afterDrops && afterDrops.share >= this.cfg.emergencyThreshold;
 			const appliedBefore = this.history.status().applied;
-			const withHistory = this.history.transform(messages, { apply: trigger, emergency: historyEmergency, turn: f.turn });
+			const withHistory = this.history.transform(messages, { apply: trigger, emergency: historyEmergency, turn: f.turn, keys });
 			if (this.history.status().applied > appliedBefore) {
 				this.lastApplyAt = now;
 				this.lastRequestApplied = true;
@@ -686,13 +781,13 @@ export class ContextLayer {
 		if (idx >= 0) {
 			const at = messages[idx];
 			tokens = usageTokens(at.usage as NonNullable<MessageView["usage"]>);
-			for (let i = idx + 1; i < messages.length; i++) tokens += estimateMessage(messages[i]);
+			for (let i = idx + 1; i < messages.length; i++) tokens += estimateMessage(messages[i], this.imageCost);
 			const stamp = at.timestamp ?? 0;
 			for (const a of this.applied.values()) if (a.at > stamp) tokens -= a.saved;
 			tokens -= this.history.savedSince(stamp);
 		} else {
 			tokens = estimateTokens(ctx.getSystemPrompt?.() ?? "");
-			for (const m of messages) tokens += estimateMessage(m);
+			for (const m of messages) tokens += estimateMessage(m, this.imageCost);
 		}
 		tokens = Math.max(0, tokens);
 		return { tokens, window: safe, share: tokens / safe };
@@ -833,6 +928,11 @@ export class ContextLayer {
 			if (typeof v === "string") args[k] = oneLine(redactSecrets(/path|file/i.test(k) ? displayPath(v, cwd) : v), 200);
 			else if (typeof v === "number" || typeof v === "boolean") args[k] = v;
 		}
+		const images = imageCount(stored.content);
+		// The judge never sees images: their text, plus one marker saying how many there are.
+		const text = meta.tool === USER_IMAGE_TOOL ? `(attached to the user message: ${String(args.message ?? "")})` : stripPathNotes(contentText(stored.content.filter((p) => p.type === "text")));
+		// A user message has no call: what happened after it is everything from the next turn on.
+		const after = call?.seq ?? calls.filter((c) => c.turn <= meta.turn).reduce((s, c) => Math.max(s, c.seq), -1);
 		return {
 			current_goal: goal,
 			candidate: {
@@ -842,9 +942,10 @@ export class ContextLayer {
 				tokens: meta.tokens,
 				turns_ago: Math.max(0, turn - meta.turn),
 				...(meta.isError ? { error: true } : {}),
-				excerpt: excerpt(stripPathNotes(contentText(stored.content))),
+				excerpt: excerpt([text, imageMarker(images)].filter((s) => s.trim()).join("\n")),
+				...(images > 0 ? { images } : {}),
 			},
-			since_then: this.sinceThen(calls, call?.seq ?? -1, cwd),
+			since_then: this.sinceThen(calls, after, cwd),
 			known_memories: this.knownMemories(meta, cwd),
 		};
 	}
@@ -891,7 +992,10 @@ export class ContextLayer {
 				}
 				if (!r.verdict || gen !== this.generation) continue;
 				verdict = r.verdict;
-				if (verdict.capture && s.capture.mode !== "off") {
+				// Nothing can read an image here: no fact capture, and a drop (restorable) instead of a summary.
+				const images = (meta.images ?? 0) > 0;
+				if (images && verdict.action === "summarize") verdict = { ...verdict, action: "drop", reasons: [...verdict.reasons, "→ drop: holds images (no summary)"] };
+				if (verdict.capture && s.capture.mode !== "off" && !images) {
 					const cap = await this.captureFacts(ctx, meta, gen);
 					if (cap.memoryBacked && r.verdict.action !== "drop") {
 						const again = decideDrop(r.verdict.signals, s.context, s.capture.pDurable, true);
@@ -906,7 +1010,7 @@ export class ContextLayer {
 			if (gen !== this.generation || s.judge.shadow || verdict.action === "keep") continue;
 			this.pending.set(meta.id, {
 				id: meta.id,
-				kind: verdict.action === "summarize" ? "summary" : "drop",
+				kind: verdict.action === "summarize" && !meta.images ? "summary" : "drop",
 				source: "judge",
 				summary: verdict.summary,
 				savedAs: verdict.savedAs,
@@ -1011,18 +1115,26 @@ export class ContextLayer {
 					continue;
 				}
 			}
-			const head = [`#${ord} · ${meta.tool}${meta.args ? ` ${meta.args}` : ""} · turn ${meta.turn} · ${fmtTokens(meta.tokens)}${meta.isError ? " · error" : ""}`];
+			const images = stored.content.filter((p) => p.type === "image");
+			const user = meta.tool === USER_IMAGE_TOOL;
+			const what = user ? (images.length === 1 ? "user image" : `${images.length} user images`) : `${meta.tool}${meta.args ? ` ${meta.args}` : ""}`;
+			const head = [`#${ord} · ${what} · turn ${meta.turn} · ${fmtTokens(meta.tokens)}${meta.isError ? " · error" : ""}`];
 			const stale = this.staleness(meta, calls);
 			if (stale) head.push(stale);
-			const text = stripPathNotes(contentText(stored.content.filter((p) => p.type === "text")));
-			const view = viewOriginal(text, { lines: params.lines, grep: params.grep, maxTokens: budget });
+			const partial = !!(params.lines || params.grep);
+			if (partial && images.length > 0) head.push(`(${imageMarker(images.length)} not shown with lines/grep; expand #${ord} without them to see ${images.length === 1 ? "it" : "them"})`);
+			const message = typeof stored.input?.message === "string" ? stored.input.message : "";
+			const text = user ? (message ? `Attached to the user message: ${message}` : "Attached to a user message.") : stripPathNotes(contentText(stored.content.filter((p) => p.type === "text")));
+			// Images are returned whole; their cost comes out of this item's text budget.
+			const textBudget = partial ? budget : Math.max(200, budget - contentTokens(images, this.imageCost));
+			const view = viewOriginal(text, { lines: params.lines, grep: params.grep, maxTokens: textBudget });
 			if (view.truncated) {
 				head.push(
-					`(truncated: first ~${fmtTokens(budget)} of ${view.totalLines} lines shown)`,
+					`(truncated: first ~${fmtTokens(textBudget)} of ${view.totalLines} lines shown)`,
 				);
 			}
 			parts.push({ type: "text", text: `${head.join("\n")}\n\n${view.text}` });
-			if (!params.lines && !params.grep) for (const p of stored.content) if (p.type === "image") parts.push(p);
+			if (!partial) for (const p of images) parts.push(p);
 			restored.push(ord);
 			const a = this.applied.get(meta.id);
 			const p: Pin = { id: meta.id, turn };
@@ -1310,6 +1422,20 @@ export class ContextLayer {
 		const messages = this.branchMessages(ctx);
 		const f = this.filter(messages, ctx.cwd);
 		return this.buildState(meta, f.calls, this.goalOf(messages).text, f.turn, ctx.cwd);
+	}
+
+	/**
+	 * Mark this session's store active (at most hourly). Long sessions stay safe from the
+	 * retention sweep of other Pi processes, which do not know this session is open.
+	 */
+	touchStore(now = Date.now()): void {
+		if (!this.files || now - this.touchedAt < 3_600_000) return;
+		try {
+			this.host.engine().db.touchOutputSession(this.sessionId, this.projectKey, this.files.dir);
+			this.touchedAt = now;
+		} catch {
+			// store unavailable: the next turn tries again
+		}
 	}
 
 	/** Remove stored originals of this session (used by tests and `/realctx outputs` cleanup). */

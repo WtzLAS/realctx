@@ -5,7 +5,7 @@
  */
 import type { SemIfAnswer, SemIfQuestion } from "./api.ts";
 import type { Settings } from "./config.ts";
-import { contentText, fmtTokens, type OutputMeta } from "./outputs.ts";
+import { contentText, fmtTokens, type OutputMeta, USER_IMAGE_TOOL } from "./outputs.ts";
 import { redactSecrets, sanitizeForPrompt } from "./safety.ts";
 import { estimateTokens, oneLine, truncate } from "./text.ts";
 
@@ -45,7 +45,15 @@ export function isReading(tool: string): boolean {
 // Deterministic filter (§7.1)
 // ---------------------------------------------------------------------------
 
-export type RuleReason = "duplicate" | "reread" | "reedit" | "expansion";
+export type RuleReason = "duplicate" | "reread" | "reedit" | "expansion" | "image";
+
+/** Images cost far more than their placeholder: outputs with images may drop from this size on. */
+export const IMAGE_DROP_MIN = 200;
+
+/** Smallest size at which an output may be dropped. */
+export function dropMinFor(o: Pick<OutputMeta, "images">, s: Pick<Settings["context"], "dropMinTokens">): number {
+	return o.images ? Math.min(s.dropMinTokens, IMAGE_DROP_MIN) : s.dropMinTokens;
+}
 
 export interface RuleDrop {
 	id: string;
@@ -122,7 +130,7 @@ export function filterOutputs(input: FilterInput): FilterResult {
 	const outputsById = new Map(input.outputs.map((o) => [o.id, o]));
 	for (const c of calls) {
 		const o = outputsById.get(c.id);
-		if (o && !input.done.has(o.id) && !ruled.has(o.id) && !keepLatest.has(o.id) && !input.pinned.has(o.id) && o.tokens >= s.dropMinTokens) {
+		if (o && !input.done.has(o.id) && !ruled.has(o.id) && !keepLatest.has(o.id) && !input.pinned.has(o.id) && o.tokens >= dropMinFor(o, s)) {
 			const dup = laterSig.get(o.sig);
 			const path = o.paths.length === 1 ? o.paths[0] : undefined;
 			if (path && isMutating(o.tool) && !o.isError && laterEdit.has(path)) {
@@ -152,9 +160,14 @@ export function filterOutputs(input: FilterInput): FilterResult {
 		if (input.done.has(o.id) || ruled.has(o.id)) continue;
 		if (input.pinned.has(o.id)) prot.set(o.id, "expanded recently");
 		else if (input.turn - o.turn < s.protectTurns) prot.set(o.id, `last ${s.protectTurns} turns`);
-		else if (o.tokens < s.dropMinTokens) prot.set(o.id, "small");
+		else if (o.tokens < dropMinFor(o, s)) prot.set(o.id, "small");
 		else if (keepLatest.has(o.id)) prot.set(o.id, "latest snapshot");
 		else if (protectedTools.has(o.tool.toLowerCase())) prot.set(o.id, "protected tool");
+		else if (o.images && s.imageMaxTurns > 0 && input.turn - o.turn > s.imageMaxTurns) {
+			// Images are spent after a few turns; the agent restores one when it needs it again.
+			rules.push({ id: o.id, kind: "drop", reason: "image" });
+			ruled.add(o.id);
+		}
 		else if (errors.has(o.id)) prot.set(o.id, "unresolved error");
 		else if (o.tool === "realctx_expand") {
 			// A copy of an output that is still restorable: drop it once its pin expired.
@@ -185,7 +198,7 @@ export function dropQuestions(): Record<string, SemIfQuestion> {
 		still_needed: {
 			type: "noul",
 			instructions:
-				"Will the coding agent likely need the exact contents of the candidate tool output again to finish its current goal (for example to quote, patch or compare it), rather than just knowing what it said?",
+				"Will the coding agent likely need the exact contents of the candidate tool output again to finish its current goal (for example to quote, patch or compare it), rather than just knowing what it said? When the candidate holds images (candidate.images), you cannot see them: judge from the tool, its arguments, the goal and since_then whether the agent still has to look at them; a dropped image can be restored on demand.",
 			criteria: { true: "The exact text is still needed for the current goal", false: "The output is spent: the agent has used it or moved on" },
 		},
 		unique_info: {
@@ -217,6 +230,8 @@ export interface DropState {
 		turns_ago: number;
 		error?: boolean;
 		excerpt: string;
+		/** Images in the output: not shown to the judge (the excerpt has a marker for each). */
+		images?: number;
 	};
 	since_then: string[];
 	known_memories: string[];
@@ -425,17 +440,21 @@ const REASON: Record<RuleReason, (by?: number) => string> = {
 	reread: (by) => `re-read${by ? ` in #${by}` : " later"}`,
 	reedit: (by) => `edited again${by ? ` in #${by}` : " later"}`,
 	expansion: () => "copy of a restorable output",
+	image: () => "old image",
 };
 
 /** Render a placeholder once. Only immutable facts go in, so the text is byte-stable. */
 export function renderPlaceholder(
-	meta: Pick<OutputMeta, "ord" | "tool" | "args" | "tokens" | "isError">,
+	meta: Pick<OutputMeta, "ord" | "tool" | "args" | "tokens" | "isError" | "images">,
 	kind: AppliedDrop["kind"],
 	opts: { summary?: string; savedAs?: string[]; reason?: RuleReason; by?: number } = {},
 ): string {
-	const what = oneLine(`${meta.tool}${meta.args ? ` ${meta.args}` : ""}`, 100).replace(/[[\]]/g, "");
+	const n = meta.images ?? 0;
+	const user = meta.tool === USER_IMAGE_TOOL && n > 0;
+	const what = user ? (n === 1 ? "user image" : `${n} user images`) : oneLine(`${meta.tool}${meta.args ? ` ${meta.args}` : ""}`, 100).replace(/[[\]]/g, "");
 	const label = kind === "summary" ? "summarized" : kind === "shrink" ? "superseded" : "dropped";
 	const parts = [`#${meta.ord} ${label}`, what, fmtTokens(meta.tokens)];
+	if (n > 0 && !user) parts.push(n === 1 ? "image" : `${n} images`);
 	if (meta.isError) parts.push("error");
 	if (opts.reason) parts.push(REASON[opts.reason](opts.by));
 	if (opts.savedAs && opts.savedAs.length > 0) parts.push(`saved as ${opts.savedAs.join(", ")}`);

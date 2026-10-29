@@ -89,7 +89,8 @@ function sameContent(a: ContentPart[], b: ContentPart[]): boolean {
 	return a.every((x, i) => {
 		const y = b[i];
 		if (x?.type !== y?.type) return false;
-		return x.type === "text" ? x.text === (y as typeof x).text : x.data === (y as typeof x).data;
+		if (x.type === "text") return x.text === (y as typeof x).text;
+		return x.data === (y as typeof x).data && x.mimeType === (y as typeof x).mimeType;
 	});
 }
 
@@ -346,7 +347,8 @@ export default function realctx(pi: ExtensionAPI) {
 				"info",
 			);
 		}
-		// Stored originals of sessions inactive past context.retentionDays are deleted (shared, throttled).
+		// Daily store sweep: originals of sessions inactive past context.retentionDays, and orphaned
+		// store folders (shared, at most once a day; also checked at turn end).
 		void pruneOutputsThrottled(e, openSessions()).catch(() => {});
 		if (!family.subagent) void suggestConsolidation(ctx, e);
 		try {
@@ -532,6 +534,9 @@ export default function realctx(pi: ExtensionAPI) {
 		layer.judgeInBackground(ctx);
 		if (layer.active) layer.history.prepareInBackground(ctx);
 		layer.captureUserInBackground(ctx);
+		// Keep this session's originals alive for other processes' sweeps, then run the daily sweep.
+		layer.touchStore();
+		if (engine) void pruneOutputsThrottled(engine, openSessions()).catch(() => {});
 		refreshStatus(ctx);
 		return entries.length > 0 ? { entries } : undefined;
 	});

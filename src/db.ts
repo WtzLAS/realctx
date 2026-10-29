@@ -1035,6 +1035,10 @@ export class RealctxDB {
 		).run(session, project, dir, Date.now());
 	}
 
+	/** Store folders of every session the index knows (for the orphan sweep). */
+	outputSessionDirs(): string[] {
+		return (this.stmt("SELECT dir FROM output_sessions").all() as Row[]).map((r) => String(r.dir));
+	}
 	/** Sessions whose outputs were last active before `before` (ms), except `keep`. */
 	staleOutputSessions(before: number, keep: string[]): Array<{ session: string; dir: string }> {
 		const rows = this.stmt("SELECT session, dir FROM output_sessions WHERE last_active < ? AND session NOT IN (SELECT value FROM json_each(?))").all(before, JSON.stringify(keep)) as Row[];

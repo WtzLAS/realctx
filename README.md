@@ -23,6 +23,20 @@ mtimes. Outputs under `context.captureMinTokens` are not stored and never droppe
 Originals of sessions without activity for `context.retentionDays` (default 7; 0 = keep
 forever) are deleted, with their index rows and vectors; sessions open in this process are
 never pruned. After that their placeholders can no longer be expanded (re-run the tool).
+The sweep runs at most once a day (at session start or turn end, shared by all Pi
+processes); it also removes store folders no index row knows that were not written to
+within the retention period, and leftover temp files.
+
+**Images**: images in tool results and images the user pastes are stored too (the user's
+as one `#N` per message, tool `user`) and count what the session model charges for them,
+computed from their pixel size (Anthropic ⌈w·h/750⌉ after its downscale, OpenAI tiles or
+patches, Gemini per image or tile; unknown models ⌈w·h/750⌉). Outputs with images may be
+dropped from 200 tokens on, and every image older than `context.imageMaxTurns` (default 6;
+0 = off) is dropped by a rule. A dropped user image becomes a placeholder inside the user
+message (its text stays). The judge cannot see images: it gets the text and an image
+count; image outputs are dropped, never summarized, and never mined for facts.
+`realctx_expand` returns the images (`lines`/`grep` views say they were left out), and
+historian transcripts mark them as `[image #N]` so summaries can cite them.
 
 **Sessions**: every session has its own context layer: its own registry, drops, pins
 and stored originals. A child session (`/fork`, `/clone`, or a subagent started while a
@@ -38,7 +52,8 @@ their "user" messages, which are the parent agent's prompts.
   todo/plan snapshot and skill loads (`context.protectedTools`), unresolved errors, and
   outputs expanded in the last `context.repinTurns` turns.
 - *Rules, no judge*: exact duplicate calls (newest kept), an older full `read` of a path
-  read again later, older edits of a path edited again later (shrunk to a marker).
+  read again later, older edits of a path edited again later (shrunk to a marker), and
+  images older than `context.imageMaxTurns` turns.
 - *Gray zone*: the judge gets the current goal (last user message + todo), an excerpt
   (secrets redacted), what happened since, and the captions of memories already attached
   to the paths, and answers `still_needed`, `unique_info`, `durable_fact` and

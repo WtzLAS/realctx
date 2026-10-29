@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { normalizeSettings, saveSettings } from "../src/config.ts";
 import { clearProjectCache } from "../src/project.ts";
+import { image, png } from "./fixtures-images.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -23,6 +24,10 @@ let agentDir = "";
 let judgeCalls = 0;
 /** P(still_needed) the mock judge answers for drop questions. */
 let stillNeeded = 0.02;
+/** P(unique_info) the mock judge answers (high = summarize instead of drop). */
+let uniqueInfo = 0.05;
+/** States the mock judge received for drop questions. */
+const judgeStates: string[] = [];
 
 before(async () => {
 	srv = createServer((req, res) => {
@@ -41,10 +46,13 @@ before(async () => {
 			}
 			const answers: Record<string, unknown> = {};
 			const isDrop = "still_needed" in body.questions || "unique_info" in body.questions;
-			if (isDrop) judgeCalls++;
+			if (isDrop) {
+				judgeCalls++;
+				judgeStates.push(typeof body.state === "string" ? body.state : JSON.stringify(body.state));
+			}
 			for (const [k, q] of Object.entries<any>(body.questions)) {
 				if (q.type === "noul") {
-					const v = k === "still_needed" ? stillNeeded : k === "unique_info" ? 0.05 : k === "durable_fact" ? 0.1 : k === "durable_user_fact" ? userFact : k === "unsafe" ? 0.01 : 0.95;
+					const v = k === "still_needed" ? stillNeeded : k === "unique_info" ? uniqueInfo : k === "durable_fact" ? 0.1 : k === "durable_user_fact" ? userFact : k === "unsafe" ? 0.01 : 0.95;
 					answers[k] = { type: "noul", noul: v };
 				} else if (q.type === "score") answers[k] = { type: "score", score: 1, legend: {}, probabilities: {}, confidence: 0.9 };
 				else {
@@ -101,6 +109,7 @@ const big = (tag: string) => Array.from({ length: 200 }, (_, i) => `${tag} line 
 /** Answers of the mock rewrite model (fact extraction, summaries). */
 let completeText = '{"facts": []}';
 let completeCalls = 0;
+const completePrompts: string[] = [];
 /** Answer of the mock historian, and the models the mock registry was asked for. */
 let historianText = '{"summary": "## Done\\n- ran the auth tests (#1 failed on token expiry)", "facts": []}';
 let historianCalls = 0;
@@ -155,6 +164,7 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 					return { stopReason: "stop", content: [{ type: "text", text: historianText }], usage: {} };
 				}
 				completeCalls++;
+				completePrompts.push(JSON.stringify(req));
 				return { stopReason: "stop", content: [{ type: "text", text: completeText }], usage: {} };
 			},
 		},
@@ -167,14 +177,15 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 	 * `details` is the tool's result details; `after` stands for a tool_result handler of an
 	 * extension loaded after realctx (pi-hashline-edit-pro rewrites edit results there).
 	 */
-	const turn = async (name: string, input: Record<string, unknown>, text: string, isError = false, opts: { details?: unknown; after?: (content: any[]) => any[] } = {}) => {
+	const turn = async (name: string, input: Record<string, unknown>, text: string, isError = false, opts: { details?: unknown; after?: (content: any[]) => any[]; content?: any[] } = {}) => {
 		const id = `call${++seq}`;
 		now += 1000;
 		const assistant = { role: "assistant", content: [{ type: "toolCall", id, name, arguments: input }], timestamp: now, usage: { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 1010 }, stopReason: "toolUse" };
 		entries.push({ type: "message", id: nextId(), message: assistant });
 		await emit("message_end", { type: "message_end", message: assistant }, ctx);
-		const r = await emit("tool_result", { type: "tool_result", toolName: name, toolCallId: id, input, content: [{ type: "text", text }], isError, details: opts.details }, ctx);
-		let content = r?.content ?? [{ type: "text", text }];
+		const raw = opts.content ?? [{ type: "text", text }];
+		const r = await emit("tool_result", { type: "tool_result", toolName: name, toolCallId: id, input, content: raw, isError, details: opts.details }, ctx);
+		let content = r?.content ?? raw;
 		if (opts.after) content = opts.after(content);
 		let message: any = { role: "toolResult", toolCallId: id, toolName: name, content, details: opts.details, isError, timestamp: now };
 		message = (await emit("message_end", { type: "message_end", message }, ctx))?.message ?? message;
@@ -183,7 +194,8 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 		for (const d of te?.entries ?? []) entries.push({ ...d, id: nextId() });
 		return id;
 	};
-	const user = (text: string) => entries.push({ type: "message", id: nextId(), message: { role: "user", content: text, timestamp: now } });
+	const user = (text: string, images: any[] = []) =>
+		entries.push({ type: "message", id: nextId(), message: { role: "user", content: images.length > 0 ? [{ type: "text", text }, ...images] : text, timestamp: now } });
 	/** Run the `context` hook over the branch messages, like a provider request. */
 	const request = async () => {
 		const messages = structuredClone(entries.filter((e) => e.type === "message").map((e) => e.message));
@@ -730,4 +742,134 @@ test("pi-hashline-edit-pro: anchor edits are tracked by their result details; re
 	const ex = await h.tools.get("realctx_expand").execute("x", { ids: [1] }, undefined, undefined, h.ctx);
 	assert.match(ex.content[0].text, /post-edit diff one line 0/);
 	assert.doesNotMatch(ex.content[0].text, /Replaced 1 line/);
+});
+
+test("images: user and tool images drop after imageMaxTurns, placeholders say so, expansion restores them; reload renders the same bytes", async () => {
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 1000, protectTurns: 1, imageMaxTurns: 2 } });
+	const h = await harness();
+	// Two pasted screenshots: 1500×1000 each = 2000 tokens for an unknown model (w·h/750).
+	h.user("why is the button misaligned?", [image(png(1500, 1000)), image(png(1500, 1000))]);
+	await h.request(); // the request after the prompt stores the images (#1)
+	const shot = await h.turn("read", { path: "src/shot.png" }, "", false, { content: [{ type: "text", text: "Read image file [image/png]" }, image(png(1200, 800))] });
+	for (let i = 0; i < 4; i++) await h.turn("bash", { command: `echo ${i}` }, big(`filler ${i}`));
+	await h.settle();
+
+	const m = await h.request();
+	const u = m.find((x) => x.role === "user");
+	assert.deepEqual(
+		u.content.map((p: any) => p.type),
+		["text", "text"],
+		"the images are gone, the text stays",
+	);
+	assert.equal(u.content[0].text, "why is the button misaligned?");
+	assert.match(u.content[1].text, /^\[#1 dropped · 2 user images · 4k tok · old image\]$/);
+	assert.match(h.resultText(m, shot), /^\[#2 dropped · read src\/shot\.png · [\d.]+k tok · image · old image\]$/);
+	// Byte-stable.
+	const again = await h.request();
+	assert.equal(again.find((x) => x.role === "user").content[1].text, u.content[1].text);
+
+	// Restoring returns the images; a filtered view says they were left out.
+	const ex = await h.tools.get("realctx_expand").execute("x1", { ids: [1] }, undefined, undefined, h.ctx);
+	assert.match(ex.content[0].text, /^#1 · 2 user images · turn 0 · 4k tok/);
+	assert.match(ex.content[0].text, /Attached to the user message: why is the button misaligned\?/);
+	assert.deepEqual(
+		ex.content.filter((p: any) => p.type === "image").map((p: any) => p.mimeType),
+		["image/png", "image/png"],
+	);
+	const part = await h.tools.get("realctx_expand").execute("x2", { ids: [2], grep: "Read" }, undefined, undefined, h.ctx);
+	assert.match(part.content[0].text, /\(\[image\] not shown with lines\/grep; expand #2 without them to see it\)/);
+	assert.equal(part.content.filter((p: any) => p.type === "image").length, 0);
+
+	// The registry persists the user-image output: a fresh instance renders the same placeholder.
+	await h.turn("bash", { command: "echo flush" }, big("flush"));
+	const { default: realctx } = await import("../extensions/realctx/index.ts");
+	const handlers = new Map<string, Handler[]>();
+	realctx({
+		registerTool() {},
+		registerCommand() {},
+		on: (e: string, fn: Handler) => void handlers.set(e, [...(handlers.get(e) ?? []), fn]),
+		appendEntry() {},
+		getActiveTools: () => [],
+		getAllTools: () => [],
+		setActiveTools() {},
+		sendUserMessage() {},
+	} as any);
+	for (const fn of handlers.get("session_start") ?? []) await fn({ type: "session_start", reason: "reload" }, h.ctx);
+	const messages = structuredClone(h.entries.filter((e) => e.type === "message").map((e) => e.message));
+	let out: any;
+	for (const fn of handlers.get("context") ?? []) out = (await fn({ type: "context", messages }, h.ctx)) ?? out;
+	const reloaded = (out?.messages ?? messages).find((x: any) => x.role === "user");
+	assert.equal(reloaded.content[1]?.text, u.content[1].text, "same placeholder bytes after reload");
+});
+
+test("images: the judge sees an image count, image outputs are dropped instead of summarized", async () => {
+	writeSettings({ judge: { shadow: false }, context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, imageMaxTurns: 0 } });
+	stillNeeded = 0.02;
+	uniqueInfo = 0.9; // the judge would summarize
+	judgeStates.length = 0;
+	completePrompts.length = 0;
+	try {
+		const h = await harness();
+		h.user("fix the layout");
+		const shot = await h.turn("screenshot", { url: "http://localhost:3000" }, "", false, { content: [image(png(1600, 1200)), image(png(800, 600))] });
+		for (let i = 0; i < 3; i++) await h.turn("bash", { command: `echo ${i}` }, big(`filler ${i}`));
+		await h.settle();
+		await h.turn("bash", { command: "echo last" }, big("last"));
+		await h.settle();
+		const state = judgeStates.map((s) => JSON.parse(s)).find((s) => s.candidate?.tool === "screenshot");
+		assert.ok(state, "the judge was asked about the screenshot");
+		assert.equal(state.candidate.images, 2);
+		assert.match(state.candidate.excerpt, /\[2 images\]/);
+		assert.ok(!state.candidate.excerpt.includes("iVBOR"), "no image data in the judge state");
+		const m = await h.request();
+		assert.match(h.resultText(m, shot), /^\[#1 dropped · screenshot http:\/\/localhost:3000 · [\d.]+k tok · 2 images\]$/);
+		// Text outputs are summarized by the rewrite model; the screenshot never was.
+		assert.ok(completePrompts.length > 0, "text outputs were summarized");
+		assert.ok(!completePrompts.some((p) => p.includes("localhost:3000")), "the image output never was");
+	} finally {
+		uniqueInfo = 0.05;
+	}
+});
+
+test("daily store sweep: orphaned folders and stale temp files go, recent ones stay; once a day", async () => {
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, retentionDays: 7 } });
+	const { MemoryEngine } = await import("../src/engine.ts");
+	const { pruneOutputs, pruneOutputsThrottled } = await import("../src/jobs.ts");
+	const { utimesSync } = await import("node:fs");
+	const e = new MemoryEngine();
+	try {
+		const root = join(base, "sessions");
+		const old = Date.now() / 1000 - 10 * 86_400;
+		const orphan = join(root, "proj-x", "lost-session");
+		mkdirSync(orphan, { recursive: true });
+		writeFileSync(join(orphan, "00001-abc.json"), "{}");
+		utimesSync(join(orphan, "00001-abc.json"), old, old);
+		utimesSync(orphan, old, old);
+		const recent = join(root, "proj-x", "unindexed-but-recent");
+		mkdirSync(recent, { recursive: true });
+		writeFileSync(join(recent, "00001-def.json"), "{}");
+		const known = join(root, "proj-y", "known");
+		mkdirSync(known, { recursive: true });
+		writeFileSync(join(known, "00001-x.json.tmp-123"), "{}");
+		utimesSync(join(known, "00001-x.json.tmp-123"), old, old);
+		writeFileSync(join(known, "00002-y.json"), "{}");
+		e.db.touchOutputSession("known-session", "proj-y", known);
+
+		const r = pruneOutputs(e, []);
+		assert.equal(r.orphans, 1);
+		assert.equal(r.temps, 1);
+		assert.throws(() => readFileSync(join(orphan, "00001-abc.json")));
+		assert.equal(readFileSync(join(recent, "00001-def.json"), "utf8"), "{}", "recent unindexed folders are kept");
+		assert.equal(readFileSync(join(known, "00002-y.json"), "utf8"), "{}");
+		assert.throws(() => readFileSync(join(known, "00001-x.json.tmp-123")));
+
+		// Throttle: at most once a day, shared through the schedule table.
+		e.db.setSchedule("retention", Date.now() - 2 * 86_400_000);
+		assert.ok(await pruneOutputsThrottled(e, []));
+		assert.equal(await pruneOutputsThrottled(e, []), undefined);
+		assert.ok(await pruneOutputsThrottled(e, [], Date.now() + 86_400_000 + 1000));
+		e.db.purgeOutputSession("known-session");
+	} finally {
+		e.close();
+	}
 });

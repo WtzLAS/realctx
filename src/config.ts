@@ -50,6 +50,8 @@ export interface Settings {
 		captureMinTokens: number;
 		/** Never drop an output smaller than this. */
 		dropMinTokens: number;
+		/** Images (tool results and the user's) older than N model turns are dropped by a rule (0 = off). */
+		imageMaxTurns: number;
 		/** Outputs of the last N model turns are never dropped. */
 		protectTurns: number;
 		/** Tools whose latest result is never dropped (older ones are superseded). */
@@ -248,6 +250,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		captureMinTokens: 1000,
 		dropMinTokens: 1000,
 		protectTurns: 4,
+		imageMaxTurns: 6,
 		protectedTools: ["todo", "todo_write", "TodoWrite", "skill"],
 		pDrop: 0.15,
 		pUnique: 0.3,
@@ -427,6 +430,7 @@ export function normalizeSettings(input: unknown): Settings {
 	c.captureMinTokens = Math.round(clamp(c.captureMinTokens, 0, 1_000_000));
 	c.dropMinTokens = Math.round(clamp(c.dropMinTokens, 0, 1_000_000));
 	c.protectTurns = Math.round(clamp(c.protectTurns, 0, 1000));
+	c.imageMaxTurns = Math.round(clamp(c.imageMaxTurns, 0, 1000));
 	for (const k of ["pDrop", "pUnique", "pKeep", "minConfidence"] as const) c[k] = clamp(c[k], 0, 1);
 	c.emergencyThreshold = clamp(c.emergencyThreshold, 0.1, 1);
 	c.applyThreshold = Math.min(clamp(c.applyThreshold, 0.05, 1), c.emergencyThreshold);

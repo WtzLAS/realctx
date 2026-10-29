@@ -26,7 +26,10 @@ import {
 	renderChunk,
 	renderHistory,
 	renderTranscript,
+	textOf,
+	userImageId,
 } from "../../src/history.ts";
+import type { ImageCost } from "../../src/images.ts";
 import { fmtTokens } from "../../src/outputs.ts";
 import { viewOriginal } from "../../src/policy.ts";
 import { familyRoot, takeCaptureBudget } from "../../src/shared.ts";
@@ -48,6 +51,8 @@ export interface HistoryHost {
 	output(toolCallId: string): OutputLabel | undefined;
 	/** Current usage of the safe input window, as of the last request. */
 	usage(): { tokens: number; window: number; share: number } | undefined;
+	/** Image token cost of the session model. */
+	imageCost?(): ImageCost;
 	/** Absolute assistant-turn counter. */
 	assistants(): number;
 	onCaptured?(ctx: ExtensionContext): void;
@@ -141,13 +146,13 @@ export class HistoryManager {
 	 * In the `context` hook: apply ready chunks when `apply` is true (and, in an emergency, build a
 	 * deterministic one), then render every applied chunk. Returns the new messages, or undefined.
 	 */
-	transform(messages: MessageView[], opts: { apply: boolean; emergency: boolean; turn: number }): MessageView[] | undefined {
+	transform(messages: MessageView[], opts: { apply: boolean; emergency: boolean; turn: number; keys?: string[] }): MessageView[] | undefined {
 		if (!this.enabled) return undefined;
 		const now = Date.now();
 		if (opts.apply || opts.emergency) {
 			for (const c of this.ready()) {
 				// Only a chunk that still matches this transcript, contiguous with what is applied.
-				const probe = renderHistory(messages, [...this.applied(), c]);
+				const probe = renderHistory(messages, [...this.applied(), c], opts.keys);
 				if (!probe.rendered.includes(c)) continue;
 				c.appliedAt = now;
 				c.appliedTurn = opts.turn;
@@ -155,19 +160,23 @@ export class HistoryManager {
 			}
 			if (opts.emergency && this.cfg.emergencyFallback && this.ready().length === 0) this.emergencyChunk(messages, opts.turn, now);
 		}
-		const r = renderHistory(messages, this.applied());
+		const r = renderHistory(messages, this.applied(), opts.keys);
 		return r.rendered.length > 0 ? r.messages : undefined;
 	}
 
 	/** Labels and sizes as the model saw them (dropped outputs count as their placeholder). */
 	private tokensOf(messages: MessageView[]) {
+		const cost = this.host.imageCost?.();
 		return (i: number): number => {
 			const m = messages[i];
 			if (m.role === "toolResult" && m.toolCallId) {
 				const o = this.host.output(m.toolCallId);
 				if (o?.placeholder) return estimateTokens(o.placeholder) + 8;
 			}
-			return estimateMessage(m);
+			const userImages = userImageId(m);
+			const o = userImages ? this.host.output(userImages) : undefined;
+			if (o?.placeholder) return estimateTokens(`${textOf(m.content)}\n${o.placeholder}`) + 8;
+			return estimateMessage(m, cost);
 		};
 	}
 
@@ -187,8 +196,9 @@ export class HistoryManager {
 		const outputs: number[] = [];
 		const labels = new Map<number, string>();
 		for (const m of part) {
-			if (m.role !== "toolResult" || !m.toolCallId) continue;
-			const o = this.host.output(m.toolCallId);
+			const id = m.role === "toolResult" ? m.toolCallId : userImageId(m);
+			if (!id) continue;
+			const o = this.host.output(id);
 			if (!o) continue;
 			outputs.push(o.ord);
 			labels.set(o.ord, o.label);

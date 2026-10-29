@@ -8,7 +8,8 @@
  * every request. Chunks follow each other from the oldest message on, so applying the next one
  * never changes the bytes before it.
  */
-import { contentTokens, fmtTokens } from "./outputs.ts";
+import { GENERIC_IMAGE_COST, type ImageCost, imageTokens } from "./images.ts";
+import { contentTokens, fmtTokens, imageCount, USER_IMAGE_TOOL } from "./outputs.ts";
 import { parseJsonObject } from "./rewrite.ts";
 import { redactSecrets, sanitizeForPrompt } from "./safety.ts";
 import { estimateTokens, oneLine, sha256, truncate } from "./text.ts";
@@ -43,18 +44,18 @@ export function textOf(content: unknown): string {
 		.join("\n");
 }
 
-/** Rough token count of one message as sent to the provider. */
-export function estimateMessage(m: MessageView): number {
-	if (m.role === "toolResult") return contentTokens(Array.isArray(m.content) ? (m.content as Array<{ type: string; text?: string }>) : []) + 8;
+/** Rough token count of one message as sent to the provider (images by pixel size under `cost`). */
+export function estimateMessage(m: MessageView, cost: ImageCost = GENERIC_IMAGE_COST): number {
+	if (m.role === "toolResult") return contentTokens(Array.isArray(m.content) ? (m.content as Array<{ type: string; text?: string }>) : [], cost) + 8;
 	if (m.role === "bashExecution") return estimateTokens(`${m.command ?? ""}\n${m.output ?? ""}`) + 8;
 	if (m.role === "compactionSummary" || m.role === "branchSummary") return estimateTokens(m.summary ?? "") + 24;
 	if (Array.isArray(m.content)) {
 		let n = 8;
-		for (const p of m.content as Array<{ type?: string; text?: string; thinking?: string; arguments?: unknown }>) {
+		for (const p of m.content as Array<{ type?: string; text?: string; thinking?: string; arguments?: unknown; data?: string }>) {
 			if (p?.type === "text") n += estimateTokens(p.text ?? "");
 			else if (p?.type === "thinking") n += estimateTokens(p.thinking ?? "");
 			else if (p?.type === "toolCall") n += estimateTokens(JSON.stringify(p.arguments ?? {})) + 12;
-			else if (p?.type === "image") n += 1200;
+			else if (p?.type === "image") n += imageTokens(p, cost);
 		}
 		return n;
 	}
@@ -66,6 +67,31 @@ export function messageKey(m: MessageView): string {
 	const extra = m.role === "toolResult" ? (m.toolCallId ?? "") : m.role === "user" || m.role === "custom" ? sha256(textOf(m.content)).slice(0, 10) : "";
 	return `${m.role}:${m.timestamp ?? 0}:${extra}`;
 }
+
+export { USER_IMAGE_TOOL };
+
+/**
+ * Output id of the images attached to a user message (undefined when it has none). Derived
+ * from the message key, so it survives reloads; never collides with a provider tool call id.
+ */
+export function userImageId(m: MessageView): string | undefined {
+	if (m.role !== "user" || !Array.isArray(m.content) || imageCount(m.content as Array<{ type?: string }>) === 0) return undefined;
+	return `user-image:${messageKey(m).slice("user:".length)}`;
+}
+
+/** `[image]`, `[2 images #5]`: how images appear in transcripts the historian reads. */
+export function imageMarker(n: number, ord?: number): string {
+	if (n <= 0) return "";
+	return `[${n === 1 ? "image" : `${n} images`}${ord !== undefined ? ` #${ord}` : ""}]`;
+}
+
+function withMarker(text: string, marker: string): string {
+	if (!marker) return text;
+	return text.trim() ? `${text}\n${marker}` : marker;
+}
+
+/** Transcripts count an image as its marker. */
+const MARKER_COST: ImageCost = { name: "marker", tokens: () => 8, fallback: 8 };
 
 /** Messages a chunk may never contain: Pi's own summaries and realctx's rendered blocks. */
 export function isSummaryMessage(m: MessageView): boolean {
@@ -194,7 +220,7 @@ function argsLine(args: unknown): string {
 export function renderTranscript(messages: MessageView[], opts: TranscriptOptions): string {
 	const budgetChars = Math.max(2000, opts.maxTokens * 3);
 	// Shorten each kind of item in proportion to the budget.
-	const raw = messages.reduce((n, m) => n + estimateMessage(m), 0) * 3.5;
+	const raw = messages.reduce((n, m) => n + estimateMessage(m, MARKER_COST), 0) * 3.5;
 	const scale = raw > budgetChars ? budgetChars / raw : 1;
 	const cap = (n: number) => Math.max(160, Math.floor(n * scale));
 	const lines: string[] = [];
@@ -216,16 +242,21 @@ export function renderTranscript(messages: MessageView[], opts: TranscriptOption
 			}
 		} else if (m.role === "toolResult") {
 			const out = m.toolCallId ? opts.output(m.toolCallId) : undefined;
-			const text = textOf(m.content);
+			const text = withMarker(textOf(m.content), imageMarker(imageCount(Array.isArray(m.content) ? m.content : [])));
 			const head = `  ← ${out ? `#${out.ord} ` : ""}${m.toolName ?? "result"}${m.isError ? " (error)" : ""}`;
 			if (out?.placeholder) lines.push(`${head}: ${out.placeholder}`);
 			else lines.push(`${head}${out ? ` (${out.label})` : ""}: ${clip(text, cap(out ? 1500 : 2500))}`);
 		} else if (m.role === "user") {
-			lines.push(`[turn ${turn + 1}] USER: ${clip(textOf(m.content), cap(8000))}`);
+			const id = userImageId(m);
+			const out = id ? opts.output(id) : undefined;
+			const n = imageCount(Array.isArray(m.content) ? m.content : []);
+			const marker = out?.placeholder ?? imageMarker(n, out?.ord);
+			lines.push(`[turn ${turn + 1}] USER: ${withMarker(clip(textOf(m.content), cap(8000)), marker)}`);
 		} else if (m.role === "bashExecution") {
 			lines.push(`[turn ${turn + 1}] USER ran: ${oneLine(m.command ?? "", 200)}\n${clip(m.output ?? "", cap(1500))}`);
 		} else if (m.role === "custom") {
-			lines.push(`[turn ${turn + 1}] NOTE (${m.customType ?? "extension"}): ${clip(textOf(m.content), cap(2000))}`);
+			const marker = imageMarker(imageCount(Array.isArray(m.content) ? m.content : []));
+			lines.push(`[turn ${turn + 1}] NOTE (${m.customType ?? "extension"}): ${withMarker(clip(textOf(m.content), cap(2000)), marker)}`);
 		}
 	}
 	return sanitizeForPrompt(redactSecrets(lines.join("\n")));
@@ -240,6 +271,7 @@ Keep:
 - findings: causes of bugs, how things work, values, names, APIs, error messages that matter
 - what was tried and failed, and why; open problems and agreed next steps
 - references to tool outputs as #N exactly as labelled (they can be restored by number)
+- images: they appear as [image …] markers or placeholders and you cannot see them; record who provided which image, what it showed as far as the text around it tells, and its #N exactly as labelled (images can be restored by number too)
 
 Drop: greetings, filler, the agent's thinking aloud, repeated attempts that taught nothing, file contents that are summarized by their effect.
 
@@ -293,8 +325,16 @@ export function fallbackHistory(messages: MessageView[], opts: Pick<TranscriptOp
 			turn++;
 			if (!Array.isArray(m.content)) continue;
 			for (const p of m.content as Array<{ type?: string; name?: string; arguments?: unknown }>) if (p?.type === "toolCall") lines.push(`- turn ${turn}: ${p.name ?? "tool"} ${argsLine(p.arguments)}`);
-		} else if (m.role === "user") lines.push(`- user (turn ${turn + 1}): ${oneLine(textOf(m.content), 300)}`);
-		else if (m.role === "toolResult" && m.isError) lines.push(`  failed: ${oneLine(textOf(m.content), 160)}`);
+		} else if (m.role === "user") {
+			const id = userImageId(m);
+			const out = id ? opts.output(id) : undefined;
+			const marker = imageMarker(imageCount(Array.isArray(m.content) ? m.content : []), out?.ord);
+			lines.push(`- user (turn ${turn + 1}): ${oneLine(textOf(m.content), 300)}${marker ? ` ${marker}` : ""}`);
+		} else if (m.role === "toolResult" && m.isError) lines.push(`  failed: ${oneLine(textOf(m.content), 160)}`);
+		else if (m.role === "toolResult" && imageCount(Array.isArray(m.content) ? m.content : []) > 0) {
+			const out = m.toolCallId ? opts.output(m.toolCallId) : undefined;
+			lines.push(`  ${m.toolName ?? "result"}: ${imageMarker(imageCount(m.content as Array<{ type?: string }>), out?.ord)}`);
+		}
 	}
 	const keep = lines.length > 60 ? [...lines.slice(0, 30), `- … ${lines.length - 50} more steps …`, ...lines.slice(-20)] : lines;
 	return redactSecrets(keep.join("\n"));
@@ -354,11 +394,13 @@ export function chunkMessage(c: Pick<HistoryChunk, "text" | "timestamp" | "n">):
  * `count` messages; otherwise (branch switch, Pi compaction) it is skipped and those messages
  * pass through unchanged.
  */
-export function renderHistory(messages: MessageView[], chunks: HistoryChunk[]): { messages: MessageView[]; rendered: HistoryChunk[] } {
+export function renderHistory(messages: MessageView[], chunks: HistoryChunk[], keys?: string[]): { messages: MessageView[]; rendered: HistoryChunk[] } {
 	if (chunks.length === 0) return { messages, rendered: [] };
+	// `keys`: keys of the messages as Pi sent them, when `messages` already has drops rendered
+	// (a user message whose images became a placeholder hashes differently).
 	const index = new Map<string, number>();
 	messages.forEach((m, i) => {
-		const k = messageKey(m);
+		const k = keys?.[i] ?? messageKey(m);
 		if (!index.has(k)) index.set(k, i);
 	});
 	const out: MessageView[] = [];

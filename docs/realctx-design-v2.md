@@ -154,7 +154,9 @@ Results below `context.captureMinTokens` are not stored; they're never dropped. 
 
 **Where originals live:** `~/.pi/agent/realctx/sessions/<project-key>/<session-id>/` (files mode 0600), outside the project. Originals can contain secrets and must never land in the committed `.pi/realctx/` memory store. Each session has its own directory; a child session copies what it inherits (§13.6).
 
-**Retention:** originals, their index rows, vectors and verdicts are deleted once their session has had no activity for `context.retentionDays` (default 7; `0` keeps them forever). Sessions open in the current process are never pruned. The check runs at session start, at most once an hour. A placeholder whose original expired can no longer be expanded; `realctx_expand` says so and the model re-runs the tool.
+**Retention:** originals, their index rows, vectors and verdicts are deleted once their session has had no activity for `context.retentionDays` (default 7; `0` keeps them forever). Sessions open in the current process are never pruned, and open sessions refresh their activity at turn end (at most hourly) so other Pi processes' sweeps keep them. The sweep runs at most once a day across all processes (shared schedule), checked at session start and at turn end. It also deletes store folders that no index row knows and that were not written to within the retention period (lost index, crashes), and temp files of interrupted writes older than a day. A placeholder whose original expired can no longer be expanded; `realctx_expand` says so and the model re-runs the tool.
+
+**Images:** images in tool results are stored with the result; images attached to a user message are stored as one output per message (tool `user`, id derived from the message key, so it is stable across reloads), captured on the first request that contains the message. An image counts what the session model charges for it, from the pixel size in its encoded header (PNG, JPEG, GIF, WebP, BMP): Anthropic ⌈w·h/750⌉ after its downscale (long edge 1568 px / 1.15 MP; 2576 px / 3.75 MP for Claude ≥ 4.7), OpenAI 512-px tiles (gpt-4o, gpt-4.1, gpt-5, o-series) or 32-px patches capped at 1536 (mini/nano), Gemini 1120 per image (3.x) or 258 per tile (≤ 2.x), otherwise ⌈w·h/750⌉. Unreadable sizes count as a 2000×2000 image (Pi's resize bound). A dropped user image is replaced, inside the user message, by its placeholder (`[#N dropped · 2 user images · 4k tok]`); the text of the message stays. History compression matches chunks by the keys of the messages as Pi sent them, so rendered placeholders do not break the match.
 
 ## 7. Deciding what to drop
 
@@ -163,7 +165,7 @@ Results below `context.captureMinTokens` are not stored; they're never dropped. 
 **Never drop**
 
 - Results from the last `context.protectTurns` turns
-- Results under `context.dropMinTokens`
+- Results under `context.dropMinTokens` (outputs with images: under `min(dropMinTokens, 200)`)
 - Latest todo/plan snapshot; skill loads; tools in `context.protectedTools`
 - Unresolved errors (errored, no later successful call of the same tool on the same paths or arguments)
 - Outputs expanded within `context.repinTurns` turns
@@ -174,6 +176,7 @@ Results below `context.captureMinTokens` are not stored; they're never dropped. 
 - An older `read` of a path the tracker saw read again later
 - Older edits to a path edited again later: shrink to a marker keeping path and region
 - A `realctx_expand` result whose pin expired (the original is still restorable)
+- Images (tool results and the user's) older than `context.imageMaxTurns` turns (placeholder ends `· old image`)
 
 Everything else is a gray-zone candidate.
 
@@ -198,6 +201,7 @@ Everything else is a gray-zone candidate.
 ```
 
 - `excerpt` passes through the safety scanner first; detected secrets are redacted before anything leaves the machine.
+- Images never reach the judge: `excerpt` has the text and an `[N images]` marker, and `candidate.images` gives the count (the `still_needed` instruction says the agent can restore a dropped image).
 - `known_memories` lists captions of memories attached to the candidate's paths (from path notes or a quick index lookup). It lets the judge see what's already saved.
 
 **Questions:**
@@ -220,6 +224,8 @@ The yes/no type is `noul` (LLM Gateway's System One schema).
 | `still_needed` < `pDrop`, `unique_info` < `pUnique`, confidence ≥ `minConfidence` | **drop** |
 | (`action` = summarize, or `unique_info` ≥ `pUnique`), `still_needed` < `pKeep` | **summarize** (rewrite model, §7.5) |
 | Otherwise | **keep**, re-judge later |
+
+Outputs with images are never summarized (no model reads them): a summarize verdict becomes a drop, and no facts are captured from them.
 
 Confidence is P(drop) + P(summarize) of the `action` answer. Independently: `durable_fact` ≥ `capture.pDurable` → capture (§13.1). With `judge.shadow` on (the default), verdicts are only logged; rule and emergency drops still apply. Without a judge, only the deterministic filter and emergency reclaim drop.
 
@@ -273,13 +279,14 @@ realctx_expand({ ids: number[], lines?: string, grep?: string })
 
 - Returns the original as a **new tool result** at the end; never restores in place.
 - Capped at `context.expandMaxTokens`; overflow returns the head plus a hint to use `lines` or `grep`.
+- Images are returned whole (they cannot be cut); their tokens come out of the text budget of the same item. With `lines` or `grep` they are left out, and the header says so.
 - **Staleness:** if the path tracker or mtimes show the file changed since capture, prepend "file edited since turn N; re-read for the current version."
 - **Repeats:** a second expand of the same ID within `repinTurns` returns a pointer to the first.
 - **Missing:** an ID that was never captured in this session, or whose original expired (§6), is reported as not found.
 - **No path notes:** expansions don't count as touching their paths, so memories aren't shown twice.
 - Logs a false-drop signal for tuning (§14).
 
-`realctx_expand({ history: [3] })` returns the transcript of history part `h3` (§9.4) from the session branch, with the same `lines` / `grep` options; tool outputs inside it are shortened and keep their `#N` labels.
+`realctx_expand({ history: [3] })` returns the transcript of history part `h3` (§9.4) from the session branch, with the same `lines` / `grep` options; tool outputs inside it are shortened and keep their `#N` labels. Images appear as `[image #N]` markers (also in the historian's transcript and the deterministic outline); restore them with `realctx_expand(ids=[N])`.
 
 ### 9.4 History compression (the historian)
 
@@ -570,6 +577,7 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `context.captureMinTokens` | `1000` | Smaller outputs aren't stored or dropped |
 | `context.dropMinTokens` | `1000` | Never drop below this |
 | `context.protectTurns` | `4` | Recent turns immune from dropping |
+| `context.imageMaxTurns` | `6` | Images (tool results and the user's) older than this are dropped by a rule; `0` = off |
 | `context.protectedTools` | `["todo", "todo_write", "TodoWrite", "skill"]` | Never dropped (latest instance for snapshots) |
 | `context.pDrop`, `context.pUnique`, `context.pKeep` | `0.15`, `0.3`, `0.5` | Policy thresholds (§7.3) |
 | `context.minConfidence` | `0.7` | Min judge confidence to act |

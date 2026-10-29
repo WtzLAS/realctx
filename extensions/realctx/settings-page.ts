@@ -496,6 +496,7 @@ function fields(): FieldDef[] {
 		ctxNum("captureMinTokens", "Context: capture min tokens", "Tool outputs smaller than this are not stored, so they are never dropped.", 0, 1_000_000, true),
 		ctxNum("dropMinTokens", "Context: drop min tokens", "Never drop an output smaller than this.", 0, 1_000_000, true),
 		ctxNum("protectTurns", "Context: protected turns", "Outputs of the last N model turns are never dropped.", 0, 1000, true),
+		ctxNum("imageMaxTurns", "Context: image max turns", "Images (tool results and pasted by the user) older than N model turns are dropped by a rule when drops apply; restorable with realctx_expand (0 = off).", 0, 1000, true),
 		ctxNum("pDrop", "Context: max P(still_needed)", "Drop only when the judge's P(still needed) is below this."),
 		ctxNum("pUnique", "Context: max P(unique_info)", "Drop (rather than summarize) only when P(unique info) is below this."),
 		ctxNum("minConfidence", "Context: min confidence", "Minimum judge confidence (P of the drop/summarize action) to act."),

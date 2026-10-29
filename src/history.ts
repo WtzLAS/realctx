@@ -107,12 +107,21 @@ function toolCallIds(m: MessageView): string[] {
  * Indexes at which a chunk may start or end (an end index is exclusive): before a user-side
  * message, or before an assistant message once every earlier tool call has its result. Cutting
  * anywhere else would separate a tool call from its result.
+ *
+ * A call that never gets a result (Pi restarted or aborted while it ran) is closed by the next
+ * message that is not a tool result, as pi-ai does when it inserts a synthetic "No result
+ * provided" result there. Otherwise one orphaned call would block every later cut, and history
+ * could never be compressed again for the rest of the session. A call in the last message has
+ * no later message, so it stays open: it may still be running.
  */
 export function boundaries(messages: MessageView[]): Set<number> {
 	const out = new Set<number>();
 	const open = new Set<string>();
+	const answered = new Set<string>();
+	for (const m of messages) if (m.role === "toolResult" && m.toolCallId) answered.add(m.toolCallId);
 	for (let i = 0; i < messages.length; i++) {
 		const m = messages[i];
+		if (m.role !== "toolResult") for (const id of open) if (!answered.has(id)) open.delete(id);
 		if (open.size === 0 && m.role !== "toolResult") out.add(i);
 		for (const id of toolCallIds(m)) open.add(id);
 		if (m.role === "toolResult" && m.toolCallId) open.delete(m.toolCallId);

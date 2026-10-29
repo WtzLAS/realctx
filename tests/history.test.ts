@@ -55,6 +55,34 @@ test("boundaries never split a tool call from its result", () => {
 	assert.deepEqual([...boundaries(open)].sort(), [0, 1]);
 });
 
+test("boundaries: a call that never got a result (Pi restarted while it ran) does not block later cuts", () => {
+	// The shape of a real session: a long `task_output` wait, Pi restarted, then a new prompt.
+	const m = [
+		user("watch the release"),
+		call("w", "task_output", { id: "job", wait_ms: 600_000 }),
+		{ role: "system", content: "restarted", timestamp: t++ } as MessageView,
+		user("continue"),
+		call("b1", "bash", { command: "tail log" }),
+		result("b1", "z".repeat(4000)),
+		call("b2", "bash", { command: "ls" }),
+		result("b2", "ok"),
+		reply("Still running."),
+	];
+	const b = boundaries(m);
+	assert.ok(b.has(2) && b.has(3) && b.has(4) && b.has(6) && b.has(8) && b.has(m.length), `cuts: ${[...b].sort((x, y) => x - y)}`);
+	assert.ok(!b.has(5) && !b.has(7), "answered calls still pair with their results");
+	const c = pickChunk(m, 0, protectFrom(m, 1), 500, 1_000_000);
+	assert.ok(c && c.end > 2, "history can compress past the orphaned call");
+
+	// Parallel calls: the answered one pairs with its result, the orphan closes at the next message.
+	const par = [user("go"), { ...call("p1", "bash", {}), content: [{ type: "toolCall", id: "p1", name: "bash", arguments: {} }, { type: "toolCall", id: "p2", name: "bash", arguments: {} }] } as MessageView, result("p1", "ok"), user("next"), reply("ok")];
+	assert.deepEqual([...boundaries(par)].sort((x, y) => x - y), [0, 1, 3, 4, 5]);
+
+	// A result that arrives late (after another message) still keeps its call open until then.
+	const late = [user("go"), call("l", "bash", {}), { role: "custom", customType: "note", content: "x", timestamp: t++ } as MessageView, result("l", "ok"), reply("done")];
+	assert.deepEqual([...boundaries(late)].sort((x, y) => x - y), [0, 1, 4, 5]);
+});
+
 test("pickChunk: whole turns from the start, before the protected tail, within bounds", () => {
 	const m = transcript();
 	const tail = protectFrom(m, 2); // last two agent turns' prompt: "now the docs"

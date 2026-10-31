@@ -6,6 +6,8 @@ export type SecretAction = "reject" | "redact";
 export type StripMode = "imported" | "always" | "never";
 
 export interface Settings {
+	/** Config schema version. `loadSettings` migrates and rewrites files from older versions. */
+	version: number;
 	embedding: {
 		/** Base URL, with or without a trailing `/v1`. */
 		endpoint: string;
@@ -218,7 +220,11 @@ export interface Settings {
 	};
 }
 
+/** Bump when defaults change in a way saved configs must pick up; add the step to `migrateSettings`. */
+export const SETTINGS_VERSION = 2;
+
 export const DEFAULT_SETTINGS: Settings = {
+	version: SETTINGS_VERSION,
 	embedding: {
 		endpoint: "",
 		apiKey: "",
@@ -253,7 +259,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		pUnique: 0.3,
 		pKeep: 0.5,
 		minConfidence: 0.7,
-		applyThreshold: 0.25,
+		applyThreshold: 0.35,
 		emergencyThreshold: 0.9,
 		cacheTtl: "5m",
 		cacheTtlByModel: {},
@@ -268,7 +274,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	history: {
 		enabled: true,
 		model: "",
-		prepareThreshold: 0.2,
+		prepareThreshold: 0.25,
 		protectTurns: 8,
 		minChunkTokens: 6000,
 		maxChunkTokens: 30000,
@@ -414,9 +420,26 @@ export function parseDuration(v: string | number | undefined, fallbackMs = 300_0
 	return Math.round(n * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000));
 }
 
+function rawVersion(raw: unknown): number {
+	return isObject(raw) && typeof raw.version === "number" && Number.isFinite(raw.version) ? raw.version : 1;
+}
+
+/**
+ * Bring settings from older config files up to date. Saved configs contain every key, so an old
+ * default is indistinguishable from an explicit choice: only values equal to the old default move.
+ */
+function migrateSettings(s: Settings, from: number): void {
+	if (from < 2) {
+		// v2: history.prepareThreshold 0.2 → 0.25, context.applyThreshold 0.25 → 0.35.
+		if (s.context.applyThreshold === 0.25) s.context.applyThreshold = 0.35;
+		if (s.history.prepareThreshold === 0.2 && s.context.applyThreshold > 0.25) s.history.prepareThreshold = 0.25;
+	}
+}
+
 export function normalizeSettings(input: unknown): Settings {
 	const raw = liftJudgeConnection(input);
 	const s = mergeInto(structuredClone(DEFAULT_SETTINGS), raw);
+	s.version = SETTINGS_VERSION;
 	const ttlRaw = isObject(raw) && isObject(raw.context) && isObject(raw.context.cacheTtlByModel) ? raw.context.cacheTtlByModel : {};
 	s.context.cacheTtlByModel = Object.fromEntries(Object.entries(ttlRaw).filter((e): e is [string, string] => typeof e[1] === "string"));
 	s.judge.concurrency = Math.round(clamp(s.judge.concurrency, 1, 16));
@@ -491,11 +514,23 @@ export function normalizeSettings(input: unknown): Settings {
 
 export function loadSettings(file: string): Settings {
 	if (!existsSync(file)) return structuredClone(DEFAULT_SETTINGS);
+	let raw: unknown;
 	try {
-		return normalizeSettings(JSON.parse(readFileSync(file, "utf8")));
+		raw = JSON.parse(readFileSync(file, "utf8"));
 	} catch {
 		return structuredClone(DEFAULT_SETTINGS);
 	}
+	const s = normalizeSettings(raw);
+	const from = rawVersion(raw);
+	if (from < SETTINGS_VERSION) {
+		migrateSettings(s, from);
+		try {
+			saveSettings(file, s);
+		} catch {
+			// read-only config: the migrated values still apply in memory
+		}
+	}
+	return s;
 }
 
 export function saveSettings(file: string, settings: Settings): void {

@@ -3,8 +3,11 @@
  * forged-tag stripping, expansion views, scheduler priority.
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { DEFAULT_SETTINGS, normalizeSettings, parseDuration } from "../src/config.ts";
+import { DEFAULT_SETTINGS, loadSettings, normalizeSettings, parseDuration, SETTINGS_VERSION } from "../src/config.ts";
 import type { OutputMeta } from "../src/outputs.ts";
 import { argsSignature, fmtTokens, summarizeArgs } from "../src/outputs.ts";
 import {
@@ -164,6 +167,37 @@ test("summaries, fact parsing, settings, durations", () => {
 	assert.equal("shadow" in s.judge, false, "the removed judge.shadow setting is dropped from old settings files");
 	assert.equal(s.context.applyThreshold, 0.8, "apply threshold never exceeds the emergency threshold");
 	assert.equal(normalizeSettings({}).capture.mode, "suggest");
+});
+
+test("settings: v1 config files move old threshold defaults to the v2 defaults and are rewritten", () => {
+	const dir = mkdtempSync(join(tmpdir(), "realctx-cfg-"));
+	try {
+		const file = join(dir, "config.json");
+		const old = (apply: number, prepare: number) => {
+			const v1: Record<string, unknown> = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>;
+			delete v1.version;
+			(v1.context as Record<string, unknown>).applyThreshold = apply;
+			(v1.history as Record<string, unknown>).prepareThreshold = prepare;
+			writeFileSync(file, JSON.stringify(v1));
+		};
+		old(0.25, 0.2);
+		const s = loadSettings(file);
+		assert.equal(s.context.applyThreshold, 0.35);
+		assert.equal(s.history.prepareThreshold, 0.25);
+		const saved = JSON.parse(readFileSync(file, "utf8"));
+		assert.equal(saved.version, SETTINGS_VERSION);
+		assert.equal(saved.context.applyThreshold, 0.35);
+		assert.equal(saved.history.prepareThreshold, 0.25);
+		old(0.3, 0.1);
+		assert.equal(loadSettings(file).context.applyThreshold, 0.3, "custom values stay");
+		assert.equal(loadSettings(file).history.prepareThreshold, 0.1);
+		old(0.22, 0.2);
+		assert.equal(loadSettings(file).history.prepareThreshold, 0.2, "prepare never moves above a custom apply threshold");
+		writeFileSync(file, JSON.stringify({ version: SETTINGS_VERSION, context: { applyThreshold: 0.25 } }));
+		assert.equal(loadSettings(file).context.applyThreshold, 0.25, "current-version files are not migrated");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("scheduler: one shared queue, highest priority first", async () => {

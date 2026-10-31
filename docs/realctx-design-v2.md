@@ -565,7 +565,7 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `rewriteModel` | session model | Pi model for Edit/Merge, extraction, summaries |
 | `history.enabled` | `true` | History compression on/off (§9.4) |
 | `history.model` | `rewriteModel`, else session model | The historian (`provider/model`) |
-| `history.prepareThreshold` | `0.2` | Safe-window usage at which parts are prepared |
+| `history.prepareThreshold` | `0.25` | Safe-window usage at which parts are prepared |
 | `history.protectTurns` | `8` | Recent agent turns never compressed |
 | `history.minChunkTokens`, `history.maxChunkTokens` | `6000`, `30000` | Size of one part |
 | `history.summaryMaxTokens`, `history.storyTokens` | `1500`, `3000` | Summary bound; earlier parts passed for continuity |
@@ -581,7 +581,7 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `context.protectedTools` | `["todo", "todo_write", "TodoWrite", "skill"]` | Never dropped (latest instance for snapshots) |
 | `context.pDrop`, `context.pUnique`, `context.pKeep` | `0.15`, `0.3`, `0.5` | Policy thresholds (§7.3) |
 | `context.minConfidence` | `0.7` | Min judge confidence to act |
-| `context.applyThreshold` | `0.25` | Safe-window usage that applies queued drops |
+| `context.applyThreshold` | `0.35` | Safe-window usage that applies queued drops |
 | `context.emergencyThreshold` | `0.9` | Emergency reclaim |
 | `context.cacheTtl`, `context.cacheTtlByModel` | `"5m"`, `{}` | Provider cache lifetime; per-model override |
 | `context.expandMaxTokens` | `4000` | Cap per expansion |

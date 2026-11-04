@@ -61,8 +61,12 @@ their "user" messages, which are the parent agent's prompts.
   changes. Summaries come from the rewrite model, with a deterministic fallback.
 - Drop and summarize verdicts are queued and applied with the next pass (below).
   `/realctx recent` lists the latest drops, verdicts, summaries and history parts.
-- The status line reads `🧠 <memories> · 📉 −<reclaimed>`, followed by a spinner while
-  realctx is judging or calling a model in the background.
+- The status line reads `🧠 <memories> · 📉 −<reclaimed> · 📊 <usage>%`, followed by a
+  spinner while realctx is judging or calling a model in the background. `📊` is realctx's
+  estimate of the context it actually sends, as a share of the model's full context window.
+  Pi's own footer percentage counts the raw transcript (dropped outputs and compressed
+  history in full) whenever it cannot reuse the last response's usage, e.g. after a
+  network-error retry, so it can read much higher, even above 100%.
 
 **Applying** rewrites earlier messages, which costs a prompt-cache rebuild, so queued
 drops are applied together, in one pass, only when the cache is cold (`context.cacheTtl`,

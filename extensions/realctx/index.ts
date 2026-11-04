@@ -266,7 +266,12 @@ export default function realctx(pi: ExtensionAPI) {
 			const setup = e.semifClient.configured ? "" : " · setup: /realctx settings";
 			const st = layer.status();
 			const ctxPart = st.active ? ` · 📉 ${st.applied ? `−${compactTokens(st.reclaimed)}` : "0"}${st.queued ? ` (+${st.queued} queued)` : ""}` : "";
-			statusBase = { ctx, text: `🧠 ${n}${pending ? ` (+${pending} queued)` : ""}${ctxPart}`, setup };
+			// realctx's own estimate of the context it sends, as a share of the model's full window
+			// (like Pi's footer). Pi's footer re-estimates the raw transcript after a retry, so it
+			// can read far higher than what the model actually receives.
+			const ctxWindow = ctx.model?.contextWindow ?? 0;
+			const usagePart = st.active && st.usage && ctxWindow > 0 ? ` · 📊 ${Math.round((st.usage.tokens / ctxWindow) * 100)}%` : "";
+			statusBase = { ctx, text: `🧠 ${n}${pending ? ` (+${pending} queued)` : ""}${ctxPart}${usagePart}`, setup };
 			syncSpinner();
 			renderStatus();
 		} catch {
@@ -575,6 +580,8 @@ export default function realctx(pi: ExtensionAPI) {
 		// SAFETY: `out` holds the original AgentMessages, same-shape copies of tool results, and
 		// `custom` history messages built by chunkMessage (role, customType, content, display,
 		// timestamp: the CustomMessage shape), so it is still an AgentMessage[] at runtime.
+		// The usage estimate changed: keep the status line's percentage current.
+		refreshStatus(ctx);
 		return out ? { messages: out as unknown as typeof event.messages } : undefined;
 	});
 

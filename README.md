@@ -349,9 +349,15 @@ Moving a memory between stores (manage page) re-expresses its paths.
   in the list); `/realctx debug` shows what the judge gave a candidate (`p` sets its paths).
 - **Recall ranks, never filters, by path**: memories covering the given or recently
   touched paths come first, project-wide ones next, those about other areas last.
-- **Missing paths.** At session start, scopes that no longer exist are flagged (✗ in
-  `/realctx manage`), with a suggested new location taken from `git log` renames
-  (press `f` to apply it).
+- **Moved files.** Memory paths follow files that git shows were moved: renames in
+  the last 300 commits, renames staged with `git mv`, and plain `mv`s where a deleted
+  tracked file's exact content shows up as one untracked file (directories follow the
+  majority of their files). With `paths.autoRename` (default on) realctx rewrites these
+  paths at session start and after turns (at most every 30 s) and tells you which ones
+  it changed. Subagent sessions leave this to their parent.
+- **Missing paths.** At session start, scopes that still don't exist are flagged (✗ in
+  `/realctx manage`, which shows where moved paths went; press `f` to follow them).
+  `/realctx prune-paths` cleans them up (see below).
 - **Counters.** `used_count` (recall and reinforce) drives sorting. `path_inject_count`
   records automatic displays and never affects ranking.
 
@@ -408,7 +414,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace, the path urgency (tier, per-level probabilities, what the write would store; `p` sets candidate paths) and the rewrite diff; `w` writes it for real |
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
-| `prune-paths` | drop paths that no longer exist from memories (after a confirm listing the changes); a memory whose paths are all gone is deleted |
+| `prune-paths` | review memories that refer to missing paths, then apply all changes or approve each one: moved paths follow the file, deleted paths are dropped, and a memory with no paths left becomes project-wide (`~` for global; you can delete it during the review instead). A path that git only knows from another branch or a stash is kept, so switching branches never prunes anything. Without a UI, every change except deletion is applied |
 | `consolidate [global] [shared] [personal] [--no-paths]` | shrink and clean the memory base (see below); fully automatic, writes the result and reports what changed |
 | `fix-gitignore` | check whether `.pi/realctx` is ignored by git and append the verified fix |
 | `conflicts [enable\|disable <name>]` | other context managers next to realctx: list, re-enable or disable them |

@@ -108,10 +108,10 @@ From realmem:
 
 | Hook / API | Context layer | Memory layer |
 |---|---|---|
-| `session_start` | Restore ID registry, drop set, pins; adopt a parent's originals (§13.6); warn about and disable other context managers (§12.3) | Migrate realmem data, resolve project key, check missing paths and `.gitignore`, prune expired outputs, scheduled consolidation check |
+| `session_start` | Restore ID registry, drop set, pins; adopt a parent's originals (§13.6); warn about and disable other context managers (§12.3) | Migrate realmem data, resolve project key, follow moved paths (`paths.autoRename`), check missing paths and `.gitignore`, prune expired outputs, scheduled consolidation check |
 | `before_agent_start` | — | Build or replay the `<realctx>` snapshot |
 | `tool_result` | Capture original into output store | Compute touched paths, append path notes |
-| `turn_end` | Persist registry and drops; queue drop candidates (background) | Persist shown-note ids (`realctx-shown`); user-message capture (background) |
+| `turn_end` | Persist registry and drops; queue drop candidates (background) | Persist shown-note ids (`realctx-shown`); user-message capture (background); follow moved paths (at most every 30 s) |
 | `message_end` | Usage and cache telemetry per response | — |
 | `input` | — | Mark extension-sent messages as not the user's |
 | `session_tree`, `session_compact` | Rebuild the drop set for the new branch | Rebuild shown-note ids |
@@ -599,6 +599,8 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `capture.userMessages`, `capture.userMinChars` | `true`, `24` | User-message capture (§13.1) |
 | `thresholds.urgencyHigh`, `thresholds.urgencyMid` | `1.5`, `0.75` | Path-note urgency tiers |
 | `paths.maxFull`, `paths.maxCaptions`, `paths.charBudget` | `3`, `8`, `6000` | Per-result path-note limits |
+| `paths.staleCheck` | `true` | Flag memories whose paths no longer exist at session start |
+| `paths.autoRename` | `true` | Rewrite memory paths that git shows were moved (history, staged, content-matched `mv`) at session start and after turns |
 | `consolidate.neighbors` | `12` | Same-store neighbours reviewed |
 | `consolidate.forget`, `consolidate.revise` | `0.7`, `0.7` | Probability thresholds |
 | `consolidate.minImportance` | `0.5` | Below this: forget |

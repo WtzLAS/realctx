@@ -182,6 +182,11 @@ export interface Settings {
 		charBudget: number;
 		/** Check path scopes against the working tree and flag missing ones. */
 		staleCheck: boolean;
+		/**
+		 * Rewrite memory paths that git shows were moved (committed, staged or plain `mv`
+		 * matched by content), at session start and after turns.
+		 */
+		autoRename: boolean;
 	};
 	prompt: {
 		/** Number of most-used captions injected into the session system prompt. */
@@ -328,6 +333,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		maxCaptions: 8,
 		charBudget: 6000,
 		staleCheck: true,
+		autoRename: true,
 	},
 	prompt: {
 		topCaptions: 20,

@@ -84,7 +84,10 @@ function memoryLines(engine: MemoryEngine, m: MemoryRow): (theme: Theme) => stri
 		];
 		const urgency = urgencyLines(engine, m);
 		const ps = engine.db.getPathState(m.store, m.id);
-		if (ps) meta.push(["missing", `${ps.missing.join(", ")}${ps.suggestion ? ` → moved to ${ps.suggestion}? (press f)` : ""}`]);
+		if (ps) {
+			const moved = Object.keys(ps.renames).length > 0;
+			meta.push(["missing", `${ps.missing.map((p) => (ps.renames[p] ? `${p} → ${ps.renames[p]}` : p)).join(", ")}${moved ? " (moved: press f)" : ""}`]);
+		}
 		if (m.flags) meta.push(["quarantine", m.flags]);
 		const out = [t.bold(m.caption), ""];
 		for (const [k, v] of meta) out.push(`${t.fg("muted", k.padEnd(10))} ${k === "quarantine" || k === "missing" ? t.fg("warning", v) : v}`);
@@ -110,7 +113,7 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: MemoryEngine, in
 			{ id: "edit" as const, key: "e", label: "edit content" },
 			{ id: "caption" as const, key: "c", label: "caption" },
 			{ id: "paths" as const, key: "p", label: "paths" },
-			...(engine.db.getPathState(m.store, m.id)?.suggestion ? [{ id: "fix" as const, key: "f", label: "apply suggested path" }] : []),
+			...(Object.keys(engine.db.getPathState(m.store, m.id)?.renames ?? {}).length > 0 ? [{ id: "fix" as const, key: "f", label: "follow moved paths" }] : []),
 			{ id: "move" as const, key: "m", label: "move scope" },
 			{ id: "delete" as const, key: "d", label: "delete" },
 			...(m.flags ? [{ id: "approve" as const, key: "a", label: "approve (unquarantine)" }] : []),
@@ -145,8 +148,8 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: MemoryEngine, in
 				}
 				case "fix": {
 					const ps = engine.db.getPathState(cur.store, cur.id);
-					if (ps?.suggestion && ps.missing.length === 1) {
-						const paths = (cur.paths ?? []).map((p) => (p === ps.missing[0] ? (ps.suggestion as string) : p));
+					if (ps && Object.keys(ps.renames).length > 0) {
+						const paths = (cur.paths ?? []).map((p) => ps.renames[p] ?? p);
 						m = await engine.updateMemory(ctx.cwd, cur, { paths });
 						engine.checkPaths(ctx.cwd);
 					}

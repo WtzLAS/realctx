@@ -68,7 +68,8 @@ export interface UrgencyRow {
 
 export interface PathStateRow {
 	missing: string[];
-	suggestion: string | null;
+	/** missing scope → where git says it moved (stored as JSON in the `suggestion` column). */
+	renames: Record<string, string>;
 }
 
 export interface UpsertMemory {
@@ -129,6 +130,21 @@ function parsePaths(value: SQLInputValue | undefined): string[] | undefined {
 		return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : undefined;
 	} catch {
 		return undefined;
+	}
+}
+
+/** `path_state.suggestion`: a JSON map missing → new path (older rows: one plain path for a single missing scope). */
+function parseRenames(value: SQLInputValue | undefined, missing: string[]): Record<string, string> {
+	if (typeof value !== "string" || !value) return {};
+	if (!value.startsWith("{")) return missing.length === 1 ? { [missing[0]]: value } : {};
+	try {
+		const parsed: unknown = JSON.parse(value);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const out: Record<string, string> = {};
+		for (const [k, v] of Object.entries(parsed)) if (typeof v === "string" && missing.includes(k)) out[k] = v;
+		return out;
+	} catch {
+		return {};
 	}
 }
 
@@ -859,17 +875,18 @@ export class RealctxDB {
 	getPathState(store: string, id: string): PathStateRow | undefined {
 		const r = this.stmt("SELECT missing, suggestion FROM path_state WHERE store = ? AND id = ?").get(store, id) as Row | undefined;
 		if (!r) return undefined;
-		return { missing: parsePaths(r.missing) ?? [], suggestion: r.suggestion === null ? null : String(r.suggestion) };
+		const missing = parsePaths(r.missing) ?? [];
+		return { missing, renames: parseRenames(r.suggestion, missing) };
 	}
 
-	setPathState(store: string, id: string, basis: string, missing: string[], suggestion: string | undefined): void {
+	setPathState(store: string, id: string, basis: string, missing: string[], renames: Record<string, string> = {}): void {
 		if (missing.length === 0) {
 			this.stmt("DELETE FROM path_state WHERE store = ? AND id = ?").run(store, id);
 			return;
 		}
 		this.stmt(
 			"INSERT INTO path_state(store, id, basis, missing, suggestion, checked) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, id) DO UPDATE SET basis = excluded.basis, missing = excluded.missing, suggestion = excluded.suggestion, checked = excluded.checked",
-		).run(store, id, basis, JSON.stringify(missing), suggestion ?? null, Date.now());
+		).run(store, id, basis, JSON.stringify(missing), Object.keys(renames).length > 0 ? JSON.stringify(renames) : null, Date.now());
 	}
 
 	stalePathIds(stores: string[]): Set<string> {

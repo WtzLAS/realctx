@@ -53,6 +53,7 @@ import {
 } from "./consolidate.ts";
 import {
 	absoluteScopes,
+	classifyMissing,
 	clearRepoCache,
 	coverSpecificity,
 	fromAbsoluteScope,
@@ -64,6 +65,7 @@ import {
 	scopeCovers,
 	scopeExists,
 	suggestRename,
+	type RepoFiles,
 	toAbsoluteScope,
 } from "./paths.ts";
 
@@ -131,6 +133,36 @@ export interface RecallResult {
 	embedError?: string;
 	/** Project-relative paths the ranking favoured. */
 	focus?: string[];
+}
+
+const NO_GIT: RepoFiles = { isGit: false, head: "", files: undefined, renames: new Map() };
+
+/** What pruning does with one memory that refers to missing paths. */
+export interface PathPruneChange {
+	memory: MemoryRow;
+	/** Missing path → where git says it moved. */
+	renames: Record<string, string>;
+	/** Missing paths that were deleted (or never known to git): removed. */
+	dropped: string[];
+	/** Missing paths git has only seen on other refs (another branch): kept. */
+	kept: string[];
+	/** Paths after the change; empty = every path is gone (the memory becomes project-wide / global). */
+	paths: string[];
+}
+
+export interface PathPrunePlan {
+	changes: PathPruneChange[];
+	/** Memories whose missing paths are all kept (only on other branches): left alone. */
+	skipped: Array<{ memory: MemoryRow; paths: string[] }>;
+}
+
+export interface PathPruneResult {
+	updated: MemoryRow[];
+	/** Memories left without paths, now scoped to the whole project / user directory. */
+	unscoped: MemoryRow[];
+	deleted: MemoryRow[];
+	/** Memories changed since the plan: not touched. */
+	stale: MemoryRow[];
 }
 
 /** Key under which a path urgency stays valid: the memory's content and its paths. */
@@ -541,14 +573,19 @@ export class MemoryEngine {
 		return this.urgencyPromise;
 	}
 
-	/** Flag path-scoped memories whose paths no longer exist (with a rename suggestion from git). */
+	private repoFor(cwd: string): RepoFiles {
+		const project = this.scopes(cwd).project;
+		return project ? repoFiles(project.root, project.isGit) : NO_GIT;
+	}
+
+	/** Flag path-scoped memories whose paths no longer exist (with rename suggestions from git). */
 	checkPaths(cwd: string, force = false): { checked: number; stale: number } {
 		const ctx = this.scopes(cwd);
 		if (!force && !this.settings.paths.staleCheck) return { checked: 0, stale: 0 };
-		const noGit = { head: "", files: undefined, renames: new Map<string, string>() };
-		const repo = ctx.project ? repoFiles(ctx.project.root, ctx.project.isGit) : noGit;
-		let stale = 0;
 		const rows = this.db.scopedPaths(ctx.stores.map((s) => s.id));
+		if (rows.length === 0) return { checked: 0, stale: 0 };
+		const repo = this.repoFor(cwd);
+		let stale = 0;
 		this.db.tx(() => {
 			for (const m of rows) {
 				// Project scopes are checked against the working tree (globs via git); global
@@ -557,9 +594,15 @@ export class MemoryEngine {
 				if (!root) continue;
 				// Global scopes are `~`, `~/…` or absolute: resolve them, never join an absolute path onto `~`.
 				const target = (p: string) => (m.kind === "global" ? (toAbsoluteScope(p, "global", undefined) ?? p) : p);
-				const missing = m.paths.filter((p) => !scopeExists(root, target(p), m.kind === "global" ? noGit : repo));
-				const suggestion = m.kind !== "global" && missing.length === 1 ? suggestRename(missing[0], repo, root) : undefined;
-				this.db.setPathState(m.store, m.id, m.hash, missing, suggestion);
+				const missing = m.paths.filter((p) => !scopeExists(root, target(p), m.kind === "global" ? NO_GIT : repo));
+				const renames: Record<string, string> = {};
+				if (m.kind !== "global") {
+					for (const p of missing) {
+						const to = suggestRename(p, repo, root);
+						if (to) renames[p] = to;
+					}
+				}
+				this.db.setPathState(m.store, m.id, m.hash, missing, renames);
 				if (missing.length > 0) stale++;
 			}
 		});
@@ -567,35 +610,109 @@ export class MemoryEngine {
 	}
 
 	/**
-	 * Drop paths that no longer exist from path-scoped memories; a memory whose paths are
-	 * all gone is deleted. `dryRun` only reports what would change.
+	 * Rewrite the paths of project memories that git shows were moved: renames in recent
+	 * commits, staged renames, and plain moves matched by content (`paths.autoRename`).
+	 * Refreshes the working-tree listing first; returns the memories it rewrote.
 	 */
-	async prunePaths(
-		cwd: string,
-		opts: { dryRun?: boolean } = {},
-	): Promise<{ updated: Array<{ memory: MemoryRow; removed: string[] }>; deleted: MemoryRow[] }> {
+	async followRenames(cwd: string): Promise<Array<{ memory: MemoryRow; renames: Record<string, string> }>> {
+		if (!this.settings.paths.autoRename) return [];
+		const ctx = this.scopes(cwd);
+		if (!ctx.project?.isGit) return [];
+		const ids = ctx.stores.filter((s) => s.kind !== "global").map((s) => s.id);
+		const rows = this.db.scopedPaths(ids);
+		if (rows.length === 0) return [];
+		clearRepoCache();
+		this.checkPaths(cwd, true);
+		const out: Array<{ memory: MemoryRow; renames: Record<string, string> }> = [];
+		for (const s of rows) {
+			const ps = this.db.getPathState(s.store, s.id);
+			if (!ps || Object.keys(ps.renames).length === 0) continue;
+			const row = this.db.getById(s.id, [s.store]);
+			if (!row?.paths) continue;
+			const paths = row.paths.map((p) => ps.renames[p] ?? p);
+			out.push({ memory: await this.updateMemory(cwd, row, { paths }), renames: ps.renames });
+		}
+		if (out.length > 0) this.checkPaths(cwd, true);
+		return out;
+	}
+
+	/**
+	 * Plan what pruning would do with each memory that refers to missing paths: moved
+	 * paths are rewritten, deleted ones dropped (a memory left without paths becomes
+	 * project-wide / global), and paths git cannot place (only on other branches) kept.
+	 */
+	planPrune(cwd: string): PathPrunePlan {
 		this.sync(cwd);
 		this.resetRepoCache();
 		this.checkPaths(cwd, true);
 		const ctx = this.scopes(cwd);
-		const updated: Array<{ memory: MemoryRow; removed: string[] }> = [];
-		const deleted: MemoryRow[] = [];
+		const repo = this.repoFor(cwd);
+		const verdicts = new Map<string, "deleted" | "unknown">();
+		const classify = (p: string): "deleted" | "unknown" => {
+			const root = ctx.project?.root;
+			if (!root) return "unknown";
+			let v = verdicts.get(p);
+			if (!v) verdicts.set(p, (v = classifyMissing(p, repo, root)));
+			return v;
+		};
+		const plan: PathPrunePlan = { changes: [], skipped: [] };
 		for (const s of this.db.scopedPaths(ctx.stores.map((x) => x.id))) {
-			const missing = this.db.getPathState(s.store, s.id)?.missing ?? [];
-			if (missing.length === 0) continue;
+			const ps = this.db.getPathState(s.store, s.id);
+			if (!ps || ps.missing.length === 0) continue;
 			const row = this.db.getById(s.id, [s.store]);
 			if (!row) continue;
-			const keep = (row.paths ?? []).filter((p) => !missing.includes(p));
-			if (keep.length === 0) {
-				if (!opts.dryRun) await this.deleteMemory(row);
-				deleted.push(row);
+			const renames: Record<string, string> = {};
+			const dropped: string[] = [];
+			const kept: string[] = [];
+			for (const p of ps.missing) {
+				if (ps.renames[p]) renames[p] = ps.renames[p];
+				else if ((s.kind === "global" ? "deleted" : classify(p)) === "deleted") dropped.push(p);
+				else kept.push(p);
+			}
+			if (Object.keys(renames).length === 0 && dropped.length === 0) {
+				plan.skipped.push({ memory: row, paths: kept });
+				continue;
+			}
+			const paths = [...new Set((row.paths ?? []).filter((p) => !dropped.includes(p)).map((p) => renames[p] ?? p))];
+			plan.changes.push({ memory: row, renames, dropped, kept, paths });
+		}
+		return plan;
+	}
+
+	/**
+	 * Apply reviewed prune changes: "apply" writes the planned paths (a memory left without
+	 * paths gets the whole-root scope), "delete" deletes the memory. Memories edited since
+	 * the plan are skipped and reported as stale.
+	 */
+	async applyPrune(cwd: string, decisions: Array<{ change: PathPruneChange; action: "apply" | "delete" }>): Promise<PathPruneResult> {
+		const out: PathPruneResult = { updated: [], unscoped: [], deleted: [], stale: [] };
+		for (const { change, action } of decisions) {
+			const row = this.db.getById(change.memory.id, [change.memory.store]);
+			if (!row || row.hash !== change.memory.hash || JSON.stringify(row.paths) !== JSON.stringify(change.memory.paths)) {
+				out.stale.push(change.memory);
+				continue;
+			}
+			if (action === "delete") {
+				await this.deleteMemory(row);
+				out.deleted.push(row);
+			} else if (change.paths.length === 0) {
+				out.unscoped.push(await this.updateMemory(cwd, row, { paths: [row.kind === "global" ? "~" : "."] }));
 			} else {
-				const out = opts.dryRun ? row : await this.updateMemory(cwd, row, { paths: keep });
-				updated.push({ memory: out, removed: missing });
+				out.updated.push(await this.updateMemory(cwd, row, { paths: change.paths }));
 			}
 		}
-		if (!opts.dryRun && updated.length > 0) this.checkPaths(cwd, true);
-		return { updated, deleted };
+		if (out.updated.length + out.unscoped.length + out.deleted.length > 0) this.checkPaths(cwd, true);
+		return out;
+	}
+
+	/** Plan and apply every change without review (never deletes a memory). */
+	async prunePaths(cwd: string): Promise<PathPruneResult & { plan: PathPrunePlan }> {
+		const plan = this.planPrune(cwd);
+		const r = await this.applyPrune(
+			cwd,
+			plan.changes.map((change) => ({ change, action: "apply" as const })),
+		);
+		return { ...r, plan };
 	}
 
 	/** Delete memories by id (full id or unique prefix). */

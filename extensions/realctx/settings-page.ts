@@ -264,6 +264,17 @@ function fields(): FieldDef[] {
 			values: ["on", "off"],
 		},
 		{
+			id: "paths.autoRename",
+			label: "Follow moved files",
+			description: "Rewrite memory paths that git shows were moved (commits, git mv, or a plain mv matched by content), at session start and after turns.",
+			get: (s) => (s.paths.autoRename ? "on" : "off"),
+			set: (s, v) => {
+				s.paths.autoRename = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		{
 			id: "paths.maxFull",
 			label: "Path notes: max full",
 			description: "Max memories shown in full per tool result (others fall back to captions).",

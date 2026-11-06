@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -260,7 +260,7 @@ test("hand-written scoped memories get urgency in the background; missing paths 
 		e.resetRepoCache();
 		const res = e.checkPaths(proj);
 		assert.equal(res.stale, 1);
-		assert.deepEqual(e.db.getPathState(m.store, m.id), { missing: ["web/app.ts"], suggestion: "frontend/app.ts" });
+		assert.deepEqual(e.db.getPathState(m.store, m.id), { missing: ["web/app.ts"], renames: { "web/app.ts": "frontend/app.ts" } });
 		// Fixing the path clears the flag, and invalidates the urgency (judged for the old paths).
 		const fixed = await e.updateMemory(proj, m, { paths: ["frontend/app.ts"] });
 		e.checkPaths(proj);
@@ -271,7 +271,7 @@ test("hand-written scoped memories get urgency in the background; missing paths 
 	}
 });
 
-test("prunePaths drops missing paths and deletes memories whose paths are all gone; forget deletes by id", async () => {
+test("prunePaths drops missing paths and unscopes memories whose paths are all gone; forget deletes by id", async () => {
 	clearProjectCache();
 	const e = new MemoryEngine();
 	try {
@@ -286,19 +286,130 @@ test("prunePaths drops missing paths and deletes memories whose paths are all go
 		);
 		e.sync(proj);
 		const stores = () => e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 999, offset: 0 });
-		const dry = await e.prunePaths(proj, { dryRun: true });
-		assert.ok(dry.updated.some((u) => u.memory.caption === "PRUNE partial" && u.removed.join() === "gone/a.ts"));
-		assert.ok(dry.deleted.some((m) => m.caption === "PRUNE all gone"));
-		assert.ok(stores().some((m) => m.caption === "PRUNE all gone"), "dry run changes nothing");
-		await e.prunePaths(proj);
+		const plan = e.planPrune(proj);
+		assert.ok(plan.changes.some((c) => c.memory.caption === "PRUNE partial" && c.dropped.join() === "gone/a.ts" && c.paths.join() === "db"));
+		assert.ok(plan.changes.some((c) => c.memory.caption === "PRUNE all gone" && c.paths.length === 0), "never known to git: deleted");
+		assert.ok(stores().some((m) => m.caption === "PRUNE all gone" && m.paths?.join() === "gone/b.ts"), "planning changes nothing");
+		const res = await e.prunePaths(proj);
+		assert.equal(res.deleted.length, 0, "pruning without review never deletes a memory");
 		const after = stores();
-		assert.ok(!after.some((m) => m.caption === "PRUNE all gone"));
+		const gone = after.find((m) => m.caption === "PRUNE all gone");
+		assert.deepEqual(gone?.paths, ["."], "a memory without paths left becomes project-wide");
+		await e.deleteMemory(gone!);
 		const partial = after.find((m) => m.caption === "PRUNE partial");
 		assert.deepEqual(partial?.paths, ["db"]);
 		const r = await e.forget(proj, [partial!.id, "nonexistent-id"]);
 		assert.equal(r.deleted.length, 1);
 		assert.deepEqual(r.missing, ["nonexistent-id"]);
 		assert.ok(!stores().some((m) => m.caption === "PRUNE partial"));
+	} finally {
+		e.close();
+	}
+});
+
+const gitIn = (...args: string[]) => execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=t", ...args], { cwd: proj, encoding: "utf8" });
+
+function writeMem(n: string, caption: string, paths: string[]): void {
+	const id = `01900000-0000-7000-8000-0000000000${n}`;
+	writeFileSync(
+		join(proj, ".pi", "realctx", `${id}.md`),
+		`---\nid: ${id}\ncaption: ${caption}\npaths:\n${paths.map((p) => `  - ${p}`).join("\n")}\n---\n\nBody of ${caption}.\n`,
+	);
+}
+
+test("followRenames follows staged renames and plain moves (by content), several paths per memory", async () => {
+	clearProjectCache();
+	const e = new MemoryEngine();
+	try {
+		mkdirSync(join(proj, "mvsrc"), { recursive: true });
+		mkdirSync(join(proj, "lib"), { recursive: true });
+		writeFileSync(join(proj, "mvsrc", "one.ts"), "export const one = 1;\n");
+		writeFileSync(join(proj, "mvsrc", "two.ts"), "export const two = 2;\n");
+		writeFileSync(join(proj, "lib", "three.ts"), "export const three = 3;\n");
+		gitIn("add", "mvsrc", "lib");
+		gitIn("commit", "-qm", "files to move");
+		writeMem("d1", "FOLLOW two files", ["mvsrc/one.ts", "mvsrc/two.ts"]);
+		writeMem("d2", "FOLLOW directory", ["mvsrc"]);
+		writeMem("d3", "FOLLOW staged", ["lib/three.ts", "db"]);
+		e.sync(proj);
+
+		renameSync(join(proj, "mvsrc"), join(proj, "moved")); // plain mv: untracked destination
+		gitIn("mv", "lib/three.ts", "lib/3.ts"); // staged rename
+		const moved = await e.followRenames(proj);
+		assert.equal(moved.length, 3, JSON.stringify(moved.map((m) => m.renames)));
+		const byCaption = (c: string) => e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 999, offset: 0 }).find((m) => m.caption === c);
+		assert.deepEqual([...(byCaption("FOLLOW two files")?.paths ?? [])].sort(), ["moved/one.ts", "moved/two.ts"]);
+		assert.deepEqual(byCaption("FOLLOW directory")?.paths, ["moved"]);
+		assert.deepEqual([...(byCaption("FOLLOW staged")?.paths ?? [])].sort(), ["db", "lib/3.ts"]);
+		assert.equal(e.checkPaths(proj, true).stale, 0, "nothing left missing");
+		assert.deepEqual(await e.followRenames(proj), [], "idempotent");
+		for (const c of ["FOLLOW two files", "FOLLOW directory", "FOLLOW staged"]) await e.deleteMemory(byCaption(c)!);
+		gitIn("add", "-A", "moved", "mvsrc", "lib");
+		gitIn("commit", "-qm", "moved");
+	} finally {
+		e.close();
+	}
+});
+
+test("prune review: deleted paths are dropped, other-branch paths kept, an all-gone memory is unscoped or deleted by choice", async () => {
+	clearProjectCache();
+	const e = new MemoryEngine();
+	try {
+		const main = gitIn("rev-parse", "--abbrev-ref", "HEAD").trim();
+		gitIn("checkout", "-q", "-b", "feature-x");
+		mkdirSync(join(proj, "feat"), { recursive: true });
+		writeFileSync(join(proj, "feat", "only.ts"), "export const f = 1;\n");
+		gitIn("add", "feat");
+		gitIn("commit", "-qm", "feature only");
+		gitIn("checkout", "-q", main);
+		mkdirSync(join(proj, "del"), { recursive: true });
+		writeFileSync(join(proj, "del", "x.ts"), "export const x = 1;\n");
+		writeFileSync(join(proj, "del", "y.ts"), "export const y = 1;\n");
+		gitIn("add", "del");
+		gitIn("commit", "-qm", "to delete");
+		gitIn("rm", "-q", "-r", "del");
+		gitIn("commit", "-qm", "deleted");
+
+		writeMem("e1", "PRUNEREV branch only", ["feat/only.ts"]);
+		writeMem("e2", "PRUNEREV mixed", ["feat/only.ts", "del/x.ts", "db"]);
+		writeMem("e3", "PRUNEREV unscope", ["del/x.ts"]);
+		writeMem("e4", "PRUNEREV delete", ["del/y.ts"]);
+		e.sync(proj);
+
+		const plan = e.planPrune(proj);
+		const change = (c: string) => plan.changes.find((x) => x.memory.caption === c);
+		assert.deepEqual(plan.skipped.map((s) => s.memory.caption), ["PRUNEREV branch only"], "only on another branch: left alone");
+		assert.deepEqual(change("PRUNEREV mixed")?.dropped, ["del/x.ts"]);
+		assert.deepEqual(change("PRUNEREV mixed")?.kept, ["feat/only.ts"]);
+		assert.deepEqual([...(change("PRUNEREV mixed")?.paths ?? [])].sort(), ["db", "feat/only.ts"]);
+		assert.deepEqual(change("PRUNEREV unscope")?.paths, []);
+
+		const { prunePathsCommand } = await import("../extensions/realctx/prune-page.ts");
+		const notes: string[] = [];
+		const titles: string[] = [];
+		const ctx = {
+			cwd: proj,
+			hasUI: true,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				custom: async () => "review",
+				select: async (title: string, options: string[]) => {
+					titles.push(title);
+					if (title.includes("PRUNEREV delete")) return "Delete the memory";
+					return options[0];
+				},
+			},
+		};
+		await prunePathsCommand(ctx as any, e);
+		assert.equal(titles.length, 3, titles.join("\n"));
+		const rows = e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 999, offset: 0 });
+		const row = (c: string) => rows.find((m) => m.caption === c);
+		assert.deepEqual(row("PRUNEREV branch only")?.paths, ["feat/only.ts"]);
+		assert.deepEqual([...(row("PRUNEREV mixed")?.paths ?? [])].sort(), ["db", "feat/only.ts"]);
+		assert.deepEqual(row("PRUNEREV unscope")?.paths, ["."]);
+		assert.equal(row("PRUNEREV delete"), undefined, "deleted by choice");
+		assert.match(notes.at(-1) ?? "", /updated paths of 1 memory, made 1 unscoped.*deleted 1, left 1 alone/);
+		for (const c of ["PRUNEREV branch only", "PRUNEREV mixed", "PRUNEREV unscope"]) await e.deleteMemory(row(c)!);
 	} finally {
 		e.close();
 	}
@@ -323,7 +434,7 @@ test("global absolute paths outside the user directory are checked as absolute, 
 		e.checkPaths(proj, true);
 		assert.deepEqual(e.db.getPathState(m.store, m.id)?.missing, ["/nonexistent-realctx/xyz"]);
 		const pruned = await e.prunePaths(proj);
-		const after = pruned.updated.find((u) => u.memory.id === m.id)?.memory;
+		const after = pruned.updated.find((u) => u.id === m.id);
 		assert.deepEqual([...(after?.paths ?? [])].sort(), [outside, "~/.config/tool"].sort());
 		await e.deleteMemory(after ?? m);
 	} finally {

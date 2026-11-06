@@ -297,12 +297,13 @@ export function patchFiles(patch: string): string[] {
 // Stale path detection
 // ---------------------------------------------------------------------------
 
-function git(cwd: string, args: string[]): string | undefined {
+function git(cwd: string, args: string[], input?: string): string | undefined {
 	try {
 		return execFileSync("git", args, {
 			cwd,
 			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
+			input,
+			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
 			timeout: 10_000,
 			maxBuffer: 64 * 1024 * 1024,
 			env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
@@ -313,41 +314,117 @@ function git(cwd: string, args: string[]): string | undefined {
 }
 
 export interface RepoFiles {
+	isGit: boolean;
 	head: string;
 	/** Tracked + untracked (non-ignored) files, project-relative. */
 	files: string[] | undefined;
-	/** old path → new path (renames recorded in recent history, chains resolved). */
+	/**
+	 * old path → new path: renames recorded in recent history (chains resolved), plus
+	 * uncommitted ones: renames staged in the index (`git mv`) and tracked files deleted
+	 * from the working tree whose exact content reappears as one untracked file (`mv`).
+	 */
 	renames: Map<string, string>;
 }
 
 const repoCache = new Map<string, RepoFiles>();
+/** Renames recorded in history, by `root\0head` (immutable for a given HEAD). */
+const historyCache = new Map<string, Map<string, string>>();
 
-export function repoFiles(root: string, isGit: boolean): RepoFiles {
-	if (!isGit) return { head: "", files: undefined, renames: new Map() };
-	const head = git(root, ["rev-parse", "-q", "--verify", "HEAD"])?.trim() ?? "";
-	const cached = repoCache.get(root);
-	if (cached && cached.head === head) return cached;
-	const list = git(root, ["ls-files", "-co", "--exclude-standard", "-z"]);
-	const files = list === undefined ? undefined : list.split("\0").filter(Boolean);
+/** Apply rename pairs (oldest first) to `renames`, resolving chains forward. */
+function addRenames(renames: Map<string, string>, pairs: Array<[string, string]>): void {
+	for (const [from, to] of pairs) {
+		if (from === to) continue;
+		for (const [k, v] of renames) if (v === from) renames.set(k, to);
+		renames.set(from, to);
+		renames.delete(to); // a file renamed back is no longer moved
+	}
+}
+
+function historyRenames(root: string, head: string): Map<string, string> {
+	const key = `${root}\0${head}`;
+	const hit = historyCache.get(key);
+	if (hit) return hit;
 	const renames = new Map<string, string>();
 	const log = head ? git(root, ["log", "-M", "--diff-filter=R", "--name-status", "--format=", "-n", "300"]) : undefined;
 	if (log) {
-		// Newest first: a later rename of the same file wins, chains resolve forward.
+		// Newest first: replay oldest first so a later rename of the same file wins.
 		const pairs: Array<[string, string]> = [];
 		for (const line of log.split("\n")) {
 			const parts = line.split("\t");
 			if (parts.length === 3 && parts[0].startsWith("R")) pairs.push([parts[1], parts[2]]);
 		}
-		for (const [from, to] of pairs.reverse()) {
-			for (const [k, v] of renames) if (v === from) renames.set(k, to);
-			renames.set(from, to);
-		}
+		addRenames(renames, pairs.reverse());
 	}
-	const out = { head, files, renames };
+	if (historyCache.size > 32) historyCache.clear();
+	historyCache.set(key, renames);
+	return renames;
+}
+
+const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+/**
+ * Uncommitted renames: staged renames from `git status`, and tracked files deleted from
+ * the working tree whose content matches exactly one untracked file (a plain `mv`).
+ */
+function worktreeRenames(root: string, head: string): Array<[string, string]> {
+	if (!head) return [];
+	const status = git(root, ["-c", "status.renames=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+	if (!status) return [];
+	const out: Array<[string, string]> = [];
+	const deleted: string[] = [];
+	const untracked: string[] = [];
+	const parts = status.split("\0");
+	for (let i = 0; i < parts.length; i++) {
+		const entry = parts[i];
+		if (entry.length < 4) continue;
+		const xy = entry.slice(0, 2);
+		const path = entry.slice(3);
+		if (xy[0] === "R" || xy[0] === "C") {
+			const from = parts[++i]; // -z: "R  <to>\0<from>\0"
+			if (xy[0] === "R" && from) out.push([from, path]);
+		} else if (xy === "??") untracked.push(path);
+		else if (xy.includes("D")) deleted.push(path);
+	}
+	if (deleted.length === 0 || untracked.length === 0) return out;
+	// Content match: blob ids of the deleted files at HEAD against hashes of untracked files.
+	const tree = git(root, ["ls-tree", "-r", "-z", "HEAD", "--", ...deleted.slice(0, 500).map((p) => `:(literal)${p}`)]);
+	const hashes = git(root, ["hash-object", "--stdin-paths"], untracked.slice(0, 2000).join("\n"));
+	if (!tree || !hashes) return out;
+	const oldByBlob = new Map<string, string[]>();
+	for (const line of tree.split("\0")) {
+		const m = /^\d+ blob ([0-9a-f]+)\t(.+)$/.exec(line);
+		if (!m || m[1] === EMPTY_BLOB) continue;
+		oldByBlob.set(m[1], [...(oldByBlob.get(m[1]) ?? []), m[2]]);
+	}
+	const newByBlob = new Map<string, string[]>();
+	hashes
+		.split("\n")
+		.filter(Boolean)
+		.forEach((h, i) => {
+			if (h !== EMPTY_BLOB && untracked[i]) newByBlob.set(h, [...(newByBlob.get(h) ?? []), untracked[i]]);
+		});
+	for (const [blob, olds] of oldByBlob) {
+		const news = newByBlob.get(blob);
+		if (olds.length === 1 && news?.length === 1) out.push([olds[0], news[0]]);
+	}
+	return out;
+}
+
+export function repoFiles(root: string, isGit: boolean): RepoFiles {
+	if (!isGit) return { isGit: false, head: "", files: undefined, renames: new Map() };
+	const head = git(root, ["rev-parse", "-q", "--verify", "HEAD"])?.trim() ?? "";
+	const cached = repoCache.get(root);
+	if (cached && cached.head === head) return cached;
+	const list = git(root, ["ls-files", "-co", "--exclude-standard", "-z"]);
+	const files = list === undefined ? undefined : list.split("\0").filter(Boolean);
+	const renames = new Map(historyRenames(root, head));
+	addRenames(renames, worktreeRenames(root, head));
+	const out = { isGit: true, head, files, renames };
 	repoCache.set(root, out);
 	return out;
 }
 
+/** Forget working-tree listings (history renames stay cached per HEAD). */
 export function clearRepoCache(): void {
 	repoCache.clear();
 }
@@ -379,5 +456,31 @@ export function suggestRename(scope: string, repo: RepoFiles, root: string): str
 	let n = 0;
 	for (const [d, c] of votes) if (c > n) [best, n] = [d, c];
 	return best;
+}
+
+/**
+ * What happened to a missing project scope that git does not know as moved:
+ *  - "deleted": removed in this branch's history (renames count as deletions here, since
+ *    the destination is gone too), removed from the working tree since HEAD, or never
+ *    known to git at all (an untracked or ignored file that is gone);
+ *  - "unknown": git has seen it, but only on other refs (another branch, a stash), or git
+ *    failed. It may come back with a checkout, so pruning leaves it alone.
+ * Without git every missing scope counts as deleted.
+ */
+export function classifyMissing(scope: string, repo: RepoFiles, root: string): "deleted" | "unknown" {
+	if (!repo.isGit) return "deleted";
+	if (!repo.files) return "unknown"; // git failed
+	const spec = isGlob(scope) ? `:(glob)${scope}` : `:(literal)${scope}`;
+	if (repo.head) {
+		const del = git(root, ["log", "-1", "--format=%H", "--no-renames", "--diff-filter=D", "HEAD", "--", spec]);
+		if (del === undefined) return "unknown";
+		if (del.trim()) return "deleted";
+		const tracked = git(root, ["ls-tree", "-r", "--name-only", "HEAD", "--", spec]);
+		if (tracked === undefined) return "unknown";
+		if (tracked.trim()) return "deleted"; // deleted in the working tree, not committed yet
+	}
+	const elsewhere = git(root, ["log", "--all", "-1", "--format=%H", "--", spec]);
+	if (elsewhere === undefined) return "unknown";
+	return elsewhere.trim() ? "unknown" : "deleted";
 }
 

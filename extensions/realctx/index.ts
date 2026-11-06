@@ -28,6 +28,7 @@ import { agentDirFromEnv } from "../../src/config.ts";
 import { openDebug } from "./debug-page.ts";
 import { PathNoteState } from "./path-notes.ts";
 import { openManage } from "./manage-page.ts";
+import { prunePathsCommand } from "./prune-page.ts";
 import { openSettings } from "./settings-page.ts";
 import { historianFor, registerTools, rewriterFor } from "./tools.ts";
 import { runWithLoader, showText } from "./ui.ts";
@@ -60,7 +61,7 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "embed", description: "embed memories that have no vector yet" },
 	{ name: "reindex", description: "clear the embedding cache and re-embed everything" },
 	{ name: "retry", description: "retry candidates queued while the judge was unreachable" },
-	{ name: "prune-paths", description: "drop paths that no longer exist; delete memories whose paths are all gone" },
+	{ name: "prune-paths", description: "review missing paths: follow moved files, drop deleted ones, keep paths on other branches" },
 	{ name: "consolidate", description: "SemIf reviews every memory to forget, merge and revise; the Edit/Merge model revises paths from a repo summary" },
 	{ name: "fix-gitignore", description: "check whether .pi/realctx is ignored by git and add the fix to .gitignore" },
 	{ name: "conflicts", description: "other context managers next to realctx; `conflicts enable <name>` / `conflicts disable <name>`" },
@@ -282,6 +283,43 @@ export default function realctx(pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Follow moved files (`paths.autoRename`: rewrite memory paths git shows were moved),
+	 * then optionally warn about memories that still point at missing paths. Subagents
+	 * only warn; their parent session rewrites.
+	 */
+	let lastFollow = 0;
+	let following = false;
+	let subagentSession = false;
+	const followMoves = async (ctx: ExtensionContext, e: MemoryEngine, reportStale: boolean) => {
+		if (following) return;
+		following = true;
+		lastFollow = Date.now();
+		try {
+			const moved = subagentSession ? [] : await e.followRenames(ctx.cwd);
+			if (moved.length > 0 && ctx.hasUI) {
+				const list = moved.flatMap((m) => Object.entries(m.renames).map(([from, to]) => `${from} → ${to}`));
+				ctx.ui.notify(
+					`realctx: updated the paths of ${moved.length} memor${moved.length === 1 ? "y" : "ies"} (moved files): ${list.slice(0, 5).join(", ")}${list.length > 5 ? ", …" : ""}`,
+					"info",
+				);
+			}
+			if (reportStale) {
+				const paths = e.checkPaths(ctx.cwd);
+				if (paths.stale > 0 && ctx.hasUI) {
+					ctx.ui.notify(
+						`realctx: ${paths.stale} memor${paths.stale === 1 ? "y refers" : "ies refer"} to paths that no longer exist; clean up with /realctx prune-paths`,
+						"warning",
+					);
+				}
+			}
+		} catch {
+			// git unavailable or store locked: try again later
+		} finally {
+			following = false;
+		}
+	};
+
 	const drain = (ctx: ExtensionContext) => {
 		if (draining) return;
 		const e = getEngine();
@@ -425,13 +463,11 @@ export default function realctx(pi: ExtensionAPI) {
 			if (ignored && ctx.hasUI) {
 				ctx.ui.notify(`realctx: ${describeIgnoreProblem(ignored)}\nOr run /realctx fix-gitignore to apply it.`, "warning");
 			}
-			const paths = e.checkPaths(ctx.cwd);
-			if (paths.stale > 0 && ctx.hasUI) {
-				ctx.ui.notify(`realctx: ${paths.stale} memor${paths.stale === 1 ? "y refers" : "ies refer"} to paths that no longer exist; review with /realctx manage`, "warning");
-			}
 		} catch {
 			// git unavailable: skip
 		}
+		subagentSession = family.subagent;
+		void followMoves(ctx, e, true);
 		refreshStatus(ctx);
 		void e.embedInBackground().then(() => refreshStatus(ctx)).catch(() => {});
 		void e.refreshUrgencyInBackground(ctx.cwd);
@@ -616,6 +652,8 @@ export default function realctx(pi: ExtensionAPI) {
 		// Keep this session's originals alive for other processes' sweeps, then run the daily sweep.
 		layer.touchStore();
 		if (engine) void pruneOutputsThrottled(engine, openSessions()).catch(() => {});
+		// Files moved during the turn: let path-scoped memories follow them (at most every 30 s).
+		if (engine && Date.now() - lastFollow > 30_000) void followMoves(ctx, engine, false);
 		refreshStatus(ctx);
 		return entries.length > 0 ? { entries } : undefined;
 	});
@@ -946,21 +984,9 @@ export default function realctx(pi: ExtensionAPI) {
 						break;
 					}
 					case "prune-paths":
-					case "prune": {
-						const preview = await e.prunePaths(ctx.cwd, { dryRun: true });
-						if (preview.updated.length === 0 && preview.deleted.length === 0) {
-							ctx.ui.notify("realctx: no memory refers to a missing path", "info");
-							break;
-						}
-						const lines = [
-							...preview.updated.map((u) => `edit   ${u.memory.caption}: drop ${u.removed.join(", ")}`),
-							...preview.deleted.map((m) => `delete ${m.caption}: ${(m.paths ?? []).join(", ")}`),
-						];
-						if (ctx.hasUI && !(await ctx.ui.confirm(`Prune ${lines.length} memor${lines.length === 1 ? "y" : "ies"}?`, lines.join("\n")))) return;
-						const r = await e.prunePaths(ctx.cwd);
-						ctx.ui.notify(`realctx: removed missing paths from ${r.updated.length} memor${r.updated.length === 1 ? "y" : "ies"}, deleted ${r.deleted.length}`, "info");
+					case "prune":
+						await prunePathsCommand(ctx, e);
 						break;
-					}
 					case "consolidate":
 						await consolidate(ctx, e, rest);
 						break;

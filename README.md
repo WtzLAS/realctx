@@ -78,8 +78,8 @@ cancelled while the layer is active (manual `/compact` and overflow recovery sti
 
 **Disabled models**: some models misbehave with dropped outputs or history summaries. List
 them in `context.disabledModels` (`provider/model` or `model`, case-insensitive, `*` as
-wildcard, e.g. `["openrouter/*flash*"]`), or pick them in `/realctx settings` → "Context:
-disabled models": Enter on one of Pi's models adds or removes it (the picker stays open),
+wildcard, e.g. `["openrouter/*flash*"]`), or pick them in `/realctx settings` → Context → "
+Disabled models": Enter on one of Pi's models adds or removes it (the picker stays open),
 `✎ edit as text…` takes patterns. While such a model is
 selected the context layer is paused: requests go out unchanged (no drops, history
 compression or judging, outputs are not captured, Pi's compaction runs normally) and the
@@ -475,7 +475,9 @@ pi install ~/Projects/realctx        # or add the path to "packages" in ~/.pi/ag
 
 realctx ships with no endpoints, API keys or model names: both endpoints default to none
 (empty, or `"none"` in `config.json`), and realctx works without them. Open
-`/realctx settings` to set:
+`/realctx settings` to set the following (all under General). The settings page opens on
+categories (General, Context, History, Memory, Path notes, Consolidation); Enter opens
+one, and typing on the first page searches every setting:
 
 - the **judge (SemIf) endpoint** and key. Without it, `realctx_remember` uses a
   deterministic gate (the safety scan, then a near duplicate by text overlap or

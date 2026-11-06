@@ -271,7 +271,8 @@ test("settings page: SemIf model is picked from the server's /v1/models list", a
 					picker = frame().join("\n");
 					type(c, "other");
 					c.handleInput?.(KEY.enter);
-					c.handleInput?.(KEY.esc);
+					c.handleInput?.(KEY.esc); // search → categories
+					c.handleInput?.(KEY.esc); // close and save
 				},
 			],
 			{},
@@ -311,6 +312,7 @@ test("settings page: disabled models are toggled from Pi's model list (picker st
 					assert.ok(frame().join("\n").includes("✓ *flash*"));
 					c.handleInput?.(KEY.esc); // close the picker
 					assert.ok(frame().join("\n").includes("p/other, *flash*"));
+					c.handleInput?.(KEY.esc); // search → categories
 					c.handleInput?.(KEY.esc); // close and save
 				},
 			],
@@ -355,7 +357,8 @@ test("settings page: edit a number through the submenu, save, clear the embeddin
 					c.handleInput?.(KEY.backspace);
 					type(c, "64");
 					c.handleInput?.(KEY.enter);
-					c.handleInput?.(KEY.esc);
+					c.handleInput?.(KEY.esc); // search → categories
+					c.handleInput?.(KEY.esc); // close and save
 				},
 			],
 			{},
@@ -367,6 +370,44 @@ test("settings page: edit a number through the submenu, save, clear the embeddin
 		assert.ok(notes.some(([, m]) => m.includes("embedding cache cleared")));
 		assert.equal(e.db.embeddingStats(fp).cached, 0);
 		assert.ok(existsSync(join(base, "realctx.sqlite")));
+	} finally {
+		e.close();
+	}
+});
+
+test("settings page: categories first, then the category's settings (prefix dropped); esc goes back one level", async () => {
+	const e = new MemoryEngine(base);
+	try {
+		const before = e.settings.paths.autoRename;
+		let first = "";
+		let paths = "";
+		let back = "";
+		const { ctx } = fakeCtx(
+			proj,
+			[
+				(c, frame) => {
+					first = frame().join("\n");
+					for (let i = 0; i < 4; i++) c.handleInput?.(KEY.down); // General, Context, History, Memory → Path notes
+					c.handleInput?.(KEY.enter);
+					paths = frame().join("\n");
+					type(c, "follow");
+					c.handleInput?.(KEY.enter); // cycle on → off
+					c.handleInput?.(KEY.esc); // back to the categories
+					back = frame().join("\n");
+					c.handleInput?.(KEY.esc); // close and save
+				},
+			],
+			{},
+		);
+		await openSettings(ctx, e);
+		for (const s of ["General", "Context", "History", "Memory", "Path notes", "Consolidation", "Reset thresholds", "type to search all settings"]) {
+			assert.ok(first.includes(s), `first page shows ${s}:\n${first}`);
+		}
+		assert.ok(!first.includes("Embedding dimensions"), "settings are not listed on the first page");
+		assert.ok(paths.includes("realctx settings › Path notes") && paths.includes("Max full") && !paths.includes("Path notes: max full"), paths);
+		assert.ok(!paths.includes("Embedding"), "only the category's settings");
+		assert.ok(back.includes(`follow moves ${before ? "off" : "on"}`), back);
+		assert.equal(e.settings.paths.autoRename, !before);
 	} finally {
 		e.close();
 	}

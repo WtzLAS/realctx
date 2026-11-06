@@ -595,6 +595,81 @@ function fields(): FieldDef[] {
 	return f;
 }
 
+type CategoryId = "general" | "context" | "history" | "memory" | "paths" | "consolidation";
+
+export interface SettingsCategory {
+	id: CategoryId;
+	title: string;
+	description: string;
+	/** Label prefix dropped inside the category ("Context: " → ""). */
+	prefix?: string;
+	/** Value shown next to the category on the first page. */
+	summary: (s: Settings) => string;
+}
+
+const onOff = (v: boolean) => (v ? "on" : "off");
+
+export const SETTINGS_CATEGORIES: SettingsCategory[] = [
+	{
+		id: "general",
+		title: "General",
+		description: "Models and endpoints (Edit/Merge model, SemIf judge, embeddings), other context managers and memory tools, AGENTS.md / CLAUDE.md handling.",
+		summary: (s) => `judge ${s.semif.endpoint ? "set" : "not set"} · embeddings ${s.embedding.endpoint ? "set" : "not set"}`,
+	},
+	{
+		id: "context",
+		title: "Context",
+		description: "The context layer: which tool outputs are dropped behind placeholders, when drops apply, retention of the originals.",
+		prefix: "Context: ",
+		summary: (s) => (s.context.enabled ? `on · apply at ${s.context.applyThreshold}` : "off"),
+	},
+	{
+		id: "history",
+		title: "History",
+		description: "History compression: the historian model summarizes old conversation turns.",
+		prefix: "History: ",
+		summary: (s) => (s.history.enabled ? `on · prepare at ${s.history.prepareThreshold}` : "off"),
+	},
+	{
+		id: "memory",
+		title: "Memory",
+		description: "Long-term memory: the remember gate's thresholds, judge candidates, recall, session prompt captions, secrets, and fact capture.",
+		prefix: "Capture: ",
+		summary: (s) => `capture ${s.capture.mode}`,
+	},
+	{
+		id: "paths",
+		title: "Path notes",
+		description: "Memories attached to files and directories: when they are shown on touch, and how missing or moved paths are handled.",
+		prefix: "Path notes: ",
+		summary: (s) => `notes ${onOff(s.paths.inject)} · follow moves ${onOff(s.paths.autoRename)}`,
+	},
+	{
+		id: "consolidation",
+		title: "Consolidation",
+		description: "/realctx consolidate: forgetting, merging and revising memories, and the scheduled suggestion.",
+		prefix: "Consolidate: ",
+		summary: (s) => `schedule ${s.consolidate.schedule.mode}`,
+	},
+];
+
+const GENERAL_IDS = new Set(["rewriteModel", "context.conflictAction", "prompt.stripContextFiles", "prompt.hideTools"]);
+
+/** Category of a settings field; "top" = shown on the first page itself (reset). */
+export function categoryOf(id: string): CategoryId | "top" {
+	if (id === "reset") return "top";
+	if (GENERAL_IDS.has(id) || id.startsWith("semif.") || id.startsWith("embedding.")) return "general";
+	if (id.startsWith("history.")) return "history";
+	if (id.startsWith("context.")) return "context";
+	if (id.startsWith("paths.") || id.startsWith("thresholds.urgency")) return "paths";
+	if (id.startsWith("consolidate.")) return "consolidation";
+	return "memory";
+}
+
+function capitalize(s: string): string {
+	return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryEngine): Promise<void> {
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify(`realctx settings live in ${engine.paths.config}`, "info");
@@ -707,105 +782,189 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryE
 	};
 
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-		let list: SettingsList;
-		const items: SettingItem[] = defs.map((d) => ({
-			id: d.id,
-			label: d.label,
-			description: d.description,
-			currentValue: d.get(draft),
-			values: d.kind === "cycle" ? d.values : undefined,
-			submenu:
-				d.kind === "cycle"
-					? undefined
-					: (current, close) => {
-							if (d.kind === "model") {
-								return new FilterPicker({ theme, title: d.label, items: models, selected: current, done: (v) => close(v) });
-							}
-							if (d.kind === "model-list") return modelListPicker(theme, d, close);
-							if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
-							if (d.kind === "action") {
-								if (d.id === "reset") {
-									const keep = { embedding: draft.embedding, semif: draft.semif, rewriteModel: draft.rewriteModel };
-									draft = normalizeSettings({ ...structuredClone(DEFAULT_SETTINGS), ...keep });
-									dirty = true;
-									for (const x of defs) list.updateValue(x.id, x.get(draft));
-									return new ActionSubmenu({ tui, theme, title: d.label, run: async () => ["Thresholds and limits reset. Esc on the list saves."], done: () => close() });
-								}
-								// Test against the draft settings without persisting them.
-								const probe = normalizeSettings(structuredClone(draft));
-								return new ActionSubmenu({
-									tui,
-									theme,
-									title: d.label,
-									run: async (signal) => {
-										const saved = engine.settings;
-										engine.applySettings(probe, false);
-										try {
-											return (await d.run?.(engine, signal, theme)) ?? [];
-										} finally {
-											engine.applySettings(saved, false);
-										}
-									},
-									done: () => close(),
-								});
-							}
-							const raw = d.kind === "secret" ? "" : d.get(draft);
-							return new InputSubmenu({
-								theme,
-								label: d.label,
-								help: d.kind === "secret" ? `${d.description} Current: ${d.get(draft)}. Enter "-" to clear.` : d.description,
-								value: raw === "(none)" || raw === "(session model)" || raw === NOT_SET ? "" : raw,
-								secret: d.kind === "secret",
-								validate: (v) => {
-									if (d.kind !== "number") return undefined;
-									const n = Number(v);
-									if (!Number.isFinite(n)) return "enter a number";
-									if (d.integer && !Number.isInteger(n)) return "enter a whole number";
-									if (d.min !== undefined && n < d.min) return `minimum is ${d.min}`;
-									if (d.max !== undefined && n > d.max) return `maximum is ${d.max}`;
-									return undefined;
-								},
-								done: (v) => {
-									if (v === undefined) return close();
-									d.set?.(draft, v);
-									draft = normalizeSettings(draft);
-									dirty = true;
-									close(d.get(draft));
-								},
-							});
-						},
-		}));
-
-		list = new SettingsList(
-			items,
-			Math.min(items.length, Math.max(6, tui.terminal.rows - 10)),
-			getSettingsListTheme(),
-			(id, value) => {
-				const d = defs.find((x) => x.id === id);
-				if (!d || d.kind === "action") return;
-				if (d.kind === "cycle" || d.kind === "model" || d.kind === "remote-model") {
-					d.set?.(draft, value);
-					draft = normalizeSettings(draft);
-					dirty = true;
+		const submenuFor = (d: FieldDef): SettingItem["submenu"] => {
+			if (d.kind === "cycle") return undefined;
+			return (current, close) => {
+				if (d.kind === "model") {
+					return new FilterPicker({ theme, title: d.label, items: models, selected: current, done: (v) => close(v) });
 				}
-			},
-			() => done(),
-			{ enableSearch: true },
-		);
-
-		const header: Component = {
-			render: (width: number) => [
-				truncateToWidth(theme.fg("accent", theme.bold("realctx settings")), width),
-				truncateToWidth(theme.fg("dim", `${engine.paths.config} · changes are saved when you close this page`), width),
-				"",
-			],
-			invalidate() {},
+				if (d.kind === "model-list") return modelListPicker(theme, d, close);
+				if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
+				if (d.kind === "action") {
+					if (d.id === "reset") {
+						const keep = { embedding: draft.embedding, semif: draft.semif, rewriteModel: draft.rewriteModel };
+						draft = normalizeSettings({ ...structuredClone(DEFAULT_SETTINGS), ...keep });
+						dirty = true;
+						return new ActionSubmenu({ tui, theme, title: d.label, run: async () => ["Thresholds and limits reset. Esc on the list saves."], done: () => close() });
+					}
+					// Test against the draft settings without persisting them.
+					const probe = normalizeSettings(structuredClone(draft));
+					return new ActionSubmenu({
+						tui,
+						theme,
+						title: d.label,
+						run: async (signal) => {
+							const saved = engine.settings;
+							engine.applySettings(probe, false);
+							try {
+								return (await d.run?.(engine, signal, theme)) ?? [];
+							} finally {
+								engine.applySettings(saved, false);
+							}
+						},
+						done: () => close(),
+					});
+				}
+				const raw = d.kind === "secret" ? "" : d.get(draft);
+				return new InputSubmenu({
+					theme,
+					label: d.label,
+					help: d.kind === "secret" ? `${d.description} Current: ${d.get(draft)}. Enter "-" to clear.` : d.description,
+					value: raw === "(none)" || raw === "(session model)" || raw === NOT_SET ? "" : raw,
+					secret: d.kind === "secret",
+					validate: (v) => {
+						if (d.kind !== "number") return undefined;
+						const n = Number(v);
+						if (!Number.isFinite(n)) return "enter a number";
+						if (d.integer && !Number.isInteger(n)) return "enter a whole number";
+						if (d.min !== undefined && n < d.min) return `minimum is ${d.min}`;
+						if (d.max !== undefined && n > d.max) return `maximum is ${d.max}`;
+						return undefined;
+					},
+					done: (v) => {
+						if (v === undefined) return close();
+						d.set?.(draft, v);
+						draft = normalizeSettings(draft);
+						dirty = true;
+						close(d.get(draft));
+					},
+				});
+			};
 		};
+
+		const onChange = (id: string, value: string) => {
+			const d = defs.find((x) => x.id === id);
+			if (!d || d.kind === "action") return;
+			if (d.kind === "cycle" || d.kind === "model" || d.kind === "remote-model") {
+				d.set?.(draft, value);
+				draft = normalizeSettings(draft);
+				dirty = true;
+			}
+		};
+		const rows = (reserved: number) => Math.max(4, tui.terminal.rows - reserved);
+
+		// Each list has its own item objects (labels differ between a category and the
+		// search); values are refreshed from the draft before every render, so a change
+		// made in one list shows in all of them (and after a reset).
+		const shown = new Map<"top" | "category" | "search", Array<{ item: SettingItem; def: FieldDef }>>();
+		const itemsFor = (group: "top" | "category" | "search", list: FieldDef[], label: (d: FieldDef) => string = (d) => d.label): SettingItem[] => {
+			const pairs = list.map((d) => ({
+				def: d,
+				item: {
+					id: d.id,
+					label: label(d),
+					description: d.description,
+					currentValue: d.get(draft),
+					values: d.kind === "cycle" ? d.values : undefined,
+					submenu: submenuFor(d),
+				} satisfies SettingItem,
+			}));
+			shown.set(group, pairs);
+			return pairs.map((p) => p.item);
+		};
+		// Fields keep their definition order; path-urgency thresholds come after the path-note switches.
+		const inCategory = (c: SettingsCategory) => {
+			const list = defs.filter((d) => categoryOf(d.id) === c.id);
+			return c.id === "paths" ? [...list.filter((d) => !d.id.startsWith("thresholds.")), ...list.filter((d) => d.id.startsWith("thresholds."))] : list;
+		};
+		const categoryValue = (c: SettingsCategory): string => c.summary(draft);
+
+		let where: string | undefined;
+		const categoryItems: SettingItem[] = [
+			...SETTINGS_CATEGORIES.map(
+				(c): SettingItem => ({
+					id: `category:${c.id}`,
+					label: c.title,
+					description: c.description,
+					currentValue: categoryValue(c),
+					submenu: (_current, close) => {
+						where = c.title;
+						const items = itemsFor("category", inCategory(c), (d) => (c.prefix && d.label.startsWith(c.prefix) ? capitalize(d.label.slice(c.prefix.length)) : d.label));
+						return new SettingsList(
+							items,
+							Math.min(items.length, rows(14)),
+							getSettingsListTheme(),
+							onChange,
+							() => {
+								where = undefined;
+								close();
+							},
+							{ enableSearch: true },
+						);
+					},
+				}),
+			),
+			...itemsFor(
+				"top",
+				defs.filter((d) => categoryOf(d.id) === "top"),
+			),
+		];
+		const top = new SettingsList(categoryItems, Math.min(categoryItems.length, rows(10)), getSettingsListTheme(), onChange, () => done());
+		/** A submenu (category list or action) is open on the top list. */
+		const topBusy = () => (top as unknown as { submenuComponent: unknown }).submenuComponent != null;
+
+		// Typing on the category list searches every setting (flat list, full labels).
+		let search = undefined as SettingsList | undefined;
+		const startSearch = (): SettingsList => {
+			const items = itemsFor("search", defs);
+			const list = new SettingsList(
+				items,
+				Math.min(items.length, rows(14)),
+				getSettingsListTheme(),
+				onChange,
+				() => {
+					search = undefined;
+				},
+				{ enableSearch: true },
+			);
+			search = list;
+			return list;
+		};
+		const typing = (data: string) => data !== " " && !data.startsWith("\x1b") && [...data].every((ch) => ch >= " " && ch !== "\x7f");
+
+		const refresh = () => {
+			for (const pairs of shown.values()) for (const { item, def } of pairs) item.currentValue = def.get(draft);
+			for (const c of SETTINGS_CATEGORIES) {
+				const it = categoryItems.find((x) => x.id === `category:${c.id}`);
+				if (it) it.currentValue = categoryValue(c);
+			}
+		};
+
 		return {
-			render: (width: number) => [...header.render(width), ...list.render(width)],
-			invalidate: () => list.invalidate(),
+			render: (width: number) => {
+				refresh();
+				const crumb = search ? " › search" : where ? ` › ${where}` : "";
+				const head = [
+					truncateToWidth(theme.fg("accent", theme.bold(`realctx settings${crumb}`)), width),
+					truncateToWidth(theme.fg("dim", `${engine.paths.config} · changes are saved when you close this page`), width),
+					"",
+				];
+				if (search) return [...head, ...search.render(width)];
+				const body = top.render(width);
+				if (!topBusy() && body.length > 0) {
+					body[body.length - 1] = truncateToWidth(theme.fg("dim", "  Enter to open · type to search all settings · Esc to close"), width);
+				}
+				return [...head, ...body];
+			},
+			invalidate: () => {
+				top.invalidate();
+				search?.invalidate();
+			},
 			handleInput: (data: string) => {
-				list.handleInput(data);
+				if (search) search.handleInput(data);
+				else if (!topBusy() && typing(data)) {
+					startSearch().handleInput(data);
+				} else top.handleInput(data);
 				tui.requestRender();
 			},
 		};

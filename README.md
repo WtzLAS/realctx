@@ -393,8 +393,6 @@ Moving a memory between stores (manage page) re-expresses its paths.
   - `realctx_list(page?, scope?)`: sorted by path, then used; demoted, since its output
     is large.
   - `realctx_forget(ids)`: delete memories by id (or unique prefix).
-- **Skill**: `realctx` covers when and how to recall, remember, pick a scope, correct
-  memories and restore dropped outputs.
 
 ## Commands
 

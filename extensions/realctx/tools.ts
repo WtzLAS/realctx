@@ -65,7 +65,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_recall",
 		label: "realctx recall",
 		description:
-			"Search long-term memory (realctx) with hybrid semantic + keyword search. Pass several keywords or short statements describing the task, component, command, error, or question. Results are ordered by path (memories about the given or recently touched paths first), then most used; paginated. Pass `paths` alone to list the memories attached to those files/directories, or `ids` to read memories shown as captions.",
+			"Search long-term memory (realctx) with hybrid semantic + keyword search. Pass several keywords or short statements describing the task, component, command, error, or question. Results are ordered by path (memories about the given or recently touched paths first), then most used; paginated. Pass `paths` alone to list the memories attached to those files/directories, or `ids` to read memories shown as captions. Path notes (`<realctx-path-notes>` at the end of a tool result) appear once per session and only for the exact files/directories a memory is attached to, not their parents: pass `paths` to look up a whole area.",
 		promptSnippet: "Search long-term memory; call it before starting any work and whenever you enter a new area",
 		promptGuidelines: [
 			"Call realctx_recall before starting any task (and again when switching areas or hitting surprises), with 2-8 keywords or short statements covering the task.",
@@ -83,7 +83,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 					description: "Files or directories (relative to the cwd) the question is about; their memories rank first. Alone: list memories attached to them.",
 				}),
 			),
-			ids: Type.Optional(Type.Array(Type.String({ minLength: 6, maxLength: 40 }), { maxItems: 32, description: "Memory ids to read in full" })),
+			ids: Type.Optional(Type.Array(Type.String({ minLength: 6, maxLength: 40 }), { maxItems: 32, description: "Memory ids to read in full (captions in path notes, `saved as <id>` in placeholders)" })),
 			page: Type.Optional(Type.Integer({ minimum: 1, description: "Result page (default 1)" })),
 			scope: Type.Optional(StringEnum(SCOPE_VALUES, { description: "Only search one scope" })),
 			sources: Type.Optional(
@@ -163,7 +163,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			scope: Type.Optional(
 				StringEnum(SCOPE_VALUES, {
 					description:
-						"global = all projects (user preferences, general knowledge); project-shared = synced to collaborators via git; project-personal = this machine/user only. Omit to let realctx decide.",
+						"global = all projects (user preferences, general knowledge); project-shared = committed to git and pushed to collaborators (never machine-specific paths or personal preferences); project-personal = this machine/user only. Omit to let realctx decide.",
 				}),
 			),
 			paths: Type.Optional(
@@ -218,7 +218,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_expand",
 		label: "realctx expand",
 		description:
-			"Restore what realctx removed from the context. Tool outputs: placeholders look like `[#42 dropped · read src/x.ts · 3.1k tok]`, pass their numbers as `ids`. Old conversation: a `<realctx-history part=\"h3\">` summary replaced turns; pass `history=[3]` for the transcript of that part. Originals are returned as a new result (not restored in place), capped in size; use `lines` (e.g. \"120-260\") or `grep` (regex) to fetch only part.",
+			"Restore what realctx removed from the context. Tool outputs: placeholders look like `[#42 dropped · read src/x.ts · 3.1k tok]`, pass their numbers as `ids`. Old conversation: a `<realctx-history part=\"h3\">` summary replaced turns; pass `history=[3]` for the transcript of that part. Originals are returned as a new result (not restored in place), capped in size; use `lines` (e.g. \"120-260\") or `grep` (regex) to fetch only part. `summarized` placeholders carry a short summary below them; `saved as <id>` means the durable part is now a memory (read it with realctx_recall ids); `superseded` means a newer result is already in context. Expand only when you need the exact text, not just in case; for a file that may have changed, re-read it instead.",
 		promptSnippet: "Restore a dropped tool output shown as a [#N dropped …] placeholder",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 16, description: "Output numbers from placeholders, e.g. [42] for [#42 …]" })),

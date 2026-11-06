@@ -58,7 +58,7 @@ after(() => {
 	delete process.env.REALCTX_HOME;
 });
 
-test("extension registers tools, skill, command; freezes the session prompt; strips imported context files", async () => {
+test("extension registers tools and command; freezes the session prompt; strips imported context files", async () => {
 	const { default: realctx } = await import("../extensions/realctx/index.ts");
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
@@ -91,8 +91,6 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 		for (const h of handlers.get(e) ?? []) last = await h(ev, ctx);
 		return last;
 	};
-	const skills = await emit("resources_discover", { type: "resources_discover", cwd: proj, reason: "startup" }, {});
-	assert.ok(skills.skillPaths[0].endsWith("skills"));
 
 	const statuses: Record<string, string | undefined> = {};
 	const ctx: any = {

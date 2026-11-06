@@ -3,11 +3,10 @@
  *
  * Context layer: captures tool outputs, drops spent ones behind byte-stable placeholders,
  * restores them with realctx_expand. Memory layer: surprise-gated Markdown facts,
- * path notes, a frozen per-session system prompt section. Plus the /realctx command and a skill.
+ * path notes, a frozen per-session system prompt section. Plus the /realctx command.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatPlan, planSummary } from "../../src/consolidate.ts";
@@ -33,8 +32,6 @@ import { openSettings } from "./settings-page.ts";
 import { historianFor, registerTools, rewriterFor } from "./tools.ts";
 import { runWithLoader, showText } from "./ui.ts";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SKILLS_DIR = join(HERE, "..", "..", "skills");
 const CONTEXT_FILE_RE = /(?:^|[\\/])(?:AGENTS(?:\.override)?|CLAUDE)\.md$/i;
 
 /** Same frames and pace as Pi's working loader. */
@@ -391,7 +388,6 @@ export default function realctx(pi: ExtensionAPI) {
 		contextStatus,
 	});
 
-	pi.on("resources_discover", () => ({ skillPaths: [SKILLS_DIR] }));
 
 	pi.on("session_start", async (_event, ctx) => {
 		snapshot = undefined;

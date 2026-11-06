@@ -395,7 +395,7 @@ memory AZJrPlwafS-aSxwtPk9aaw  Run e2e tests with pnpm test:e2e
 output #57                     bash pnpm test (turn 22) · 3 failing in auth/session.test.ts …
 ```
 
-**Naming:** every tool is prefixed `realctx_`. realmem's `realmem_*` tools and `/realmem` command are not kept as aliases; realmem's data migrates (§16), and a still-loaded realmem extension is disabled like any other conflicting plugin (§12.3). The `realctx` skill covers recall, remember, scope choice, and expansion.
+**Naming:** every tool is prefixed `realctx_`. realmem's `realmem_*` tools and `/realmem` command are not kept as aliases; realmem's data migrates (§16), and a still-loaded realmem extension is disabled like any other conflicting plugin (§12.3). There is no skill: tool descriptions, prompt guidelines and the session prompt section carry all agent-facing guidance.
 
 ### 12.3 Conflicting plugins
 

@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DEFAULT_SETTINGS, loadSettings, normalizeSettings, parseDuration, SETTINGS_VERSION } from "../src/config.ts";
+import { DEFAULT_SETTINGS, loadSettings, matchModel, normalizeSettings, parseDuration, SETTINGS_VERSION } from "../src/config.ts";
 import type { OutputMeta } from "../src/outputs.ts";
 import { argsSignature, fmtTokens, summarizeArgs } from "../src/outputs.ts";
 import {
@@ -198,6 +198,19 @@ test("settings: v1 config files move old threshold defaults to the v2 defaults a
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("matchModel: provider/model or model, case-insensitive, * wildcard; settings keep trimmed strings", () => {
+	const m = { provider: "openrouter", id: "google/gemini-2.5-flash" };
+	assert.equal(matchModel([], m), undefined);
+	assert.equal(matchModel(["openrouter/google/gemini-2.5-flash"], m), "openrouter/google/gemini-2.5-flash");
+	assert.equal(matchModel(["Google/Gemini-2.5-Flash"], m), "Google/Gemini-2.5-Flash");
+	assert.equal(matchModel(["*flash*"], m), "*flash*");
+	assert.equal(matchModel(["openrouter/*"], m), "openrouter/*");
+	assert.equal(matchModel(["anthropic/*", "gemini-2.5-flash", "gemini.2.5-flash"], m), undefined, "no partial or regex matches");
+	assert.equal(matchModel(["*"], undefined), undefined);
+	assert.deepEqual(normalizeSettings({ context: { disabledModels: [" a/b ", "", 3, "c*"] } }).context.disabledModels, ["a/b", "c*"]);
+	assert.deepEqual(DEFAULT_SETTINGS.context.disabledModels, []);
 });
 
 test("scheduler: one shared queue, highest priority first", async () => {

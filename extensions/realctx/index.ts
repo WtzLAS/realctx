@@ -265,7 +265,8 @@ export default function realctx(pi: ExtensionAPI) {
 			const pending = e.db.countPending(sc.project?.root);
 			const setup = e.semifClient.configured ? "" : " · setup: /realctx settings";
 			const st = layer.status();
-			const ctxPart = st.active ? ` · 📉 ${st.applied ? `−${compactTokens(st.reclaimed)}` : "0"}${st.queued ? ` (+${st.queued} queued)` : ""}` : "";
+			// 🛑: the session model is in context.disabledModels, so the context layer is paused.
+			const ctxPart = st.modelOff ? " · 🛑" : st.active ? ` · 📉 ${st.applied ? `−${compactTokens(st.reclaimed)}` : "0"}${st.queued ? ` (+${st.queued} queued)` : ""}` : "";
 			// realctx's own estimate of the context it sends, as a share of the model's full window
 			// (like Pi's footer). Pi's footer re-estimates the raw transcript after a retry, so it
 			// can read far higher than what the model actually receives.
@@ -583,6 +584,16 @@ export default function realctx(pi: ExtensionAPI) {
 		// The usage estimate changed: keep the status line's percentage current.
 		refreshStatus(ctx);
 		return out ? { messages: out as unknown as typeof event.messages } : undefined;
+	});
+
+	// Models in context.disabledModels pause the context layer (no drops, history or judging) while selected.
+	pi.on("model_select", (event, ctx) => {
+		if (layer.setModel(event.model) && layer.disabledReason === undefined && ctx.hasUI) {
+			const name = `${event.model.provider}/${event.model.id}`;
+			const off = layer.modelOff;
+			ctx.ui.notify(off ? `realctx: context layer paused for ${name} (context.disabledModels: ${off})` : `realctx: context layer resumed for ${name}`, off ? "warning" : "info");
+		}
+		refreshStatus(ctx);
 	});
 
 	// realctx replaces threshold compaction: it never pauses the session to summarise (§4).

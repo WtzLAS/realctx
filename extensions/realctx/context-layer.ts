@@ -10,7 +10,7 @@
 import { copyFileSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { embeddingFingerprint, parseDuration, type Settings } from "../../src/config.ts";
+import { embeddingFingerprint, matchModel, parseDuration, type Settings } from "../../src/config.ts";
 import type { MemoryEngine } from "../../src/engine.ts";
 import { chunkQuestions } from "../../src/judge.ts";
 import {
@@ -123,6 +123,8 @@ interface IdsData {
 export interface LayerStatus {
 	active: boolean;
 	reason?: string;
+	/** `context.disabledModels` entry that names the session model (layer paused while it is selected). */
+	modelOff?: string;
 	session?: string;
 	parent?: string;
 	subagent?: boolean;
@@ -201,6 +203,8 @@ export class ContextLayer {
 	private touchedAt = 0;
 	/** Why the layer is off (conflict, disabled, store unavailable); undefined = active. */
 	disabledReason: string | undefined;
+	/** Session model (reset, every request, model_select): checked against `context.disabledModels`. */
+	private model: { provider?: string; id?: string } | undefined;
 	conflicts: string[] = [];
 
 	private readonly host: LayerHost;
@@ -228,7 +232,23 @@ export class ContextLayer {
 	}
 
 	get active(): boolean {
-		return this.disabledReason === undefined;
+		return this.disabledReason === undefined && this.modelOff === undefined;
+	}
+
+	/** The `context.disabledModels` entry naming the session model: the layer is paused for it. */
+	get modelOff(): string | undefined {
+		try {
+			return matchModel(this.cfg.disabledModels, this.model);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Track the session model; returns true when that pauses or resumes the layer. */
+	setModel(model: { provider?: string; id?: string } | undefined): boolean {
+		const before = this.modelOff;
+		this.model = model ? { provider: model.provider, id: model.id } : undefined;
+		return this.modelOff !== before;
 	}
 
 	private get cfg(): Settings["context"] {
@@ -256,6 +276,7 @@ export class ContextLayer {
 		this.lastUsage = undefined;
 		this.conflicts = conflicts;
 		this.imageCost = imageCostFor(ctx.model);
+		this.setModel(ctx.model);
 		const s = this.host.settings();
 		this.disabledReason = !s.context.enabled
 			? "disabled in settings"
@@ -671,6 +692,7 @@ export class ContextLayer {
 					}
 				}
 			}
+			this.setModel(ctx.model);
 			if (!this.active) return changed ? messages : undefined;
 			this.imageCost = imageCostFor(ctx.model);
 			// Keys of the messages as Pi sent them (rendering a dropped user image changes its key).
@@ -1367,6 +1389,7 @@ export class ContextLayer {
 
 	status(): LayerStatus {
 		const s = this.host.settings();
+		const modelOff = this.modelOff;
 		let pendingCaptures = 0;
 		try {
 			const e = this.host.engine();
@@ -1376,7 +1399,8 @@ export class ContextLayer {
 		}
 		return {
 			active: this.active,
-			reason: this.disabledReason,
+			reason: this.disabledReason ?? (modelOff ? `${this.model?.provider ? `${this.model.provider}/` : ""}${this.model?.id} is in context.disabledModels (${modelOff})` : undefined),
+			modelOff: this.disabledReason === undefined ? modelOff : undefined,
 			session: this.sessionId,
 			parent: this.parent,
 			subagent: this.subagent,

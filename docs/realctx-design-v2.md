@@ -584,6 +584,7 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `context.applyThreshold` | `0.35` | Safe-window usage that applies queued drops |
 | `context.emergencyThreshold` | `0.9` | Emergency reclaim |
 | `context.cacheTtl`, `context.cacheTtlByModel` | `"5m"`, `{}` | Provider cache lifetime; per-model override |
+| `context.disabledModels` | `[]` | Models (`provider/model` or `model`, `*` wildcard) the context layer pauses for; status line shows `🛑` |
 | `context.expandMaxTokens` | `4000` | Cap per expansion |
 | `context.repinTurns` | `10` | Expanded items stay kept |
 | `context.retentionDays` | `7` | Originals of inactive sessions are deleted after this; `0` = forever |

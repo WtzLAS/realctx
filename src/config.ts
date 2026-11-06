@@ -72,6 +72,11 @@ export interface Settings {
 		cacheTtl: string;
 		/** Per-model cache lifetime overrides: `provider/model` or `model` → duration. */
 		cacheTtlByModel: Record<string, string>;
+		/**
+		 * Models the context layer stays off for (buggy with dropped outputs or history summaries):
+		 * `provider/model` or `model`, case-insensitive, `*` matches any run of characters.
+		 */
+		disabledModels: string[];
 		/** Max tokens one realctx_expand call returns. */
 		expandMaxTokens: number;
 		/** Expanded items stay pinned for this many turns. */
@@ -263,6 +268,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		emergencyThreshold: 0.9,
 		cacheTtl: "5m",
 		cacheTtlByModel: {},
+		disabledModels: [],
 		expandMaxTokens: 4000,
 		repinTurns: 10,
 		cancelCompaction: true,
@@ -410,6 +416,22 @@ function liftJudgeConnection(input: unknown): RawConfig {
 	return { ...raw, semif };
 }
 
+/**
+ * The entry of a `provider/model` or `model` list that names `model` (case-insensitive; `*` matches
+ * any run of characters), or undefined.
+ */
+export function matchModel(patterns: readonly string[], model: { provider?: string; id?: string } | undefined): string | undefined {
+	if (!model?.id || patterns.length === 0) return undefined;
+	const names = [model.id, ...(model.provider ? [`${model.provider}/${model.id}`] : [])];
+	for (const p of patterns) {
+		const pat = p.trim();
+		if (!pat) continue;
+		const re = new RegExp(`^${pat.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "i");
+		if (names.some((n) => re.test(n))) return pat;
+	}
+	return undefined;
+}
+
 /** Parse a duration such as `5m`, `1h`, `300s`, `1500ms` or a number of seconds. */
 export function parseDuration(v: string | number | undefined, fallbackMs = 300_000): number {
 	if (typeof v === "number") return Number.isFinite(v) && v >= 0 ? v * 1000 : fallbackMs;
@@ -442,6 +464,7 @@ export function normalizeSettings(input: unknown): Settings {
 	s.version = SETTINGS_VERSION;
 	const ttlRaw = isObject(raw) && isObject(raw.context) && isObject(raw.context.cacheTtlByModel) ? raw.context.cacheTtlByModel : {};
 	s.context.cacheTtlByModel = Object.fromEntries(Object.entries(ttlRaw).filter((e): e is [string, string] => typeof e[1] === "string"));
+	s.context.disabledModels = s.context.disabledModels.map((m) => m.trim()).filter(Boolean);
 	s.judge.concurrency = Math.round(clamp(s.judge.concurrency, 1, 16));
 	s.judge.minIntervalMs = Math.round(clamp(s.judge.minIntervalMs, 0, 60_000));
 	s.judge.maxPerPass = Math.round(clamp(s.judge.maxPerPass, 0, 64));

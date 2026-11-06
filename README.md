@@ -76,6 +76,16 @@ reaches `context.applyThreshold` (35%), or on `/realctx flush`. At
 outputs are dropped until usage is under the apply threshold. Pi's threshold compaction is
 cancelled while the layer is active (manual `/compact` and overflow recovery still run).
 
+**Disabled models**: some models misbehave with dropped outputs or history summaries. List
+them in `context.disabledModels` (`provider/model` or `model`, case-insensitive, `*` as
+wildcard, e.g. `["openrouter/*flash*"]`), or pick them in `/realctx settings` → "Context:
+disabled models": Enter on one of Pi's models adds or removes it (the picker stays open),
+`✎ edit as text…` takes patterns. While such a model is
+selected the context layer is paused: requests go out unchanged (no drops, history
+compression or judging, outputs are not captured, Pi's compaction runs normally) and the
+status line shows `🛑` instead of `📉`. Switching to another model resumes the layer with
+the drops it had.
+
 **Rendering**: each dropped result is replaced by a placeholder rendered once from
 immutable data and persisted on the branch (`realctx-ids`, `realctx-drops`), so it is
 byte-identical on every request, after reload and after resume:

@@ -285,6 +285,50 @@ test("settings page: SemIf model is picked from the server's /v1/models list", a
 	}
 });
 
+test("settings page: disabled models are toggled from Pi's model list (picker stays open) or edited as text", async () => {
+	const e = new MemoryEngine(base);
+	try {
+		let picker = "";
+		const { ctx } = fakeCtx(
+			proj,
+			[
+				(c, frame) => {
+					type(c, "disabled models");
+					c.handleInput?.(KEY.enter); // open the model list picker
+					type(c, "other");
+					c.handleInput?.(KEY.enter); // add p/other; the filter stays
+					picker = frame().join("\n");
+					for (let i = 0; i < 5; i++) c.handleInput?.(KEY.backspace);
+					type(c, "p/m");
+					c.handleInput?.(KEY.enter); // add p/m
+					assert.ok(frame().join("\n").includes("✓ p/m"));
+					c.handleInput?.(KEY.enter); // still on p/m: remove it again
+					for (let i = 0; i < 3; i++) c.handleInput?.(KEY.backspace);
+					c.handleInput?.(KEY.enter); // unfiltered, first row: ✎ edit as text
+					assert.ok(frame().join("\n").includes("* as wildcard"));
+					type(c, ", *flash*");
+					c.handleInput?.(KEY.enter); // back in the picker
+					assert.ok(frame().join("\n").includes("✓ *flash*"));
+					c.handleInput?.(KEY.esc); // close the picker
+					assert.ok(frame().join("\n").includes("p/other, *flash*"));
+					c.handleInput?.(KEY.esc); // close and save
+				},
+			],
+			{},
+		);
+		ctx.modelRegistry.getAvailable = () => [
+			{ provider: "p", id: "m", name: "M" },
+			{ provider: "p", id: "other", name: "Other" },
+		];
+		await openSettings(ctx, e);
+		assert.ok(picker.includes("✓ p/other") && picker.includes("enter add/remove · esc done"), picker);
+		assert.deepEqual(e.settings.context.disabledModels, ["p/other", "*flash*"]);
+		assert.deepEqual(JSON.parse(readFileSync(join(base, "config.json"), "utf8")).context.disabledModels, ["p/other", "*flash*"], "persisted");
+	} finally {
+		e.close();
+	}
+});
+
 test("settings page: edit a number through the submenu, save, clear the embedding cache", async () => {
 	const e = new MemoryEngine(base);
 	try {

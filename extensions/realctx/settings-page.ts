@@ -22,7 +22,9 @@ interface FieldDef {
 	description: string;
 	get: Getter;
 	set?: Setter;
-	kind: "text" | "secret" | "number" | "cycle" | "model" | "remote-model" | "action";
+	kind: "text" | "secret" | "number" | "cycle" | "model" | "model-list" | "remote-model" | "action";
+	/** model-list: the entries (Pi models or patterns); `set` takes them as comma-separated text. */
+	list?: (s: Settings) => string[];
 	/** remote-model: list the server's models for the draft settings. */
 	listModels?: (draft: Settings, signal: AbortSignal) => Promise<string[]>;
 	values?: string[];
@@ -482,6 +484,17 @@ function fields(): FieldDef[] {
 			kind: "cycle",
 			values: ["on", "off"],
 		},
+		{
+			id: "context.disabledModels",
+			label: "Context: disabled models",
+			description: "Models the context layer pauses for (no drops, history compression or judging; 🛑 in the footer). Enter on a model adds or removes it; ✎ edits the list as text: provider/model or model, * as wildcard (e.g. openai/gpt-5*, *flash*).",
+			get: (s) => s.context.disabledModels.join(", ") || "(none)",
+			list: (s) => s.context.disabledModels,
+			set: (s, v) => {
+				s.context.disabledModels = v.trim() === "(none)" ? [] : v.split(/[,\s]+/).filter(Boolean);
+			},
+			kind: "model-list",
+		},
 		ctxNum("captureMinTokens", "Context: capture min tokens", "Tool outputs smaller than this are not stored, so they are never dropped.", 0, 1_000_000, true),
 		ctxNum("dropMinTokens", "Context: drop min tokens", "Never drop an output smaller than this.", 0, 1_000_000, true),
 		ctxNum("protectTurns", "Context: protected turns", "Outputs of the last N model turns are never dropped.", 0, 1000, true),
@@ -629,6 +642,59 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryE
 		};
 	};
 
+	/** Pi's models toggled in and out of a list setting (stays open until esc); ✎ edits the list as text (wildcards). */
+	const modelListPicker = (theme: Theme, d: FieldDef, close: (v?: string) => void): Component => {
+		const registry = ctx.modelRegistry.getAvailable().map((m) => ({ id: `${m.provider}/${m.id}`, name: m.name }));
+		const entries = () => d.list?.(draft) ?? [];
+		const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+		const items = (): SelectItem[] => {
+			const listed = entries();
+			return [
+				{ value: TYPE_MODEL, label: "✎ edit as text…", description: "provider/model or model, * as wildcard" },
+				...listed.map((e) => ({ value: e, label: `✓ ${e}`, description: registry.find((m) => same(m.id, e))?.name ?? "pattern" })),
+				...registry.filter((m) => !listed.some((e) => same(e, m.id))).map((m) => ({ value: m.id, label: `  ${m.id}`, description: m.name })),
+			];
+		};
+		const update = (next: string[]) => {
+			d.set?.(draft, next.join(", ") || "(none)");
+			draft = normalizeSettings(draft);
+			dirty = true;
+		};
+		let child: Component;
+		const picker = new FilterPicker({
+			theme,
+			title: d.label,
+			items: items(),
+			hint: "type to filter · ↑↓ move · enter add/remove · esc done",
+			done: (v) => {
+				if (v === undefined) return close(d.get(draft));
+				if (v === TYPE_MODEL) {
+					child = new InputSubmenu({
+						theme,
+						label: d.label,
+						help: "Comma-separated: provider/model or model, * as wildcard (e.g. openai/gpt-5*, *flash*). Empty = none.",
+						value: entries().join(", "),
+						done: (text) => {
+							if (text !== undefined) update(text.split(/[,\s]+/).filter(Boolean));
+							picker.setItems(items());
+							child = picker;
+						},
+					});
+					return;
+				}
+				const listed = entries();
+				update(listed.some((e) => same(e, v)) ? listed.filter((e) => !same(e, v)) : [...listed, v]);
+				picker.setItems(items(), v);
+			},
+		});
+		child = picker;
+		return {
+			render: (w: number) => child.render(w),
+			handleInput: (data: string) => child.handleInput?.(data),
+			invalidate: () => child.invalidate(),
+		};
+	};
+
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 		let list: SettingsList;
 		const items: SettingItem[] = defs.map((d) => ({
@@ -644,6 +710,7 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryE
 							if (d.kind === "model") {
 								return new FilterPicker({ theme, title: d.label, items: models, selected: current, done: (v) => close(v) });
 							}
+							if (d.kind === "model-list") return modelListPicker(theme, d, close);
 							if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
 							if (d.kind === "action") {
 								if (d.id === "reset") {

@@ -278,6 +278,49 @@ test("rule drops apply only when the cache is cold, render byte-stable placehold
 	assert.equal(h.resultText(out?.messages ?? messages, r1), p, "same placeholder bytes after reload");
 });
 
+test("context.disabledModels pauses the context layer for those models (🛑 in the footer) and resumes on a model switch", async () => {
+	writeSettings({ context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, disabledModels: ["P/M*"] } });
+	const h = await harness();
+	let status = "";
+	h.ctx.ui.setStatus = (_k: string, t: string) => {
+		status = t;
+	};
+	h.user("refactor a.ts");
+	const r1 = await h.turn("read", { path: "src/a.ts" }, big("first read of a"));
+	await h.turn("bash", { command: "echo 1" }, big("unrelated"));
+	await h.turn("read", { path: "src/a.ts" }, big("second read of a"));
+	await h.turn("bash", { command: "echo 2" }, big("x"));
+	await h.turn("bash", { command: "echo 3" }, big("y"));
+	await h.settle();
+	// Paused: the cache is cold, but nothing is dropped and Pi's compaction is not cancelled.
+	assert.match(h.resultText(await h.request(), r1), /first read of a line 0/);
+	assert.equal(await h.emit("session_before_compact", { type: "session_before_compact", reason: "threshold" }, h.ctx), undefined);
+	assert.match(status, /🛑/);
+	assert.doesNotMatch(status, /📉/);
+
+	// Switching to another model resumes the layer: outputs captured from now on drop again.
+	const model = { provider: "p", id: "other", contextWindow: 200_000, maxTokens: 20_000 };
+	h.ctx.model = model;
+	await h.emit("model_select", { type: "model_select", model, source: "set" }, h.ctx);
+	assert.ok(h.notices.some((n) => /context layer resumed for p\/other/.test(n)));
+	assert.doesNotMatch(status, /🛑/);
+	const r3 = await h.turn("read", { path: "src/b.ts" }, big("first read of b"));
+	await h.turn("bash", { command: "echo 4" }, big("z"));
+	await h.turn("read", { path: "src/b.ts" }, big("second read of b"));
+	await h.turn("bash", { command: "echo 5" }, big("w"));
+	await h.turn("bash", { command: "echo 6" }, big("v"));
+	await h.settle();
+	assert.match(h.resultText(await h.request(), r3), /^\[#\d+ dropped · read src\/b\.ts/);
+
+	// And back: paused again with a warning.
+	h.ctx.model = { provider: "p", id: "m" };
+	await h.emit("model_select", { type: "model_select", model: h.ctx.model, source: "cycle" }, h.ctx);
+	assert.ok(h.notices.some((n) => /context layer paused for p\/m \(context\.disabledModels: P\/M\*\)/.test(n)));
+	assert.match(status, /🛑/);
+	assert.match(h.resultText(await h.request(), r3), /first read of b line 0/);
+	await h.shutdown();
+});
+
 test("judge drops: verdicts queue and apply at pressure; /realctx recent lists them", async () => {
 	writeSettings({});
 	judgeCalls = 0;

@@ -215,15 +215,17 @@ export class FilterPicker implements Component {
 	private list: SelectList;
 	private readonly theme: Theme;
 	private readonly title: string;
-	private readonly items: SelectItem[];
+	private items: SelectItem[];
 	private readonly maxVisible: number;
+	private readonly hint: string;
 	private readonly done: (value?: string) => void;
 
-	constructor(opts: { theme: Theme; title: string; items: SelectItem[]; selected?: string; maxVisible?: number; done: (value?: string) => void }) {
+	constructor(opts: { theme: Theme; title: string; items: SelectItem[]; selected?: string; maxVisible?: number; hint?: string; done: (value?: string) => void }) {
 		this.theme = opts.theme;
 		this.title = opts.title;
 		this.items = opts.items;
 		this.maxVisible = opts.maxVisible ?? 12;
+		this.hint = opts.hint ?? "type to filter · ↑↓ move · enter select · esc cancel";
 		this.done = opts.done;
 		this.list = this.makeList(opts.items);
 		const idx = opts.items.findIndex((i) => i.value === opts.selected);
@@ -238,8 +240,14 @@ export class FilterPicker implements Component {
 		return list;
 	}
 
+	/** Replace the items, keeping the filter text; `selected` (a value) stays highlighted when shown. */
+	setItems(items: SelectItem[], selected?: string): void {
+		this.items = items;
+		this.applyFilter(selected);
+	}
+
 	/** Substring filter over value, label and description (SelectList.setFilter only matches value prefixes). */
-	private applyFilter(): void {
+	private applyFilter(selected?: string): void {
 		const words = this.input.getValue().toLowerCase().split(/\s+/).filter(Boolean);
 		const items =
 			words.length === 0
@@ -249,6 +257,8 @@ export class FilterPicker implements Component {
 						return words.every((w) => hay.includes(w));
 					});
 		this.list = this.makeList(items);
+		const idx = selected === undefined ? -1 : items.findIndex((i) => i.value === selected);
+		if (idx >= 0) this.list.setSelectedIndex(idx);
 	}
 
 	render(width: number): string[] {
@@ -257,7 +267,7 @@ export class FilterPicker implements Component {
 			truncateToWidth(t.fg("accent", t.bold(this.title)), width),
 			...this.input.render(width).map((l) => truncateToWidth(`${t.fg("dim", "filter: ")}${l}`, width)),
 			...this.list.render(width),
-			truncateToWidth(t.fg("dim", "type to filter · ↑↓ move · enter select · esc cancel"), width),
+			truncateToWidth(t.fg("dim", this.hint), width),
 		];
 	}
 

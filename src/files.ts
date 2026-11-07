@@ -130,7 +130,7 @@ export function normalizePathScopes(paths: string[], kind: ScopeKind = "shared")
 	}
 	if (out.has(whole)) return [whole];
 	// Drop plain scopes already covered by another plain scope (`a` covers `a/b`).
-	const isGlob = (p: string) => /[*?[\]{}]/.test(p);
+	const isGlob = (p: string) => /[*?{}]/.test(p);
 	const plain = [...out].filter((p) => !isGlob(p));
 	return [...out].filter((p) => isGlob(p) || !plain.some((q) => q !== p && p.startsWith(`${q}/`))).sort((a, b) => a.localeCompare(b));
 }

@@ -265,3 +265,29 @@ test("result paths: snapshotId, patch headers (both files of a move), explicit p
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+test("scopes: bracketed directory and file names are treated as plain paths", () => {
+	assert.ok(scopeCovers("[fufu]logs", "[fufu]logs/docs/HANDOFF.md"));
+	assert.ok(scopeCovers("[fufu]logs/docs/HANDOFF.md", "[fufu]logs/docs/HANDOFF.md"));
+	assert.ok(!scopeCovers("[fufu]logs", "flEL/docs/HANDOFF.md"), "brackets are literal, not a char class");
+	assert.ok(scopeCovers("app/users/[id]", "app/users/[id]/page.tsx"));
+	assert.ok(scopeCovers("[fufu]logs/**/*.lua", "[fufu]logs/lua/sv_init.lua"), "globs under bracketed dirs still match");
+	assert.ok(scopeCovers("app/**/[id]/*.tsx", "app/users/[id]/page.tsx"), "globs with bracketed segments match");
+	assert.deepEqual(normalizePathScopes(["[fufu]logs/lua", "[fufu]logs", "app/[id]/page.tsx"]), ["[fufu]logs", "app/[id]/page.tsx"]);
+
+	const root = mkdtempSync(join(tmpdir(), "realctx-brackets-"));
+	try {
+		mkdirSync(join(root, "[fufu]logs", "docs"), { recursive: true });
+		writeFileSync(join(root, "[fufu]logs", "docs", "HANDOFF.md"), "# handoff");
+		const R = resolvePathArg(".", root) as string;
+		const rel = (xs: string[]) => xs.map((x) => (x.startsWith(`${R}/`) ? x.slice(R.length + 1) : x));
+		assert.deepEqual(rel(touchedPaths("read", { path: "[fufu]logs/docs/HANDOFF.md" }, root)), ["[fufu]logs/docs/HANDOFF.md"]);
+		assert.deepEqual(rel(touchedPaths("bash", { command: "cat [fufu]logs/docs/HANDOFF.md" }, root)), ["[fufu]logs/docs/HANDOFF.md"]);
+		assert.deepEqual(rel(resultPaths({ path: "[fufu]logs/docs/HANDOFF.md" }, root)), ["[fufu]logs/docs/HANDOFF.md"]);
+		const noGit = repoFiles(root, false);
+		assert.ok(scopeExists(root, "[fufu]logs", noGit));
+		assert.ok(scopeExists(root, "[fufu]logs/docs/HANDOFF.md", noGit));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});

@@ -66,6 +66,8 @@ export interface Settings {
 		minConfidence: number;
 		/** Share of the safe input window at which queued drops are applied. */
 		applyThreshold: number;
+		/** Token ceiling on applyThreshold (0 = off), so 1M-window models apply drops sooner. */
+		applyMaxTokens: number;
 		/** Share of the safe input window that triggers an emergency reclaim. */
 		emergencyThreshold: number;
 		/** Provider prompt-cache lifetime, e.g. "5m", "1h", "300s". */
@@ -103,6 +105,8 @@ export interface Settings {
 		model: string;
 		/** Share of the safe input window at which the historian prepares the next chunk (background). */
 		prepareThreshold: number;
+		/** Token ceiling on prepareThreshold (0 = off). */
+		prepareMaxTokens: number;
 		/** The last N assistant turns are never compressed. */
 		protectTurns: number;
 		/** Chunk size bounds, in tokens of the messages it replaces. */
@@ -270,6 +274,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		pKeep: 0.5,
 		minConfidence: 0.7,
 		applyThreshold: 0.35,
+		applyMaxTokens: 120_000,
 		emergencyThreshold: 0.9,
 		cacheTtl: "5m",
 		cacheTtlByModel: {},
@@ -286,6 +291,7 @@ export const DEFAULT_SETTINGS: Settings = {
 		enabled: true,
 		model: "",
 		prepareThreshold: 0.25,
+		prepareMaxTokens: 80_000,
 		protectTurns: 8,
 		minChunkTokens: 6000,
 		maxChunkTokens: 30000,
@@ -483,11 +489,13 @@ export function normalizeSettings(input: unknown): Settings {
 	for (const k of ["pDrop", "pUnique", "pKeep", "minConfidence"] as const) c[k] = clamp(c[k], 0, 1);
 	c.emergencyThreshold = clamp(c.emergencyThreshold, 0.1, 1);
 	c.applyThreshold = Math.min(clamp(c.applyThreshold, 0.05, 1), c.emergencyThreshold);
+	c.applyMaxTokens = Math.round(clamp(c.applyMaxTokens, 0, 10_000_000));
 	c.expandMaxTokens = Math.round(clamp(c.expandMaxTokens, 200, 200_000));
 	c.repinTurns = Math.round(clamp(c.repinTurns, 0, 1000));
 	const h = s.history;
 	h.model = typeof h.model === "string" ? h.model.trim() : "";
 	h.prepareThreshold = clamp(h.prepareThreshold, 0.05, 1);
+	h.prepareMaxTokens = Math.round(clamp(h.prepareMaxTokens, 0, 10_000_000));
 	h.protectTurns = Math.round(clamp(h.protectTurns, 1, 1000));
 	h.minChunkTokens = Math.round(clamp(h.minChunkTokens, 500, 500_000));
 	h.maxChunkTokens = Math.round(clamp(h.maxChunkTokens, h.minChunkTokens, 1_000_000));

@@ -12,6 +12,8 @@ export interface RewriteRequest {
 	/** The new fact (edit / merge); unused for revise. */
 	candidate?: { caption: string; content: string };
 	signal?: AbortSignal;
+	timeoutMs?: number;
+	background?: boolean;
 }
 
 export interface RewriteResult {
@@ -31,6 +33,8 @@ export interface CompletionRequest {
 	/** Keep the prompt cached between calls that share a long prefix. */
 	cache?: boolean;
 	signal?: AbortSignal;
+	timeoutMs?: number;
+	background?: boolean;
 }
 
 export type Completer = (req: CompletionRequest) => Promise<{ text: string; model: string; usage?: Usage }>;
@@ -104,30 +108,96 @@ export function resolveModel(spec: string, models: Pick<ModelAccess, "find">, fa
 	return models.find(s.slice(0, slash), s.slice(slash + 1)) ?? undefined;
 }
 
+export const DEFAULT_COMPLETION_TIMEOUT_MS = 30_000;
+export const HISTORIAN_TIMEOUT_MS = 60_000;
+export const MODEL_COOLDOWN_STRIKES = 2;
+export const MODEL_COOLDOWN_MS = 2 * 60_000;
+
+interface ModelHealth {
+	failures: number;
+	until: number;
+	lastError: string;
+}
+
+const modelHealth = new Map<string, ModelHealth>();
+
+/** Clear per-model failure cooldowns (for tests and settings reloads). */
+export function resetModelCooldowns(): void {
+	modelHealth.clear();
+}
+
 export function createCompleter(models: ModelAccess, model: Model<Api>): Completer {
+	const modelKey = `${model.provider}/${model.id}`;
 	return async (req) => {
-		const response = await models.complete(
+		if (req.background) {
+			const h = modelHealth.get(modelKey);
+			if (h && Date.now() < h.until) {
+				throw new Error(`${modelKey} cooling down after repeated failures: ${h.lastError}`);
+			}
+		}
+		const timeoutMs = req.timeoutMs ?? DEFAULT_COMPLETION_TIMEOUT_MS;
+		const controller = new AbortController();
+		const signal = req.signal ? AbortSignal.any([controller.signal, req.signal]) : controller.signal;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+		const call = models.complete(
 			model,
 			{
 				systemPrompt: req.system,
 				messages: [{ role: "user", content: [{ type: "text", text: req.prompt }], timestamp: Date.now() }],
 			},
-			{ signal: req.signal, cacheRetention: req.cache ? "short" : "none", maxTokens: req.maxTokens ?? 4096 },
+			{ signal, cacheRetention: req.cache ? "short" : "none", maxTokens: req.maxTokens ?? 4096 },
 		);
-		if (response.stopReason === "aborted") throw new Error("model call aborted");
-		if (response.stopReason === "error") throw new Error(`model call failed: ${response.errorMessage ?? "model error"}`);
-		const text = response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n");
-		return { text, model: `${model.provider}/${model.id}`, usage: response.usage };
+		const timeoutPromise = timeoutMs > 0
+			? new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					timedOut = true;
+					void call.catch(() => {});
+					controller.abort();
+					reject(new Error(`model call timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+				timer.unref?.();
+			})
+			: undefined;
+		try {
+			const response = timeoutPromise ? await Promise.race([call, timeoutPromise]) : await call;
+			if (timedOut) throw new Error(`model call timed out after ${timeoutMs}ms`);
+			if (response.stopReason === "aborted") throw new Error("model call aborted");
+			if (response.stopReason === "error") throw new Error(`model call failed: ${response.errorMessage ?? "model error"}`);
+			modelHealth.delete(modelKey);
+			const text = response.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			return { text, model: modelKey, usage: response.usage };
+		} catch (err) {
+			if (!req.signal?.aborted) {
+				const prev = modelHealth.get(modelKey);
+				const failures = (prev?.failures ?? 0) + 1;
+				const lastError = err instanceof Error ? err.message : String(err);
+				modelHealth.set(modelKey, {
+					failures,
+					until: failures >= MODEL_COOLDOWN_STRIKES ? Date.now() + MODEL_COOLDOWN_MS : 0,
+					lastError,
+				});
+			}
+			throw err;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 	};
 }
 
 export function createRewriter(models: ModelAccess, model: Model<Api>): Rewriter {
 	const complete = createCompleter(models, model);
 	return async (req) => {
-		const r = await complete({ system: SYSTEM_PROMPT, prompt: buildRewritePrompt(req), signal: req.signal });
+		const r = await complete({
+			system: SYSTEM_PROMPT,
+			prompt: buildRewritePrompt(req),
+			signal: req.signal,
+			timeoutMs: req.timeoutMs,
+			background: req.background,
+		});
 		return { ...parseRewrite(r.text), model: r.model, usage: r.usage };
 	};
 }

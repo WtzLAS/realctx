@@ -937,3 +937,71 @@ test("daily store sweep: orphaned folders and stale temp files go, recent ones s
 		e.close();
 	}
 });
+
+
+test("1M-window token ceilings and historian fallback: prepareMaxTokens/applyMaxTokens fire on hot cache and failed historian falls back deterministically", async () => {
+	const { resetModelCooldowns } = await import("../src/rewrite.ts");
+	resetModelCooldowns();
+	writeSettings({
+		context: {
+			captureMinTokens: 100,
+			dropMinTokens: 100,
+			protectTurns: 1,
+			applyThreshold: 0.35,
+			applyMaxTokens: 2_500,
+			cacheTtl: "24h",
+		},
+		history: {
+			model: "h/broken",
+			prepareThreshold: 0.25,
+			prepareMaxTokens: 1_500,
+			protectTurns: 2,
+			minChunkTokens: 500,
+			maxChunkTokens: 100_000,
+			emergencyFallback: true,
+		},
+	});
+	const h = await harness();
+	// 1M window: 25% would be ~234k and 35% ~328k, so only the token ceilings can fire here.
+	h.ctx.model = { provider: "p", id: "m", contextWindow: 1_000_000, maxTokens: 64_000 };
+	const origComplete = h.ctx.modelRegistry.complete;
+	let brokenCalls = 0;
+	h.ctx.modelRegistry.complete = async (model: any, req: any) => {
+		if (model.id === "broken") {
+			brokenCalls++;
+			return { stopReason: "error", errorMessage: "upstream timeout", content: [], usage: {} };
+		}
+		return origComplete(model, req);
+	};
+	try {
+		h.user("audit large repo");
+		for (let i = 0; i < 5; i++) {
+			for (const e of h.entries) {
+				if (e.type === "message" && e.message.role === "assistant" && e.message.usage) e.message.usage.totalTokens = 3_000;
+			}
+			await h.request();
+			await h.turn(i < 3 ? "bash" : "read", i < 3 ? { command: `step ${i}` } : { path: "same.ts" }, big(`ver ${i}`));
+		}
+		await h.settle();
+		assert.ok(brokenCalls >= 1, "prepareMaxTokens triggered the historian far below 25% of 1M");
+
+		const st = (await h.tools.get("realctx_status").execute("s", {}, undefined, undefined, h.ctx)).details.context.history;
+		assert.match(st.lastError ?? "", /upstream timeout|cooling down/);
+
+		for (const e of h.entries) {
+			if (e.type === "message" && e.message.role === "assistant" && e.message.usage) e.message.usage.totalTokens = 3_000;
+		}
+		const out = await h.request();
+		const histBlock = out.find((m: any) => m.role === "custom" && m.customType === "realctx-history");
+		assert.ok(histBlock, "applyMaxTokens applied the deterministic fallback history block on a hot cache");
+		assert.match(histBlock.content, /Deterministic outline: the historian model failed/);
+		const droppedReread = out.some(
+			(m: any) => m.role === "toolResult" && m.content?.some((c: any) => String(c.text ?? "").includes("re-read in")),
+		);
+		assert.ok(droppedReread, "applyMaxTokens also applied queued rule drops on a hot cache");
+	} finally {
+		resetModelCooldowns();
+		await h.shutdown();
+		writeSettings({});
+	}
+});

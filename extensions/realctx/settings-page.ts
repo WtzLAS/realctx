@@ -204,7 +204,7 @@ function fields(): FieldDef[] {
 		max,
 		integer,
 	});
-	type HNumKey = "prepareThreshold" | "protectTurns" | "minChunkTokens" | "maxChunkTokens" | "summaryMaxTokens";
+	type HNumKey = { [K in keyof Settings["history"]]: Settings["history"][K] extends number ? K : never }[keyof Settings["history"]];
 	const hNum = (id: HNumKey, label: string, description: string, min = 0, max = 1, integer = false): FieldDef => ({
 		id: `history.${id}`,
 		label,
@@ -480,6 +480,7 @@ function fields(): FieldDef[] {
 			values: ["on", "off"],
 		},
 		hNum("prepareThreshold", "History: prepare at", "Share of the safe input window at which the historian starts summarizing old turns (background).", 0.05, 1),
+		hNum("prepareMaxTokens", "History: prepare max tokens", "Token ceiling on the prepare threshold: the historian also starts once usage reaches this many tokens (0 = off).", 0, 10_000_000, true),
 		hNum("protectTurns", "History: protect turns", "The last N agent turns are never summarized.", 1, 1000, true),
 		hNum("minChunkTokens", "History: min chunk tokens", "Summarize at least this much old conversation at once.", 500, 500_000, true),
 		hNum("maxChunkTokens", "History: max chunk tokens", "Summarize at most this much per historian call.", 500, 1_000_000, true),
@@ -514,6 +515,7 @@ function fields(): FieldDef[] {
 		ctxNum("pUnique", "Context: max P(unique_info)", "Drop (rather than summarize) only when P(unique info) is below this."),
 		ctxNum("minConfidence", "Context: min confidence", "Minimum judge confidence (P of the drop/summarize action) to act."),
 		ctxNum("applyThreshold", "Context: apply threshold", "Share of the safe input window at which queued drops are applied in one pass."),
+		ctxNum("applyMaxTokens", "Context: apply max tokens", "Token ceiling on the apply threshold: queued drops also apply once usage reaches this many tokens (0 = off), so 1M-window models do not wait until 350k tokens.", 0, 10_000_000, true),
 		ctxNum("emergencyThreshold", "Context: emergency threshold", "Share of the safe input window that applies everything and drops the largest old outputs."),
 		{
 			id: "context.cacheTtl",

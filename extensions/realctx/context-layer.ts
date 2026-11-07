@@ -708,8 +708,9 @@ export class ContextLayer {
 			const cold = lastResponse > 0 && now - lastResponse >= this.ttlMs(ctx);
 			const share = usage?.share ?? 0;
 			const emergency = share >= this.cfg.emergencyThreshold;
+			const applyReached = share >= this.cfg.applyThreshold || (!!usage && this.cfg.applyMaxTokens > 0 && usage.tokens >= this.cfg.applyMaxTokens);
 			// Drops and history summaries apply together, so the prefix is rebuilt once (§8.2).
-			const trigger = this.flushRequested || cold || share >= this.cfg.applyThreshold || emergency;
+			const trigger = this.flushRequested || cold || applyReached || emergency;
 			this.flushRequested = false;
 			if ((trigger && this.pending.size > 0) || emergency) {
 				const before = this.applied.size;
@@ -847,7 +848,8 @@ export class ContextLayer {
 	/** §8.3: drop the largest unprotected outputs until usage is under the apply threshold. */
 	private emergencyReclaim(gray: OutputMeta[], usage: NonNullable<LayerStatus["usage"]>, turn: number): void {
 		let tokens = usage.tokens;
-		const target = this.cfg.applyThreshold * usage.window;
+		const byShare = this.cfg.applyThreshold * usage.window;
+		const target = this.cfg.applyMaxTokens > 0 ? Math.min(byShare, this.cfg.applyMaxTokens) : byShare;
 		const savedNow = [...this.applied.values()].filter((a) => a.turn === turn).reduce((s, a) => s + a.saved, 0);
 		tokens -= savedNow;
 		const order = [...gray].filter((o) => !this.applied.has(o.id)).sort((a, b) => b.tokens - a.tokens || a.ord - b.ord);
@@ -1050,7 +1052,7 @@ export class ContextLayer {
 		try {
 			const rw = rewriterFor(this.host.engine(), ctx);
 			if (rw.completer) {
-				const r = await rw.completer({ system: SUMMARY_SYSTEM, prompt: buildSummaryPrompt(meta, text), maxTokens: 300 });
+				const r = await rw.completer({ system: SUMMARY_SYSTEM, prompt: buildSummaryPrompt(meta, text), maxTokens: 300, background: true });
 				const clean = cleanSummary(r.text);
 				if (clean) return clean;
 			}
@@ -1073,7 +1075,7 @@ export class ContextLayer {
 		const text = stripPathNotes(contentText(stored.content));
 		let facts: ReturnType<typeof parseFacts>;
 		try {
-			const r = await rw.completer({ system: EXTRACT_SYSTEM, prompt: buildExtractPrompt(meta, redactSecrets(text), meta.paths.map((p) => displayPath(p, ctx.cwd))), maxTokens: 1200 });
+			const r = await rw.completer({ system: EXTRACT_SYSTEM, prompt: buildExtractPrompt(meta, redactSecrets(text), meta.paths.map((p) => displayPath(p, ctx.cwd))), maxTokens: 1200, background: true });
 			facts = parseFacts(parseJsonObject(r.text));
 		} catch {
 			return none;
@@ -1361,7 +1363,7 @@ export class ContextLayer {
 		if (!takeCaptureBudget(familyRoot(this.sessionId), s.capture.maxPerSessionHour)) return;
 		let facts: ReturnType<typeof parseFacts>;
 		try {
-			const r = await rw.completer({ system: USER_EXTRACT_SYSTEM, prompt: buildUserExtractPrompt(clean, prevReply ? redactSecrets(prevReply) : undefined), maxTokens: 1000 });
+			const r = await rw.completer({ system: USER_EXTRACT_SYSTEM, prompt: buildUserExtractPrompt(clean, prevReply ? redactSecrets(prevReply) : undefined), maxTokens: 1000, background: true });
 			facts = parseFacts(parseJsonObject(r.text));
 		} catch {
 			return;

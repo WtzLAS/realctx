@@ -7,7 +7,7 @@ import { adoptPlainMarkdown, normalizePathScopes, parseMemoryMarkdown, serialize
 import { idTimestamp, newId, parseId, toCanonicalUuid } from "../src/ids.ts";
 import { buildJudgeRequest, type Candidate, decide, NONE, type Neighbor, readSignals } from "../src/judge.ts";
 import type { MemoryRow } from "../src/db.ts";
-import { parseRewrite } from "../src/rewrite.ts";
+import { createCompleter, parseRewrite, resetModelCooldowns } from "../src/rewrite.ts";
 import { redactSecrets, sanitizeForPrompt, scanInjection, scanSecrets } from "../src/safety.ts";
 import { ftsQuery, indexTokens, queryTokens } from "../src/text.ts";
 
@@ -243,4 +243,48 @@ test("api: empty model uses the server's only model, several models is an error,
 	} finally {
 		srv.close();
 	}
+});
+
+
+test("completer: enforces timeout on unresponsive providers and cools down failing background models", async () => {
+	resetModelCooldowns();
+	let calls = 0;
+	let mode: "hang" | "error" | "ok" = "hang";
+	const dummyModel = { provider: "cliproxy", id: "slow-model" } as any;
+	const complete = createCompleter(
+		{
+			find: () => dummyModel,
+			complete: async () => {
+				calls++;
+				if (mode === "hang") return await new Promise<never>(() => {});
+				if (mode === "error") return { stopReason: "error", errorMessage: "gateway 504", content: [] } as any;
+				return { stopReason: "stop", content: [{ type: "text", text: "recovered" }], usage: {} } as any;
+			},
+		},
+		dummyModel,
+	);
+
+	// 1st failure: hangs forever, bounded by timeoutMs.
+	await assert.rejects(complete({ system: "s", prompt: "p", timeoutMs: 25, background: true }), /timed out after 25ms/);
+	assert.equal(calls, 1);
+
+	// 2nd failure: reaches strike threshold and trips cooldown.
+	mode = "error";
+	await assert.rejects(complete({ system: "s", prompt: "p", background: true }), /gateway 504/);
+	assert.equal(calls, 2);
+
+	// 3rd background call fails fast without hitting the provider.
+	await assert.rejects(complete({ system: "s", prompt: "p", background: true }), /cooling down after repeated failures.*gateway 504/);
+	assert.equal(calls, 2);
+
+	// Foreground calls still try the provider, and a success clears the background cooldown.
+	mode = "ok";
+	const fg = await complete({ system: "s", prompt: "p" });
+	assert.equal(fg.text, "recovered");
+	assert.equal(calls, 3);
+
+	const bg = await complete({ system: "s", prompt: "p", background: true });
+	assert.equal(bg.text, "recovered");
+	assert.equal(calls, 4);
+	resetModelCooldowns();
 });

@@ -34,6 +34,7 @@ import { fmtTokens } from "../../src/outputs.ts";
 import { viewOriginal } from "../../src/policy.ts";
 import { familyRoot, takeCaptureBudget } from "../../src/shared.ts";
 import { estimateTokens } from "../../src/text.ts";
+import { HISTORIAN_TIMEOUT_MS } from "../../src/rewrite.ts";
 import { historianFor, rewriterFor } from "./tools.ts";
 
 export const HISTORY_ENTRY = HISTORY_TYPE;
@@ -231,14 +232,19 @@ export class HistoryManager {
 		this.unflushed.push(c);
 	}
 
+	private prepareTarget(window: number): number {
+		const byShare = this.cfg.prepareThreshold * window;
+		return this.cfg.prepareMaxTokens > 0 ? Math.min(byShare, this.cfg.prepareMaxTokens) : byShare;
+	}
+
 	/** After a turn: prepare chunks in the background while usage is above the prepare threshold. */
 	prepareInBackground(ctx: ExtensionContext, opts: { force?: boolean } = {}): void {
 		if (!this.enabled || this.preparing) return;
 		const usage = this.host.usage();
-		if (!opts.force && (!usage || usage.share < this.cfg.prepareThreshold)) return;
+		if (!opts.force && (!usage || usage.tokens < this.prepareTarget(usage.window))) return;
 		this.preparing = true;
 		const gen = this.generation;
-		void this.prepare(ctx, gen, !!opts.force)
+		void this.prepare(ctx, gen, !!opts.force, !opts.force)
 			.catch((err) => {
 				this.lastError = err instanceof Error ? err.message : String(err);
 			})
@@ -252,7 +258,7 @@ export class HistoryManager {
 		if (this.preparing) return { prepared: 0, error: "the historian is already running" };
 		this.preparing = true;
 		try {
-			return { prepared: await this.prepare(ctx, this.generation, true) };
+			return { prepared: await this.prepare(ctx, this.generation, true, false) };
 		} catch (err) {
 			return { prepared: 0, error: err instanceof Error ? err.message : String(err) };
 		} finally {
@@ -260,7 +266,7 @@ export class HistoryManager {
 		}
 	}
 
-	private async prepare(ctx: ExtensionContext, gen: number, force: boolean): Promise<number> {
+	private async prepare(ctx: ExtensionContext, gen: number, force: boolean, background: boolean): Promise<number> {
 		const messages = this.lastInput;
 		if (messages.length === 0) return 0;
 		const usage = this.host.usage();
@@ -268,10 +274,10 @@ export class HistoryManager {
 		let prepared = 0;
 		for (let round = 0; round < 4; round++) {
 			if (gen !== this.generation) return prepared;
-			if (!force && usage && projected / usage.window < this.cfg.prepareThreshold) break;
+			if (!force && usage && projected < this.prepareTarget(usage.window)) break;
 			const pick = this.planChunk(messages, force);
 			if (!pick) break;
-			const c = await this.summarize(ctx, messages, pick);
+			const c = await this.summarize(ctx, messages, pick, background);
 			if (!c || gen !== this.generation) break;
 			this.chunks.set(c.n, c);
 			this.unflushed.push(c);
@@ -294,7 +300,7 @@ export class HistoryManager {
 		return out;
 	}
 
-	private async summarize(ctx: ExtensionContext, messages: MessageView[], pick: { start: number; end: number; tokens: number }): Promise<HistoryChunk | undefined> {
+	private async summarize(ctx: ExtensionContext, messages: MessageView[], pick: { start: number; end: number; tokens: number }, background = false): Promise<HistoryChunk | undefined> {
 		const e = this.host.engine();
 		const s = this.host.settings();
 		const h = historianFor(e, ctx);
@@ -309,26 +315,45 @@ export class HistoryManager {
 		}
 		const wantFacts = s.history.captureFacts && s.capture.mode !== "off" && !this.host.subagent();
 		const transcript = renderTranscript(part, { turnOffset: this.inputTurnOffset + before, output, maxTokens: Math.min(pick.tokens, s.history.maxChunkTokens) });
-		const r = await h.completer({
-			system: HISTORIAN_SYSTEM,
-			prompt: buildHistorianPrompt({ transcript, storySoFar: this.storySoFar(), turns, summaryTokens: s.history.summaryMaxTokens, facts: wantFacts }),
-			maxTokens: s.history.summaryMaxTokens * 2 + 600,
-		});
-		const parsed = parseHistorian(r.text, s.history.summaryMaxTokens);
-		if (!parsed.summary) {
-			this.lastError = "the historian returned no summary";
-			return undefined;
+		let summary = "";
+		let model = "";
+		let facts: ReturnType<typeof parseHistorian>["facts"] = [];
+		try {
+			const r = await h.completer({
+				system: HISTORIAN_SYSTEM,
+				prompt: buildHistorianPrompt({ transcript, storySoFar: this.storySoFar(), turns, summaryTokens: s.history.summaryMaxTokens, facts: wantFacts }),
+				maxTokens: s.history.summaryMaxTokens * 2 + 600,
+				timeoutMs: HISTORIAN_TIMEOUT_MS,
+				background,
+			});
+			const parsed = parseHistorian(r.text, s.history.summaryMaxTokens);
+			if (!parsed.summary) {
+				this.lastError = "the historian returned no summary";
+			} else {
+				this.lastError = undefined;
+				this.lastModel = r.model;
+				summary = parsed.summary;
+				model = r.model;
+				facts = parsed.facts;
+			}
+		} catch (err) {
+			this.lastError = err instanceof Error ? err.message : String(err);
+			if (!background) throw err;
 		}
-		this.lastError = undefined;
-		this.lastModel = r.model;
-		const c = this.chunkFrom(messages, pick, parsed.summary, r.model);
+		if (!summary) {
+			if (!background || !s.history.emergencyFallback) return undefined;
+			const outline = fallbackHistory(part, { turnOffset: this.inputTurnOffset + before, output });
+			summary = `${outline}\n\n(Deterministic outline: the historian model failed.)`;
+			model = "fallback";
+		}
+		const c = this.chunkFrom(messages, pick, summary, model);
 		if (c.tokensAfter >= c.tokensBefore) return undefined; // nothing gained
 		try {
-			e.db.logEvent(this.host.sessionId(), "history", undefined, c.tokensBefore - c.tokensAfter, { n: c.n, turns: c.turns, model: r.model, facts: parsed.facts.length });
+			e.db.logEvent(this.host.sessionId(), "history", undefined, c.tokensBefore - c.tokensAfter, { n: c.n, turns: c.turns, model: c.model, facts: facts.length });
 		} catch {
 			// telemetry is best effort
 		}
-		if (wantFacts && parsed.facts.length > 0) void this.captureFacts(ctx, parsed.facts).catch(() => {});
+		if (wantFacts && facts.length > 0) void this.captureFacts(ctx, facts).catch(() => {});
 		return c;
 	}
 
@@ -389,7 +414,8 @@ export class HistoryManager {
 		const all = [...this.chunks.values()].sort((a, b) => a.n - b.n);
 		if (all.length === 0) {
 			const u = this.host.usage();
-			return [`No history compressed yet (the historian starts at ${Math.round(this.cfg.prepareThreshold * 100)}% of the safe window${u ? `; now ${Math.round(u.share * 100)}%` : ""}).`];
+			const cap = this.cfg.prepareMaxTokens > 0 ? ` or ${fmtTokens(this.cfg.prepareMaxTokens)}` : "";
+			return [`No history compressed yet (the historian starts at ${Math.round(this.cfg.prepareThreshold * 100)}% of the safe window${cap}${u ? `; now ${Math.round(u.share * 100)}% (${fmtTokens(u.tokens)})` : ""}).`];
 		}
 		return all.map(
 			(c) =>

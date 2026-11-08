@@ -6,7 +6,7 @@
  *  - global memories:  "~" (the default) = the user directory / everywhere, "~/x" under
  *    the user directory, or an absolute path outside it.
  * A scope is a plain path (a file or a directory and everything under it) or a glob
- * (`*`, `?`, `**`, `[...]`, `{a,b}`, matched with path.matchesGlob).
+ * (`*`, `?`, `**`, `{a,b}`, matched with path.matchesGlob; `[` and `]` are treated as literal path characters).
  *
  * All comparisons happen on absolute paths: stored scopes are resolved against their
  * root, and touched paths (from the agent's tool calls) are absolute and canonical.
@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, matchesGlob, normalize, posix } from "node:path";
 import { canonicalPath, type ScopeKind } from "./files.ts";
 
-const GLOB_CHARS = /[*?[\]{}]/;
+const GLOB_CHARS = /[*?{}]/;
 
 export function isGlob(scope: string): boolean {
 	return GLOB_CHARS.test(scope);
@@ -38,8 +38,10 @@ function under(child: string, parent: string): boolean {
 }
 
 function globMatch(path: string, glob: string): boolean {
+	const prefix = staticPrefix(glob);
+	if (prefix && !under(path, prefix)) return false;
 	try {
-		return matchesGlob(path, glob);
+		return matchesGlob(path, glob.replace(/\[/g, "[[]"));
 	} catch {
 		return false;
 	}
@@ -191,7 +193,7 @@ export function reduceScopes(paths: string[]): string[] {
 // ---------------------------------------------------------------------------
 
 const PATH_KEYS = new Set(["path", "paths", "file", "files", "filepath", "file_path", "filename", "dir", "directory", "cwd", "target", "targets", "cwdpath"]);
-const TOKEN_RE = /^[\w.@~+%=,-][\w./@~+%=,-]*$/;
+const TOKEN_RE = /^[\w.@~+%=,[\]-][\w./@~+%=,[\]-]*$/;
 
 function shellTokens(command: string): string[] {
 	const out: string[] = [];
@@ -215,7 +217,7 @@ export function touchedPaths(toolName: string, input: Record<string, unknown> | 
 	if (!input || toolName.startsWith("realctx_")) return [];
 	const out = new Set<string>();
 	const add = (p: unknown, mustExist: boolean) => {
-		if (typeof p !== "string" || p === "." || p === ".." || /[*?[\]{}]/.test(p)) return;
+		if (typeof p !== "string" || p === "." || p === ".." || GLOB_CHARS.test(p)) return;
 		const abs = resolvePathArg(p, cwd);
 		if (!abs || abs === "/") return;
 		if (mustExist && !existsSync(abs)) return;
@@ -247,7 +249,7 @@ export function resultPaths(details: unknown, cwd: string): string[] {
 	const d = details as Record<string, unknown>;
 	const out = new Set<string>();
 	const add = (p: unknown) => {
-		if (out.size >= 32 || typeof p !== "string" || !p || p === "." || p === ".." || /[*?[\]{}\n]/.test(p)) return;
+		if (out.size >= 32 || typeof p !== "string" || !p || p === "." || p === ".." || GLOB_CHARS.test(p) || p.includes("\n")) return;
 		const abs = resolvePathArg(p, cwd);
 		if (!abs || abs === "/" || !existsSync(abs)) return;
 		out.add(abs);

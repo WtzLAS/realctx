@@ -27,6 +27,7 @@ function callSummary(name: string, a: Record<string, any>): string {
 		if (a.ids) parts.push(compact(a.ids, name === "realctx_expand" ? "#" : ""));
 		if (a.history) parts.push(compact(a.history, "h"));
 	}
+	if (a.root) parts.push(`root ${clean(a.root, 120)}`);
 	if (a.paths) parts.push(compact(a.paths));
 	if (a.scope) parts.push(clean(a.scope));
 	if (a.page) parts.push(`page ${clean(a.page)}`);
@@ -97,6 +98,7 @@ export function toolRenderers(name: string): Pick<ToolDefinition, "renderCall" |
 				if (expanded) lines = raw.split("\n").slice(0, 80).map((l) => muted(clean(l, 400)));
 				else lines.push(...raw.split("\n").filter((l) => /warning|not configured|error/i.test(l)).slice(0, 3).map((l) => theme.fg("warning", clean(l, 200))));
 			}
+			if (d.readOnly) lines.unshift(muted(`Read-only · ${clean(d.root, 160)}`));
 			return context?.lastComponent instanceof Summary ? context.lastComponent.set(lines) : new Summary(lines);
 		},
 	};

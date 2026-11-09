@@ -287,6 +287,28 @@ export class MemoryEngine {
 		judgeScheduler.configure(this.settings.judge.concurrency, this.settings.judge.minIntervalMs);
 	}
 
+	/**
+	 * Read another directory without migrations or persistent index/usage writes.
+	 * Fresh files are indexed in an isolated database, never the process-wide one.
+	 */
+	private readView(cwd: string, readOnly: boolean) {
+		if (!readOnly) {
+			this.sync(cwd);
+			return { ctx: this.scopes(cwd), db: this.db, index: this.index, close: () => {} };
+		}
+		const ctx = scopeContext(cwd, this.paths.globalDir, this.paths.personalRoot);
+		const db = this.db.memorySnapshot();
+		try {
+			const index = new MemoryIndex(db, this.settings, this.embedder);
+			index.sync(ctx.stores);
+			db.syncVectors(embeddingFingerprint(this.settings));
+			return { ctx, db, index, close: () => db.close() };
+		} catch (err) {
+			db.close();
+			throw err;
+		}
+	}
+
 	close(): void {
 		this.db.close();
 	}
@@ -393,75 +415,100 @@ export class MemoryEngine {
 			scope?: ScopeKind;
 			signal?: AbortSignal;
 			countUsage?: boolean;
+			/** Browse without persistent changes, including usage, migrations and index writes. */
+			readOnly?: boolean;
 			/** Paths (relative to cwd, `~/…` or absolute) the query is about: ranked first; alone, lists their memories. */
 			paths?: string[];
 			/** Absolute paths the agent touched recently (ranked first as well). */
 			focus?: string[];
 		} = {},
 	): Promise<RecallResult> {
-		const ctx = this.scopes(cwd);
-		this.sync(cwd);
-		const stores = opts.scope ? ctx.stores.filter((s) => s.kind === opts.scope) : ctx.stores;
-		const texts = queries.map((q) => q.trim()).filter(Boolean).slice(0, 16);
-		const explicit = (opts.paths ?? []).map((p) => resolvePathArg(p, cwd)).filter((p): p is string => !!p && p !== "/");
-		if (texts.length === 0) {
-			if (explicit.length === 0) throw new CandidateError("recall needs at least one non-empty query or a path");
-			return this.pathLookup(ctx, stores, explicit, opts);
-		}
-		const here = resolvePathArg(".", cwd);
-		const focus = [...new Set([...explicit, ...(opts.focus ?? []), ...(here && here !== ctx.project?.root && here !== homeRoot() ? [here] : [])])];
-		let vectors: Float32Array[] = [];
-		let embedError: string | undefined;
-		if (this.embedder.configured) {
-			try {
-				await this.index.embedMissing(opts.signal);
-				vectors = (await this.embedder.embed(texts, "query", opts.signal)).vectors;
-			} catch (err) {
-				embedError = err instanceof Error ? err.message : String(err);
+		const view = this.readView(cwd, opts.readOnly === true);
+		const { ctx } = view;
+		try {
+			const stores = opts.scope ? ctx.stores.filter((s) => s.kind === opts.scope) : ctx.stores;
+			const texts = queries.map((q) => q.trim()).filter(Boolean).slice(0, 16);
+			const explicit = (opts.paths ?? []).map((p) => resolvePathArg(p, cwd)).filter((p): p is string => !!p && p !== "/");
+			if (texts.length === 0) {
+				if (explicit.length === 0) throw new CandidateError("recall needs at least one non-empty query or a path");
+				return this.pathLookup(ctx, stores, explicit, { ...opts, countUsage: !opts.readOnly && opts.countUsage !== false }, view.db);
 			}
+			const here = resolvePathArg(".", cwd);
+			const focus = [...new Set([...explicit, ...(opts.focus ?? []), ...(here && here !== ctx.project?.root && here !== homeRoot() ? [here] : [])])];
+			let vectors: Float32Array[] = [];
+			let embedError: string | undefined;
+			if (this.embedder.configured) {
+				try {
+					if (!opts.readOnly) await view.index.embedMissing(opts.signal);
+					vectors = (await this.embedder.embed(texts, "query", opts.signal)).vectors;
+				} catch (err) {
+					embedError = err instanceof Error ? err.message : String(err);
+				}
+			}
+			const s = this.settings;
+			const hits = view.index.hybrid(stores, {
+				vectors,
+				texts,
+				limit: s.recall.maxResults,
+				minSimilarity: s.thresholds.recallMinSimilarity,
+			});
+			// Relevant set first; then ordered by path (memories about the focus paths first,
+			// project-wide next, other areas last), then most used, then relevance.
+			const rank = new Map(hits.map((h, i) => [h.memory.rid, i]));
+			const tier = (m: MemoryRow) => pathTier(m, focus, ctx.project?.root);
+			hits.sort(
+				(a, b) =>
+					tier(b.memory) - tier(a.memory) || b.memory.usedCount - a.memory.usedCount || (rank.get(a.memory.rid) ?? 0) - (rank.get(b.memory.rid) ?? 0),
+			);
+			const pageSize = Math.max(1, opts.pageSize ?? s.recall.pageSize);
+			const pages = Math.max(1, Math.ceil(hits.length / pageSize));
+			const page = Math.min(Math.max(1, opts.page ?? 1), pages);
+			const items = hits.slice((page - 1) * pageSize, page * pageSize).map((h) => ({ ...h, store: this.storeById(ctx, h.memory.store) }));
+			if (items.length > 0 && !opts.readOnly && opts.countUsage !== false) view.db.bumpUsage(items.map((i) => i.memory.id), "recall");
+			return { items, total: hits.length, page, pages, embedError, focus };
+		} finally {
+			view.close();
 		}
-		const s = this.settings;
-		const hits = this.index.hybrid(stores, {
-			vectors,
-			texts,
-			limit: s.recall.maxResults,
-			minSimilarity: s.thresholds.recallMinSimilarity,
-		});
-		// Relevant set first; then ordered by path (memories about the focus paths first,
-		// project-wide next, other areas last), then most used, then relevance.
-		const rank = new Map(hits.map((h, i) => [h.memory.rid, i]));
-		const tier = (m: MemoryRow) => pathTier(m, focus, ctx.project?.root);
-		hits.sort(
-			(a, b) =>
-				tier(b.memory) - tier(a.memory) || b.memory.usedCount - a.memory.usedCount || (rank.get(a.memory.rid) ?? 0) - (rank.get(b.memory.rid) ?? 0),
-		);
-		const pageSize = Math.max(1, opts.pageSize ?? s.recall.pageSize);
-		const pages = Math.max(1, Math.ceil(hits.length / pageSize));
-		const page = Math.min(Math.max(1, opts.page ?? 1), pages);
-		const items = hits.slice((page - 1) * pageSize, page * pageSize).map((h) => ({ ...h, store: this.storeById(ctx, h.memory.store) }));
-		if (items.length > 0 && opts.countUsage !== false) this.db.bumpUsage(items.map((i) => i.memory.id), "recall");
-		return { items, total: hits.length, page, pages, embedError, focus };
+	}
+
+	/** List visible memories, optionally without any persistent changes. */
+	list(cwd: string, opts: { page?: number; scope?: ScopeKind; readOnly?: boolean } = {}) {
+		const view = this.readView(cwd, opts.readOnly === true);
+		try {
+			const stores = view.ctx.stores.filter((s) => !opts.scope || s.kind === opts.scope).map((s) => s.id);
+			const pageSize = this.settings.list.pageSize;
+			const total = view.db.count(stores);
+			const pages = Math.max(1, Math.ceil(total / pageSize));
+			const page = Math.min(Math.max(1, opts.page ?? 1), pages);
+			const rows = view.db.list(stores, { limit: pageSize, offset: (page - 1) * pageSize, order: "path" });
+			return { rows, total, page, pages, pageSize };
+		} finally {
+			view.close();
+		}
 	}
 
 	/** Fetch memories by id (compact or canonical UUID, or a unique prefix of ≥ 6 chars). */
-	getMemories(cwd: string, ids: string[], countUsage = true): { found: MemoryRow[]; missing: string[] } {
-		const ctx = this.scopes(cwd);
-		this.sync(cwd);
-		const stores = ctx.stores.map((s) => s.id);
-		const found: MemoryRow[] = [];
-		const missing: string[] = [];
-		for (const raw of ids.slice(0, 32)) {
-			const id = parseId(raw);
-			let m = id ? this.db.getById(id, stores) : undefined;
-			if (!m && !id && raw.trim().length >= 6) {
-				const hits = this.db.getByIdPrefix(raw.trim(), stores);
-				if (hits.length === 1) m = hits[0];
+	getMemories(cwd: string, ids: string[], countUsage = true, readOnly = false): { found: MemoryRow[]; missing: string[] } {
+		const view = this.readView(cwd, readOnly);
+		try {
+			const stores = view.ctx.stores.map((s) => s.id);
+			const found: MemoryRow[] = [];
+			const missing: string[] = [];
+			for (const raw of ids.slice(0, 32)) {
+				const id = parseId(raw);
+				let m = id ? view.db.getById(id, stores) : undefined;
+				if (!m && !id && raw.trim().length >= 6) {
+					const hits = view.db.getByIdPrefix(raw.trim(), stores);
+					if (hits.length === 1) m = hits[0];
+				}
+				if (m && !m.flags) found.push(m);
+				else missing.push(raw);
 			}
-			if (m && !m.flags) found.push(m);
-			else missing.push(raw);
+			if (!readOnly && countUsage && found.length > 0) view.db.bumpUsage(found.map((m) => m.id), "recall");
+			return { found, missing };
+		} finally {
+			view.close();
 		}
-		if (countUsage && found.length > 0) this.db.bumpUsage(found.map((m) => m.id), "recall");
-		return { found, missing };
 	}
 
 	/** Recall without a query: the memories attached to the given paths, most specific then most used first. */
@@ -470,8 +517,9 @@ export class MemoryEngine {
 		stores: StoreRef[],
 		paths: string[],
 		opts: { page?: number; pageSize?: number; countUsage?: boolean },
+		db = this.db,
 	): RecallResult {
-		const rows = this.db
+		const rows = db
 			.pathScoped(stores.map((s) => s.id))
 			.map((m) => {
 				const abs = absoluteScopes(m, ctx.project?.root) ?? [];
@@ -483,7 +531,7 @@ export class MemoryEngine {
 		const pages = Math.max(1, Math.ceil(rows.length / pageSize));
 		const page = Math.min(Math.max(1, opts.page ?? 1), pages);
 		const items = rows.slice((page - 1) * pageSize, page * pageSize).map((x) => ({ memory: x.m as MemoryRow, score: 0, store: this.storeById(ctx, x.m.store) }));
-		if (items.length > 0 && opts.countUsage !== false) this.db.bumpUsage(items.map((i) => i.memory.id), "recall");
+		if (items.length > 0 && opts.countUsage !== false) db.bumpUsage(items.map((i) => i.memory.id), "recall");
 		return { items, total: rows.length, page, pages, focus: paths };
 	}
 
@@ -1443,39 +1491,43 @@ export class MemoryEngine {
 	// status
 	// -------------------------------------------------------------------------
 
-	status(cwd: string): Record<string, unknown> {
-		const ctx = this.scopes(cwd);
-		this.sync(cwd);
-		const fp = embeddingFingerprint(this.settings);
-		const perStore = ctx.stores.map((s) => ({
-			scope: SCOPE_LABEL[s.kind],
-			dir: s.dir,
-			memories: this.db.count([s.id]),
-			quarantined: this.db.countFlagged([s.id]),
-		}));
-		const projectStores = ctx.stores.map((s) => s.id);
-		const scoped = this.db.pathScoped(projectStores);
-		return {
-			project: ctx.project ? { name: ctx.project.name, root: ctx.project.root, key: ctx.project.key, relCwd: ctx.project.relCwd } : null,
-			gitignore: ctx.project?.isGit ? (() => {
-				const p = this.sharedIgnored(ctx.project.root);
-				return p ? describeIgnoreProblem(p) : null;
-			})() : null,
-			stores: perStore,
-			paths: {
-				scoped: scoped.length,
-				unjudged: scoped.filter((m) => m.urgency === undefined).length,
-				stale: this.db.stalePathIds(projectStores).size,
-				inject: this.settings.paths.inject,
-			},
-			embeddings: { ...this.db.embeddingStats(fp), fingerprint: fp, sqliteVec: this.db.vecAvailable ? "loaded" : `unavailable (${this.db.vecError})` },
-			pending: this.db.countPending(ctx.project?.root),
-			config: {
-				embedding: this.embedder.configured ? this.settings.embedding.endpoint : null,
-				semif: this.semif.configured ? this.settings.semif.endpoint : null,
-				rewriteModel: this.settings.rewriteModel || null,
-			},
-			writeLock: this.db.lockHolder(WRITE_LOCK) ?? null,
-		};
+	status(cwd: string, readOnly = false): Record<string, unknown> {
+		const view = this.readView(cwd, readOnly);
+		const { ctx } = view;
+		try {
+			const fp = embeddingFingerprint(this.settings);
+			const perStore = ctx.stores.map((s) => ({
+				scope: SCOPE_LABEL[s.kind],
+				dir: s.dir,
+				memories: view.db.count([s.id]),
+				quarantined: view.db.countFlagged([s.id]),
+			}));
+			const projectStores = ctx.stores.map((s) => s.id);
+			const scoped = view.db.pathScoped(projectStores);
+			return {
+				project: ctx.project ? { name: ctx.project.name, root: ctx.project.root, key: ctx.project.key, relCwd: ctx.project.relCwd } : null,
+				gitignore: ctx.project?.isGit ? (() => {
+					const p = this.sharedIgnored(ctx.project.root);
+					return p ? describeIgnoreProblem(p) : null;
+				})() : null,
+				stores: perStore,
+				paths: {
+					scoped: scoped.length,
+					unjudged: scoped.filter((m) => m.urgency === undefined).length,
+					stale: view.db.stalePathIds(projectStores).size,
+					inject: this.settings.paths.inject,
+				},
+				embeddings: { ...view.db.embeddingStats(fp), fingerprint: fp, sqliteVec: view.db.vecAvailable ? "loaded" : `unavailable (${view.db.vecError})` },
+				pending: view.db.countPending(ctx.project?.root),
+				config: {
+					embedding: this.embedder.configured ? this.settings.embedding.endpoint : null,
+					semif: this.semif.configured ? this.settings.semif.endpoint : null,
+					rewriteModel: this.settings.rewriteModel || null,
+				},
+				writeLock: view.db.lockHolder(WRITE_LOCK) ?? null,
+			};
+		} finally {
+			view.close();
+		}
 	}
 }

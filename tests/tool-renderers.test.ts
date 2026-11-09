@@ -54,6 +54,14 @@ test("all calls and collapsed results stay concise; errors, progress and expansi
 	assert.match(render("status", { stores: [{ memories: 3 }], pending: 2, project: { name: "project" } }), /3 memories · 2 queued · project/);
 });
 
+test("foreign roots are visible in tool calls and read-only results", () => {
+	for (const name of ["recall", "list", "status"]) {
+		const call = toolRenderers(`realctx_${name}`).renderCall!({ root: "../other" }, theme, {} as any);
+		assert.match(call.render(200).join("\n"), /root \.\.\/other/);
+		assert.match(render(name, { root: "/projects/other", readOnly: true }), /Read-only · \/projects\/other/);
+	}
+});
+
 test("untrusted captions cannot inject terminal controls or extra rows", () => {
 	const out = render("recall", { memories: [{ id: "id", caption: "Good\n\x1b[2Jbad\x07 title" }] });
 	assert.doesNotMatch(out, /\x1b|\x07/);

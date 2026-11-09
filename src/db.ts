@@ -223,6 +223,30 @@ export class RealctxDB {
 		this.migrate();
 	}
 
+	/**
+	 * Disposable metadata copy for read-only browsing. Memory rows/FTS are rebuilt
+	 * from the selected stores; session data and persistent indexes are not copied.
+	 * Only SELECTs run on this connection, even when the target was never indexed.
+	 */
+	memorySnapshot(): RealctxDB {
+		const copy = new RealctxDB(":memory:");
+		try {
+			copy.tx(() => {
+				for (const table of ["usage", "approvals", "embeddings", "urgency", "path_state", "pending", "locks"]) {
+					const columns = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+					const insert = copy.db.prepare(`INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+					for (const row of this.db.prepare(`SELECT * FROM ${table}`).iterate() as Iterable<Row>) {
+						insert.run(...columns.map((c) => row[c]));
+					}
+				}
+			});
+			return copy;
+		} catch (err) {
+			copy.close();
+			throw err;
+		}
+	}
+
 	close(): void {
 		this.stmtCache.clear();
 		try {

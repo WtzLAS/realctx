@@ -402,20 +402,35 @@ Moving a memory between stores (manage page) re-expresses its paths.
 - **Import**: `/realctx import` marks context files as imported only when the agent
   actually stored facts from them.
 - **Tools**:
-  - `realctx_recall(queries?, paths?, ids?, sources?, page?, scope?)`: hybrid search over
+  - `realctx_recall(queries?, paths?, ids?, sources?, page?, scope?, root?)`: hybrid search over
     memories and (with `sources` containing `output`, the default) this session's
     dropped outputs. Results are
     ordered by path (memories about the given or recently touched paths first,
     project-wide next, other areas last), then by used_count, then by relevance, and are
     paginated. `paths` alone lists the memories attached to those paths; `ids` reads
     memories that were shown as captions.
-  - `realctx_remember(caption, content, scope?, paths?, user_requested?)`: `paths` takes
+  - `realctx_remember(caption, content, scope?, paths?, user_requested?, root?)`: `paths` takes
     files, directories or globs.
   - `realctx_expand(ids, lines?, grep?)`: restore dropped outputs (see above).
-  - `realctx_status()`: context usage, queued and applied drops, stores, index, queue.
-  - `realctx_list(page?, scope?)`: sorted by path, then used; demoted, since its output
+  - `realctx_status(root?)`: context usage, queued and applied drops, stores, index, queue.
+  - `realctx_list(page?, scope?, root?)`: sorted by path, then used; demoted, since its output
     is large.
-  - `realctx_forget(ids)`: delete memories by id (or unique prefix).
+  - `realctx_forget(ids, root?)`: delete memories by id (or unique prefix).
+
+**Browsing another project:** pass `root`, for example
+`realctx_recall(root="../other-project", queries=["build"])` or
+`realctx_list(root="~/Projects/other-project", scope="project-shared")`. It accepts
+an existing directory (absolute, `~/…`, or relative to the session cwd); project
+detection and relative `paths` use that directory. It does not change the session cwd.
+When the canonical directory differs from cwd—even within the same repository—the
+call is strictly **read-only**: `remember` and `forget` reject it, and browsing does
+not update usage counts, migrate stores/settings, or write the persistent index.
+Fresh memory files are searched in a disposable in-memory index; semantic search
+uses existing cached vectors without embedding new documents. Global memories
+remain visible unless filtered by `scope`. Foreign-root recall searches memories
+only (`sources: ["output"]` is rejected); status omits the current session context.
+`realctx_expand` stays session-local and has no `root` parameter. Omitted root, `.`,
+and symlink aliases of cwd retain normal read/write behavior.
 
 In Pi, tool rows use compact summaries instead of dumping memory bodies: recall/list show
 IDs and captions (expand for all captions), remember/forget show the outcome, and status

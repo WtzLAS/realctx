@@ -5,8 +5,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { CandidateError, type MemoryEngine } from "../../src/engine.ts";
-import { SCOPE_LABEL } from "../../src/files.ts";
+import { canonicalPath, SCOPE_LABEL } from "../../src/files.ts";
 import { formatList, formatOutcomeForModel, formatRecall, formatStatus, memoryEnvelope, SCOPE_ARG } from "../../src/format.ts";
+import { resolvePathArg } from "../../src/paths.ts";
+import { isDirectory } from "../../src/project.ts";
 import { type Completer, createCompleter, createRewriter, type Rewriter, resolveModel } from "../../src/rewrite.ts";
 import { oneLine } from "../../src/text.ts";
 import type { ContextLayer } from "./context-layer.ts";
@@ -27,6 +29,25 @@ export interface ToolHost {
 }
 
 const SCOPE_VALUES = ["global", "project-shared", "project-personal"] as const;
+
+const ROOT_PARAM = Type.Optional(Type.String({
+	minLength: 1,
+	maxLength: 1024,
+	description: "Memory lookup directory (default: cwd). Accepts an absolute path, ~/… or a path relative to cwd. A different canonical directory is strictly read-only: no remember/forget, usage updates or migrations. Does not switch the session cwd.",
+}));
+
+function memoryRoot(cwd: string, root?: string, write = false): { cwd: string; readOnly: boolean } {
+	if (root === undefined) return { cwd, readOnly: false };
+	const resolved = resolvePathArg(root, cwd);
+	if (!resolved || !isDirectory(resolved)) throw new Error("root must name an existing directory");
+	const readOnly = resolved !== canonicalPath(cwd);
+	if (write && readOnly) throw new Error(`Memory root "${resolved}" is read-only because it differs from the current working directory; use realctx_recall, realctx_list or realctx_status to view it.`);
+	return { cwd: resolved, readOnly };
+}
+
+function rootHeading(root: { cwd: string; readOnly: boolean }): string {
+	return root.readOnly ? `Read-only memory root: ${root.cwd}\n\n` : "";
+}
 
 export function rewriterFor(engine: MemoryEngine, ctx: ExtensionContext): { rewriter?: Rewriter; completer?: Completer; model?: string; error?: string } {
 	const model = resolveModel(engine.settings.rewriteModel, ctx.modelRegistry, ctx.model);
@@ -66,12 +87,13 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_recall",
 		label: "realctx recall",
 		description:
-			"Search long-term memory (realctx) with hybrid semantic + keyword search. Pass several keywords or short statements describing the task, component, command, error, or question. Results are ordered by path (memories about the given or recently touched paths first), then most used; paginated. Pass `paths` alone to list the memories attached to those files/directories, or `ids` to read memories shown as captions. Path notes (`<realctx-path-notes>` at the end of a tool result) appear once per session and only for the exact files/directories a memory is attached to, not their parents: pass `paths` to look up a whole area.",
+			"Search long-term memory (realctx) with hybrid semantic + keyword search. Pass several keywords or short statements describing the task, component, command, error, or question. Results are ordered by path (memories about the given or recently touched paths first), then most used; paginated. Pass `paths` alone to list the memories attached to those files/directories, or `ids` to read memories shown as captions. Path notes (`<realctx-path-notes>` at the end of a tool result) appear once per session and only for the exact files/directories a memory is attached to, not their parents: pass `paths` to look up a whole area. Set `root` to browse another project's memories read-only; paths are then relative to that directory.",
 		promptSnippet: "Search long-term memory; call it before starting any work and whenever you enter a new area",
 		promptGuidelines: [
 			"Call realctx_recall before starting any task (and again when switching areas or hitting surprises), with 2-8 keywords or short statements covering the task.",
 		],
 		parameters: Type.Object({
+			root: ROOT_PARAM,
 			queries: Type.Optional(
 				Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
 					maxItems: 16,
@@ -81,7 +103,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			paths: Type.Optional(
 				Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
 					maxItems: 16,
-					description: "Files or directories (relative to the cwd) the question is about; their memories rank first. Alone: list memories attached to them.",
+					description: "Files or directories (relative to root, or cwd when omitted) the question is about; their memories rank first. Alone: list memories attached to them.",
 				}),
 			),
 			ids: Type.Optional(Type.Array(Type.String({ minLength: 6, maxLength: 40 }), { maxItems: 32, description: "Memory ids to read in full (captions in path notes, `saved as <id>` in placeholders)" })),
@@ -90,19 +112,21 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			sources: Type.Optional(
 				Type.Array(StringEnum(["memory", "output"] as const), {
 					maxItems: 2,
-					description: "memory = long-term memories; output = this session's dropped tool outputs (restore with realctx_expand). Default: both.",
+					description: "memory = long-term memories; output = this session's dropped tool outputs (restore with realctx_expand). Default: both for cwd; memory only for another root (output is not allowed there).",
 				}),
 			),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			const root = memoryRoot(ctx.cwd, params.root);
+			if (root.readOnly && params.sources?.includes("output")) throw new Error("Dropped outputs are only available for the current working directory; use sources=[\"memory\"] with another root.");
 			const engine = host.engine(ctx);
 			const queries = params.queries ?? [];
-			const sources = new Set(params.sources && params.sources.length > 0 ? params.sources : ["memory", "output"]);
+			const sources = new Set(params.sources && params.sources.length > 0 ? params.sources : root.readOnly ? ["memory"] : ["memory", "output"]);
 			const parts: string[] = [];
 			const shown: string[] = [];
-			let details: Record<string, unknown> = {};
+			let details: Record<string, unknown> = { root: root.cwd, readOnly: root.readOnly };
 			if (params.ids && params.ids.length > 0) {
-				const { found, missing } = engine.getMemories(ctx.cwd, params.ids);
+				const { found, missing } = engine.getMemories(root.cwd, params.ids, !root.readOnly, root.readOnly);
 				for (const m of found) {
 					parts.push(memoryEnvelope(m, 8000));
 					shown.push(m.id);
@@ -118,12 +142,13 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			const wantsSearch = queries.length > 0 || (params.paths && params.paths.length > 0) || parts.length === 0;
 			if (wantsSearch && queries.length === 0 && !(params.paths && params.paths.length > 0)) throw new Error("pass queries, paths or ids");
 			if (wantsSearch && sources.has("memory")) {
-				const r = await engine.recall(ctx.cwd, queries, {
+				const r = await engine.recall(root.cwd, queries, {
 					page: params.page,
 					scope: params.scope ? SCOPE_ARG[params.scope] : undefined,
 					signal,
 					paths: params.paths,
-					focus: host.recentPaths(),
+					focus: root.readOnly ? [] : host.recentPaths(),
+					readOnly: root.readOnly,
 				});
 				parts.push(formatRecall(r, queries.length > 0 ? queries : (params.paths ?? [])));
 				shown.push(...r.items.map((i) => i.memory.id));
@@ -143,8 +168,8 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 					details.outputs = hits.map((h) => h.meta.ord);
 				}
 			}
-			host.markSeen(shown);
-			return { content: text(parts.join("\n\n")), details };
+			if (!root.readOnly) host.markSeen(shown);
+			return { content: text(rootHeading(root) + parts.join("\n\n")), details };
 		},
 	});
 
@@ -152,12 +177,13 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_remember",
 		label: "realctx remember",
 		description:
-			"Store one durable fact in long-term memory (realctx). Requires a short caption (one-line title) and self-contained content. A surprise gate checks it against existing memories: duplicates only reinforce the old memory, contradictions edit it, related facts are merged, unimportant or transient facts are skipped. Never include secrets.",
+			"Store one durable fact in long-term memory (realctx). Requires a short caption (one-line title) and self-contained content. A surprise gate checks it against existing memories: duplicates only reinforce the old memory, contradictions edit it, related facts are merged, unimportant or transient facts are skipped. Never include secrets. A root other than cwd is read-only; storing or modifying memories there is rejected.",
 		promptSnippet: "Store one durable, non-obvious fact (caption + content) in long-term memory",
 		promptGuidelines: [
 			"Call realctx_remember as soon as you learn a durable, non-obvious fact (setup, build/test/release steps, architecture, conventions, pitfalls, user preferences, machine-specific workarounds): one fact per call, never secrets or transient status.",
 		],
 		parameters: Type.Object({
+			root: ROOT_PARAM,
 			caption: Type.String({ minLength: 3, maxLength: 160, description: "One-line title, specific enough to recognise the fact in a list" }),
 			content: Type.String({
 				minLength: 1,
@@ -180,6 +206,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			user_requested: Type.Optional(Type.Boolean({ description: "true when the user explicitly asked to remember this (skips the importance gate)" })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
+			const root = memoryRoot(ctx.cwd, params.root, true);
 			const engine = host.engine(ctx);
 			const rw = rewriterFor(engine, ctx);
 			try {
@@ -193,7 +220,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 						force: params.user_requested === true,
 					},
 					{
-						cwd: ctx.cwd,
+						cwd: root.cwd,
 						rewriter: rw.rewriter,
 						signal,
 						queueOnFailure: true,
@@ -258,13 +285,17 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_status",
 		label: "realctx status",
 		description:
-			"Report the state of realctx: context usage, queued and applied drops, detected project, memory stores and counts, embedding index, queued candidates, warnings.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			"Report the state of realctx: context usage, queued and applied drops, detected project, memory stores and counts, embedding index, queued candidates, warnings. Set root to inspect another project's memory state read-only (no session context).",
+		parameters: Type.Object({ root: ROOT_PARAM }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const root = memoryRoot(ctx.cwd, params.root);
 			const engine = host.engine(ctx);
-			const s = engine.status(ctx.cwd);
-			const contextLines = host.contextStatus(ctx);
-			return { content: text([...contextLines, "", formatStatus(s)].join("\n").trim()), details: { ...s, context: host.context()?.status() } };
+			const s = engine.status(root.cwd, root.readOnly);
+			const contextLines = root.readOnly ? [] : host.contextStatus(ctx);
+			return {
+				content: text(rootHeading(root) + [...contextLines, "", formatStatus(s)].join("\n").trim()),
+				details: { ...s, root: root.cwd, readOnly: root.readOnly, context: root.readOnly ? undefined : host.context()?.status() },
+			};
 		},
 	});
 
@@ -272,22 +303,21 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_list",
 		label: "realctx list",
 		description:
-			"Rarely needed: list stored memories (id | scope | paths | used | caption), grouped by path then most used, paginated. Output can be large; prefer realctx_recall to find relevant memories.",
+			"Rarely needed: list stored memories (id | scope | paths | used | caption), grouped by path then most used, paginated. Output can be large; prefer realctx_recall to find relevant memories. Set root to browse another project's memories read-only.",
 		parameters: Type.Object({
+			root: ROOT_PARAM,
 			page: Type.Optional(Type.Integer({ minimum: 1, description: "Page (default 1)" })),
 			scope: Type.Optional(StringEnum(SCOPE_VALUES, { description: "Only list one scope" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const root = memoryRoot(ctx.cwd, params.root);
 			const engine = host.engine(ctx);
-			engine.sync(ctx.cwd);
-			const sc = engine.scopes(ctx.cwd);
-			const stores = (params.scope ? sc.stores.filter((s) => s.kind === SCOPE_ARG[params.scope as string]) : sc.stores).map((s) => s.id);
-			const pageSize = engine.settings.list.pageSize;
-			const total = engine.db.count(stores);
-			const pages = Math.max(1, Math.ceil(total / pageSize));
-			const page = Math.min(Math.max(1, params.page ?? 1), pages);
-			const rows = engine.db.list(stores, { limit: pageSize, offset: (page - 1) * pageSize, order: "path" });
-			return { content: text(formatList(rows, total, page, pageSize)), details: { total, page, pages, memories: rows.map(memoryPreview) } };
+			const { rows, total, page, pages, pageSize } = engine.list(root.cwd, {
+				page: params.page,
+				scope: params.scope ? SCOPE_ARG[params.scope] : undefined,
+				readOnly: root.readOnly,
+			});
+			return { content: text(rootHeading(root) + formatList(rows, total, page, pageSize)), details: { root: root.cwd, readOnly: root.readOnly, total, page, pages, memories: rows.map(memoryPreview) } };
 		},
 	});
 
@@ -295,13 +325,15 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 		name: "realctx_forget",
 		label: "realctx forget",
 		description:
-			"Delete memories from long-term memory (realctx) by id. Use only for memories that are wrong, obsolete or unwanted and cannot be corrected with realctx_remember; ids are shown by realctx_recall / realctx_list.",
+			"Delete memories from long-term memory (realctx) by id. Use only for memories that are wrong, obsolete or unwanted and cannot be corrected with realctx_remember; ids are shown by realctx_recall / realctx_list. A root other than cwd is read-only; deletion is rejected.",
 		parameters: Type.Object({
+			root: ROOT_PARAM,
 			ids: Type.Array(Type.String({ minLength: 6, maxLength: 40 }), { minItems: 1, maxItems: 32, description: "Memory ids (or unique prefixes) to delete" }),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const root = memoryRoot(ctx.cwd, params.root, true);
 			const engine = host.engine(ctx);
-			const r = await engine.forget(ctx.cwd, params.ids);
+			const r = await engine.forget(root.cwd, params.ids);
 			const lines = r.deleted.map((m) => `deleted ${m.id} [${SCOPE_LABEL[m.kind]}] ${m.caption}`);
 			if (r.missing.length) lines.push(`not found: ${r.missing.join(", ")}`);
 			return { content: text(lines.join("\n") || "nothing deleted"), details: { deleted: r.deleted.map((m) => m.id), missing: r.missing, memories: r.deleted.map(memoryPreview) } };

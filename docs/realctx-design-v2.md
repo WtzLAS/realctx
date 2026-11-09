@@ -244,7 +244,7 @@ The judge returns no text. Summaries come from the rewrite model (the same model
 Judging is eager and cheap; applying rewrites earlier messages and costs a cache rebuild. Queued drops apply only when:
 
 1. **Pressure:** usage of the safe input window ≥ `context.applyThreshold`.
-2. **Cache cold:** time since the last response ≥ `context.cacheTtl` (per-model overrides in `context.cacheTtlByModel`).
+2. **Cache cold:** time since the last response ≥ the active model’s resolved cache TTL (manual `context.cacheTtlByModel` override, then catalog metadata/provider estimate when `context.cacheTtlAuto` is on). Unavailable TTLs use a labeled 5m placeholder, including failed fetches without cached metadata.
 3. **Emergency:** usage ≥ `context.emergencyThreshold`: apply everything queued, then drop the largest unprotected results until under `applyThreshold`.
 4. **Flush:** `/realctx flush`, or a cancelled threshold compaction, applies at the next request.
 
@@ -565,27 +565,27 @@ Each period suggests once; running `/realctx consolidate` resets the clock. Noth
 | `rewriteModel` | session model | Pi model for Edit/Merge, extraction, summaries |
 | `history.enabled` | `true` | History compression on/off (§9.4) |
 | `history.model` | `rewriteModel`, else session model | The historian (`provider/model`) |
-| `history.prepareThreshold` | `0.25` | Safe-window usage at which parts are prepared |
-| `history.prepareMaxTokens` | `80000` | Token ceiling on `prepareThreshold` (`0` = off) |
-| `history.protectTurns` | `8` | Recent agent turns never compressed |
-| `history.minChunkTokens`, `history.maxChunkTokens` | `6000`, `30000` | Size of one part |
+| `history.prepareThreshold` | `0.3` | Safe-window usage at which parts are prepared |
+| `history.prepareMaxTokens` | `0` | Token ceiling on `prepareThreshold` (`0` = off) |
+| `history.protectTurns` | `24` | Recent agent turns never compressed |
+| `history.minChunkTokens`, `history.maxChunkTokens` | `8000`, `50000` | Size of one part |
 | `history.summaryMaxTokens`, `history.storyTokens` | `1500`, `3000` | Summary bound; earlier parts passed for continuity |
 | `history.captureFacts`, `history.emergencyFallback` | `true`, `true` | Facts from the historian; deterministic outline in an emergency |
 | `judge.concurrency`, `judge.minIntervalMs` | `1`, `0` | Parallel judge requests; rate limit |
 | `judge.api` | `"auto"` | `auto` / `systemone` / `decisions` |
 | `judge.maxPerPass` | `6` | New drop candidates judged per background pass |
 | `context.enabled` | `true` | Context layer on/off |
-| `context.captureMinTokens` | `1000` | Smaller outputs aren't stored or dropped |
-| `context.dropMinTokens` | `1000` | Never drop below this |
-| `context.protectTurns` | `4` | Recent turns immune from dropping |
-| `context.imageMaxTurns` | `6` | Images (tool results and the user's) older than this are dropped by a rule; `0` = off |
+| `context.captureMinTokens` | `0` | Smaller outputs aren't stored or dropped |
+| `context.dropMinTokens` | `0` | Never drop below this |
+| `context.protectTurns` | `24` | Recent turns immune from dropping |
+| `context.imageMaxTurns` | `8` | Images (tool results and the user's) older than this are dropped by a rule; `0` = off |
 | `context.protectedTools` | `["todo", "todo_write", "TodoWrite", "skill"]` | Never dropped (latest instance for snapshots) |
 | `context.pDrop`, `context.pUnique`, `context.pKeep` | `0.15`, `0.3`, `0.5` | Policy thresholds (§7.3) |
 | `context.minConfidence` | `0.7` | Min judge confidence to act |
-| `context.applyThreshold` | `0.35` | Safe-window usage that applies queued drops |
-| `context.applyMaxTokens` | `120000` | Token ceiling on `applyThreshold` (`0` = off) |
-| `context.emergencyThreshold` | `0.9` | Emergency reclaim |
-| `context.cacheTtl`, `context.cacheTtlByModel` | `"5m"`, `{}` | Provider cache lifetime; per-model override |
+| `context.applyThreshold` | `0.4` | Safe-window usage that applies queued drops |
+| `context.applyMaxTokens` | `0` | Token ceiling on `applyThreshold` (`0` = off) |
+| `context.emergencyThreshold` | `0.8` | Emergency reclaim |
+| `context.cacheTtlAuto`, `context.cacheTtlByModel` | `true`, `{}` | Auto-refresh per-model catalog metadata; exact per-model duration overrides (unavailable = 5m placeholder) |
 | `context.disabledModels` | `[]` | Models (`provider/model` or `model`, `*` wildcard) the context layer pauses for; status line shows `🛑` |
 | `context.expandMaxTokens` | `4000` | Cap per expansion |
 | `context.repinTurns` | `10` | Expanded items stay kept |

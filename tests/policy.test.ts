@@ -3,7 +3,7 @@
  * forged-tag stripping, expansion views, scheduler priority.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, statSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -24,7 +24,7 @@ import {
 } from "../src/policy.ts";
 import { JudgeScheduler } from "../src/scheduler.ts";
 
-const cfg = DEFAULT_SETTINGS.context;
+const cfg = { ...DEFAULT_SETTINGS.context, protectTurns: 4, dropMinTokens: 1000 };
 
 function meta(ord: number, tool: string, input: Record<string, unknown>, o: Partial<OutputMeta> = {}): OutputMeta {
 	return {
@@ -169,35 +169,57 @@ test("summaries, fact parsing, settings, durations", () => {
 	assert.equal(normalizeSettings({}).capture.mode, "suggest");
 });
 
-test("settings: v1 config files move old threshold defaults to the v2 defaults and are rewritten", () => {
+test("settings v3: reset only Context + History, back up and warn once", () => {
 	const dir = mkdtempSync(join(tmpdir(), "realctx-cfg-"));
 	try {
 		const file = join(dir, "config.json");
-		const old = (apply: number, prepare: number) => {
-			const v1: Record<string, unknown> = structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, unknown>;
-			delete v1.version;
-			(v1.context as Record<string, unknown>).applyThreshold = apply;
-			(v1.history as Record<string, unknown>).prepareThreshold = prepare;
-			writeFileSync(file, JSON.stringify(v1));
-		};
-		old(0.25, 0.2);
-		const s = loadSettings(file);
-		assert.equal(s.context.applyThreshold, 0.35);
-		assert.equal(s.history.prepareThreshold, 0.25);
-		const saved = JSON.parse(readFileSync(file, "utf8"));
-		assert.equal(saved.version, SETTINGS_VERSION);
-		assert.equal(saved.context.applyThreshold, 0.35);
-		assert.equal(saved.history.prepareThreshold, 0.25);
-		old(0.3, 0.1);
-		assert.equal(loadSettings(file).context.applyThreshold, 0.3, "custom values stay");
-		assert.equal(loadSettings(file).history.prepareThreshold, 0.1);
-		old(0.22, 0.2);
-		assert.equal(loadSettings(file).history.prepareThreshold, 0.2, "prepare never moves above a custom apply threshold");
-		writeFileSync(file, JSON.stringify({ version: SETTINGS_VERSION, context: { applyThreshold: 0.25 } }));
-		assert.equal(loadSettings(file).context.applyThreshold, 0.25, "current-version files are not migrated");
+		for (const version of [undefined, 1, 2]) {
+			const old = { ...structuredClone(DEFAULT_SETTINGS), version };
+			old.context.applyThreshold = 0.6;
+			old.context.enabled = false;
+			old.context.cacheTtlByModel = { "p/m": "1h" };
+			old.history.model = "p/historian";
+			old.history.protectTurns = 9;
+			old.semif.endpoint = "https://example.com";
+			old.semif.apiKey = "env:MY_KEY";
+			old.paths.autoRename = false;
+			old.capture.mode = "off";
+			const original = JSON.stringify(old);
+			writeFileSync(file, original);
+			const warnings: string[] = [];
+			const s = loadSettings(file, (w) => warnings.push(w));
+			assert.deepEqual(s.context, DEFAULT_SETTINGS.context);
+			assert.deepEqual(s.history, DEFAULT_SETTINGS.history);
+			for (const key of ["semif", "embedding", "paths", "capture", "thresholds"] as const) assert.deepEqual(s[key], old[key]);
+			assert.equal(warnings.length, 1);
+			assert.match(warnings[0], /Context and History settings were reset/);
+			const backup = warnings[0].match(/Backup: (.+?)\. Review/)?.[1];
+			assert.ok(backup);
+			assert.equal(readFileSync(backup, "utf8"), original);
+			assert.equal(statSync(backup).mode & 0o777, 0o600);
+			assert.equal(JSON.parse(readFileSync(file, "utf8")).version, SETTINGS_VERSION);
+			loadSettings(file, (w) => warnings.push(w));
+			assert.equal(warnings.length, 1, "no repeated reset or warning");
+		}
+		assert.equal(readdirSync(dir).filter((n) => n.endsWith(".bak")).length, 3);
+		writeFileSync(file, JSON.stringify({ version: SETTINGS_VERSION, context: { applyThreshold: 0.25 }, history: { protectTurns: 7 } }));
+		const s = loadSettings(file, () => assert.fail("current files must not warn"));
+		assert.equal(s.context.applyThreshold, 0.25);
+		assert.equal(s.history.protectTurns, 7);
+		assert.deepEqual(loadSettings(join(dir, "new.json")), DEFAULT_SETTINGS);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("new Context and History defaults and invalid TTL overrides", () => {
+	const s = normalizeSettings({});
+	assert.deepEqual([s.history.prepareThreshold, s.history.protectTurns, s.history.minChunkTokens, s.history.maxChunkTokens, s.history.prepareMaxTokens], [0.3, 24, 8000, 50000, 0]);
+	assert.deepEqual([s.context.applyThreshold, s.context.captureMinTokens, s.context.dropMinTokens, s.context.protectTurns, s.context.imageMaxTurns, s.context.applyMaxTokens, s.context.emergencyThreshold], [0.4, 0, 0, 24, 8, 0, 0.8]);
+	assert.equal(s.context.cacheTtlAuto, true);
+	assert.equal("cacheTtl" in s.context, false);
+	const overrides = normalizeSettings({ context: { cacheTtlByModel: { " p/m ": " 1h ", invalid: "oops", negative: "-1m", empty: "", zero: "0", number: 5 } } }).context.cacheTtlByModel;
+	assert.deepEqual(overrides, { "p/m": "1h", zero: "0" });
 });
 
 test("matchModel: provider/model or model, case-insensitive, * wildcard; settings keep trimmed strings", () => {

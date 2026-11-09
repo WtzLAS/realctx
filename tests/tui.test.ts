@@ -3,7 +3,7 @@
  * component, renders it (checking every line fits the width) and feeds scripted keys.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -329,6 +329,49 @@ test("settings page: disabled models are toggled from Pi's model list (picker st
 	} finally {
 		e.close();
 	}
+});
+
+test("cache TTL picker: automatic values on the right, overrides, validation, cancel and clear", async () => {
+	writeFileSync(join(base, "model-cache-ttls.json"), JSON.stringify({ version: 1, fetchedAt: Date.now(), entries: { "p/cached": { ttlMs: 900_000, caching: true } } }));
+	const e = new MemoryEngine(base);
+	try {
+		const { ctx } = fakeCtx(proj, [(c, frame) => {
+			type(c, "cache TTL by model");
+			c.handleInput?.(KEY.enter);
+			type(c, "p/cached");
+			const row = frame().find((l) => l.includes("p/cached")) ?? "";
+			assert.match(frame().join("\n"), /p\/cached\s+15m · catalog/);
+			assert.ok(visibleWidth(row) <= WIDTH);
+			c.handleInput?.(KEY.enter);
+			c.handleInput?.("\x15"); // clear auto
+			type(c, "bogus");
+			c.handleInput?.(KEY.enter);
+			assert.match(frame().join("\n"), /Enter a duration/);
+			c.handleInput?.(KEY.esc); // cancel invalid edit
+			assert.match(frame().join("\n"), /15m · catalog/);
+			c.handleInput?.(KEY.enter);
+			c.handleInput?.("\x15");
+			type(c, "1h");
+			c.handleInput?.(KEY.enter);
+			assert.match(frame().join("\n"), /p\/cached\s+1h \(overrided\)/);
+			c.handleInput?.(KEY.enter);
+			c.handleInput?.("\x15");
+			c.handleInput?.(KEY.enter); // empty restores automatic value
+			assert.match(frame().join("\n"), /15m · catalog/);
+			assert.doesNotMatch(frame().join("\n"), /overrided/);
+			c.handleInput?.(KEY.enter);
+			c.handleInput?.("\x15");
+			type(c, "2h");
+			c.handleInput?.(KEY.enter);
+			c.handleInput?.(KEY.esc); // picker → search
+			c.handleInput?.(KEY.esc); // search → categories
+			c.handleInput?.(KEY.esc); // save
+		}], {});
+		ctx.modelRegistry.getAvailable = () => [{ provider: "p", id: "cached", name: "Cached" }];
+		await openSettings(ctx, e);
+		assert.equal(e.settings.context.cacheTtlByModel["p/cached"], "2h");
+		assert.equal(JSON.parse(readFileSync(join(base, "config.json"), "utf8")).context.cacheTtlByModel["p/cached"], "2h");
+	} finally { e.close(); }
 });
 
 test("settings page: edit a number through the submenu, save, clear the embedding cache", async () => {

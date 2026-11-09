@@ -84,7 +84,7 @@ test("drop rules: old images drop by rule; small images may still drop; recent o
 	const off = filterOutputs({ outputs, calls: [], turn: 10, done: new Set(), pinned: new Set(), settings: { ...cfg, imageMaxTurns: 0 } });
 	assert.equal(off.rules.length, 0);
 	assert.ok(off.gray.some((g) => g.id === "c1"));
-	assert.equal(DEFAULT_SETTINGS.context.imageMaxTurns, 6);
+	assert.equal(DEFAULT_SETTINGS.context.imageMaxTurns, 8);
 });
 
 test("placeholders say when images are in an output; user images read as such", () => {

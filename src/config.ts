@@ -70,9 +70,9 @@ export interface Settings {
 		applyMaxTokens: number;
 		/** Share of the safe input window that triggers an emergency reclaim. */
 		emergencyThreshold: number;
-		/** Provider prompt-cache lifetime, e.g. "5m", "1h", "300s". */
-		cacheTtl: string;
-		/** Per-model cache lifetime overrides: `provider/model` or `model` → duration. */
+		/** Refresh per-model prompt-cache metadata from the online catalog in the background. */
+		cacheTtlAuto: boolean;
+		/** Per-model overrides: `provider/model` or `model` → duration; 0 = always cold. */
 		cacheTtlByModel: Record<string, string>;
 		/**
 		 * Models the context layer stays off for (buggy with dropped outputs or history summaries):
@@ -235,7 +235,7 @@ export interface Settings {
 }
 
 /** Bump when defaults change in a way saved configs must pick up; add the step to `migrateSettings`. */
-export const SETTINGS_VERSION = 2;
+export const SETTINGS_VERSION = 3;
 
 export const DEFAULT_SETTINGS: Settings = {
 	version: SETTINGS_VERSION,
@@ -264,19 +264,19 @@ export const DEFAULT_SETTINGS: Settings = {
 	},
 	context: {
 		enabled: true,
-		captureMinTokens: 1000,
-		dropMinTokens: 1000,
-		protectTurns: 4,
-		imageMaxTurns: 6,
+		captureMinTokens: 0,
+		dropMinTokens: 0,
+		protectTurns: 24,
+		imageMaxTurns: 8,
 		protectedTools: ["todo", "todo_write", "TodoWrite", "skill"],
 		pDrop: 0.15,
 		pUnique: 0.3,
 		pKeep: 0.5,
 		minConfidence: 0.7,
-		applyThreshold: 0.35,
-		applyMaxTokens: 120_000,
-		emergencyThreshold: 0.9,
-		cacheTtl: "5m",
+		applyThreshold: 0.4,
+		applyMaxTokens: 0,
+		emergencyThreshold: 0.8,
+		cacheTtlAuto: true,
 		cacheTtlByModel: {},
 		disabledModels: [],
 		expandMaxTokens: 4000,
@@ -290,11 +290,11 @@ export const DEFAULT_SETTINGS: Settings = {
 	history: {
 		enabled: true,
 		model: "",
-		prepareThreshold: 0.25,
-		prepareMaxTokens: 80_000,
-		protectTurns: 8,
-		minChunkTokens: 6000,
-		maxChunkTokens: 30000,
+		prepareThreshold: 0.3,
+		prepareMaxTokens: 0,
+		protectTurns: 24,
+		minChunkTokens: 8000,
+		maxChunkTokens: 50000,
 		summaryMaxTokens: 1500,
 		storyTokens: 3000,
 		captureFacts: true,
@@ -458,15 +458,11 @@ function rawVersion(raw: unknown): number {
 	return isObject(raw) && typeof raw.version === "number" && Number.isFinite(raw.version) ? raw.version : 1;
 }
 
-/**
- * Bring settings from older config files up to date. Saved configs contain every key, so an old
- * default is indistinguishable from an explicit choice: only values equal to the old default move.
- */
+/** v3 deliberately resets the two affected sections, including custom values. */
 function migrateSettings(s: Settings, from: number): void {
-	if (from < 2) {
-		// v2: history.prepareThreshold 0.2 → 0.25, context.applyThreshold 0.25 → 0.35.
-		if (s.context.applyThreshold === 0.25) s.context.applyThreshold = 0.35;
-		if (s.history.prepareThreshold === 0.2 && s.context.applyThreshold > 0.25) s.history.prepareThreshold = 0.25;
+	if (from < 3) {
+		s.context = structuredClone(DEFAULT_SETTINGS.context);
+		s.history = structuredClone(DEFAULT_SETTINGS.history);
 	}
 }
 
@@ -475,7 +471,9 @@ export function normalizeSettings(input: unknown): Settings {
 	const s = mergeInto(structuredClone(DEFAULT_SETTINGS), raw);
 	s.version = SETTINGS_VERSION;
 	const ttlRaw = isObject(raw) && isObject(raw.context) && isObject(raw.context.cacheTtlByModel) ? raw.context.cacheTtlByModel : {};
-	s.context.cacheTtlByModel = Object.fromEntries(Object.entries(ttlRaw).filter((e): e is [string, string] => typeof e[1] === "string"));
+	s.context.cacheTtlByModel = Object.fromEntries(Object.entries(ttlRaw)
+		.filter((e): e is [string, string] => typeof e[1] === "string" && Number.isFinite(parseDuration(e[1], NaN)))
+		.map(([key, value]) => [key.trim(), value.trim()]).filter(([key]) => key));
 	s.context.disabledModels = s.context.disabledModels.map((m) => m.trim()).filter(Boolean);
 	s.judge.concurrency = Math.round(clamp(s.judge.concurrency, 1, 16));
 	s.judge.minIntervalMs = Math.round(clamp(s.judge.minIntervalMs, 0, 60_000));
@@ -549,11 +547,13 @@ export function normalizeSettings(input: unknown): Settings {
 	return s;
 }
 
-export function loadSettings(file: string): Settings {
+export function loadSettings(file: string, warn: (message: string) => void = console.warn): Settings {
 	if (!existsSync(file)) return structuredClone(DEFAULT_SETTINGS);
 	let raw: unknown;
+	let original: string;
 	try {
-		raw = JSON.parse(readFileSync(file, "utf8"));
+		original = readFileSync(file, "utf8");
+		raw = JSON.parse(original);
 	} catch {
 		return structuredClone(DEFAULT_SETTINGS);
 	}
@@ -561,11 +561,17 @@ export function loadSettings(file: string): Settings {
 	const from = rawVersion(raw);
 	if (from < SETTINGS_VERSION) {
 		migrateSettings(s, from);
+		const backup = `${file}.v${from}-${Date.now()}-${Math.random().toString(36).slice(2)}.bak`;
+		let saved = false;
 		try {
+			// Never overwrite an earlier backup; it can contain API keys.
+			writeFileSync(backup, original, { mode: 0o600, flag: "wx" });
 			saveSettings(file, s);
-		} catch {
-			// read-only config: the migrated values still apply in memory
+			saved = true;
+		} catch (err) {
+			warn(`realctx: could not back up or save settings at ${file}: ${err instanceof Error ? err.message : String(err)}. The reset applies in memory; the old config is unchanged.`);
 		}
+		warn(`realctx settings v${SETTINGS_VERSION}: Context and History settings were reset to new defaults (including custom values). Connections, API keys and memory settings were preserved.${saved ? ` Backup: ${backup}.` : " Reset not saved."} Review /realctx settings.`);
 	}
 	return s;
 }

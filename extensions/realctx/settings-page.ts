@@ -8,6 +8,7 @@ import { EmbeddingClient, SemIfClient } from "../../src/api.ts";
 import { DEFAULT_SETTINGS, embeddingFingerprint, maskSecret, normalizeSettings, type Settings } from "../../src/config.ts";
 import type { MemoryEngine } from "../../src/engine.ts";
 import { ActionSubmenu, FilterPicker, InputSubmenu, RemotePicker } from "./ui.ts";
+import { cacheTtlPicker } from "./cache-ttl-picker.ts";
 
 const NOT_SET = "(not set)";
 const AUTO_MODEL = "(auto)";
@@ -22,7 +23,7 @@ interface FieldDef {
 	description: string;
 	get: Getter;
 	set?: Setter;
-	kind: "text" | "secret" | "number" | "cycle" | "model" | "model-list" | "remote-model" | "action";
+	kind: "text" | "secret" | "number" | "cycle" | "model" | "model-list" | "cache-ttl" | "remote-model" | "action";
 	/** model-list: the entries (Pi models or patterns); `set` takes them as comma-separated text. */
 	list?: (s: Settings) => string[];
 	/** remote-model: list the server's models for the draft settings. */
@@ -481,7 +482,7 @@ function fields(): FieldDef[] {
 		},
 		hNum("prepareThreshold", "History: prepare at", "Share of the safe input window at which the historian starts summarizing old turns (background).", 0.05, 1),
 		hNum("prepareMaxTokens", "History: prepare max tokens", "Token ceiling on the prepare threshold: the historian also starts once usage reaches this many tokens (0 = off).", 0, 10_000_000, true),
-		hNum("protectTurns", "History: protect turns", "The last N agent turns are never summarized.", 1, 1000, true),
+		hNum("protectTurns", "History: protected turns", "The last N agent turns are never summarized.", 1, 1000, true),
 		hNum("minChunkTokens", "History: min chunk tokens", "Summarize at least this much old conversation at once.", 500, 500_000, true),
 		hNum("maxChunkTokens", "History: max chunk tokens", "Summarize at most this much per historian call.", 500, 1_000_000, true),
 		hNum("summaryMaxTokens", "History: summary tokens", "Upper bound for one chunk's summary.", 100, 20_000, true),
@@ -510,22 +511,28 @@ function fields(): FieldDef[] {
 		ctxNum("captureMinTokens", "Context: capture min tokens", "Tool outputs smaller than this are not stored, so they are never dropped.", 0, 1_000_000, true),
 		ctxNum("dropMinTokens", "Context: drop min tokens", "Never drop an output smaller than this.", 0, 1_000_000, true),
 		ctxNum("protectTurns", "Context: protected turns", "Outputs of the last N model turns are never dropped.", 0, 1000, true),
-		ctxNum("imageMaxTurns", "Context: image max turns", "Images (tool results and pasted by the user) older than N model turns are dropped by a rule when drops apply; restorable with realctx_expand (0 = off).", 0, 1000, true),
+		ctxNum("imageMaxTurns", "Context: image protected turns", "Images (tool results and pasted by the user) older than N model turns are dropped by a rule when drops apply; restorable with realctx_expand (0 = off).", 0, 1000, true),
 		ctxNum("pDrop", "Context: max P(still_needed)", "Drop only when the judge's P(still needed) is below this."),
 		ctxNum("pUnique", "Context: max P(unique_info)", "Drop (rather than summarize) only when P(unique info) is below this."),
 		ctxNum("minConfidence", "Context: min confidence", "Minimum judge confidence (P of the drop/summarize action) to act."),
 		ctxNum("applyThreshold", "Context: apply threshold", "Share of the safe input window at which queued drops are applied in one pass."),
-		ctxNum("applyMaxTokens", "Context: apply max tokens", "Token ceiling on the apply threshold: queued drops also apply once usage reaches this many tokens (0 = off), so 1M-window models do not wait until 350k tokens.", 0, 10_000_000, true),
+		ctxNum("applyMaxTokens", "Context: apply max tokens", "Token ceiling on the apply threshold: queued drops also apply once usage reaches this many tokens (0 = off).", 0, 10_000_000, true),
 		ctxNum("emergencyThreshold", "Context: emergency threshold", "Share of the safe input window that applies everything and drops the largest old outputs."),
 		{
-			id: "context.cacheTtl",
-			label: "Context: cache TTL",
-			description: "Provider prompt-cache lifetime (e.g. 5m, 1h). Queued drops apply once the cache is cold.",
-			get: (s) => s.context.cacheTtl,
-			set: (s, v) => {
-				s.context.cacheTtl = v.trim() || "5m";
-			},
-			kind: "text",
+			id: "context.cacheTtlByModel",
+			label: "Context: cache TTL by model",
+			description: "Per-model lifetimes and overrides. Catalog metadata is fetched automatically; provider estimates are labeled. Unavailable TTLs use a labeled 5m placeholder.",
+			get: (s) => `${Object.keys(s.context.cacheTtlByModel).length} overrides`,
+			kind: "cache-ttl",
+		},
+		{
+			id: "context.cacheTtlAuto",
+			label: "Context: auto cache TTL",
+			description: "Fetch models.dev cache metadata daily in the background. Disable for offline/manual-only TTLs. No prompts or API keys are sent.",
+			get: (s) => s.context.cacheTtlAuto ? "on" : "off",
+			set: (s, v) => { s.context.cacheTtlAuto = v === "on"; },
+			kind: "cycle",
+			values: ["on", "off"],
 		},
 		ctxNum("expandMaxTokens", "Context: expand max tokens", "Maximum tokens returned by one realctx_expand call.", 200, 200_000, true),
 		ctxNum("repinTurns", "Context: re-pin turns", "Expanded outputs are kept (not re-dropped) for this many turns.", 0, 1000, true),
@@ -791,6 +798,10 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: MemoryE
 					return new FilterPicker({ theme, title: d.label, items: models, selected: current, done: (v) => close(v) });
 				}
 				if (d.kind === "model-list") return modelListPicker(theme, d, close);
+				if (d.kind === "cache-ttl") return cacheTtlPicker({
+					ctx, tui, theme, catalog: engine.cacheTtls, settings: () => draft,
+					changed: () => { draft = normalizeSettings(draft); dirty = true; }, close: () => close(d.get(draft)),
+				});
 				if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
 				if (d.kind === "action") {
 					if (d.id === "reset") {

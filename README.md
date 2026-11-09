@@ -31,7 +31,7 @@ within the retention period, and leftover temp files.
 as one `#N` per message, tool `user`) and count what the session model charges for them,
 computed from their pixel size (Anthropic ⌈w·h/750⌉ after its downscale, OpenAI tiles or
 patches, Gemini per image or tile; unknown models ⌈w·h/750⌉). Outputs with images may be
-dropped from 200 tokens on, and every image older than `context.imageMaxTurns` (default 6;
+dropped from 200 tokens on, and every image older than `context.imageMaxTurns` (default 8;
 0 = off) is dropped by a rule. A dropped user image becomes a placeholder inside the user
 message (its text stays). The judge cannot see images: it gets the text and an image
 count; image outputs are dropped, never summarized, and never mined for facts.
@@ -48,7 +48,7 @@ their "user" messages, which are the parent agent's prompts.
 
 **Deciding** (in the background after each turn, never in the request path):
 
-- *Never dropped*: the last `context.protectTurns` turns, small outputs, the latest
+- *Never dropped*: the last `context.protectTurns` turns (default 24), small outputs, the latest
   todo/plan snapshot and skill loads (`context.protectedTools`), unresolved errors, and
   outputs expanded in the last `context.repinTurns` turns.
 - *Rules, no judge*: exact duplicate calls (newest kept), an older full `read` of a path
@@ -69,12 +69,32 @@ their "user" messages, which are the parent agent's prompts.
   network-error retry, so it can read much higher, even above 100%.
 
 **Applying** rewrites earlier messages, which costs a prompt-cache rebuild, so queued
-drops are applied together, in one pass, only when the cache is cold (`context.cacheTtl`,
-per-model overrides in `context.cacheTtlByModel`), when usage of the safe input window
-reaches `context.applyThreshold` (35%, capped at `context.applyMaxTokens` = 120k tokens), or on `/realctx flush`. At
-`context.emergencyThreshold` everything queued applies and the largest old unprotected
+drops are applied together, in one pass, when the active model’s cache lifetime has elapsed,
+when usage of the safe input window reaches `context.applyThreshold` (40%), or on `/realctx flush`.
+`context.applyMaxTokens` is an optional token ceiling (`0` = off, the default). At
+`context.emergencyThreshold` (80%) everything queued applies and the largest old unprotected
 outputs are dropped until usage is under the apply threshold. Pi's threshold compaction is
 cancelled while the layer is active (manual `/compact` and overflow recovery still run).
+
+**Cache TTL by model**: `/realctx settings` → Context → Cache TTL by model opens a
+filterable model selector like Disabled models. The right column shows the effective TTL
+and its source; Enter edits a duration (`5m`, `1h`, `300s`). Overrides show `(overrided)`;
+empty or `auto` removes an override. `context.cacheTtlByModel` accepts exact
+`provider/model` keys (preferred) or model IDs, case-insensitively; `0` means always cold.
+
+With `context.cacheTtlAuto = true`, public [models.dev](https://models.dev) metadata is
+refreshed daily in the background and cached locally; the picker also offers Refresh.
+**The catalog currently publishes cache pricing, not TTLs.** Explicit TTL metadata, when
+available, takes precedence over labeled provider estimates (5m for cache-capable native
+Anthropic/OpenAI models). Pricing itself is never converted into a lifetime. Unknown models
+and gateways use `5m (placeholder)` when no lifetime is available, including failed fetches
+without a cached value. Manual overrides and previously fetched values take priority.
+Set an override for extended retention (e.g. 1h/24h) to match the actual provider request
+policy. Disable Auto cache TTL for manual-only/offline operation. No prompts or credentials
+are sent to the catalog; failed refreshes retain the last good snapshot.
+
+Capture/drop minimums now default to `0` (no text-size floor). The image setting is labeled
+**Image protected turns**; the general protected-turn and pinned-output rules still take priority.
 
 **Disabled models**: some models misbehave with dropped outputs or history summaries. List
 them in `context.disabledModels` (`provider/model` or `model`, case-insensitive, `*` as
@@ -147,8 +167,8 @@ stays off), `"ignore"` runs realctx next to it. Subagent sessions never change s
 ## History compression (the historian)
 
 Dropping outputs is not enough in very long sessions: prompts and replies pile up too. In
-the background, once usage reaches `history.prepareThreshold` (25%, capped at `history.prepareMaxTokens` = 80k tokens), a **historian** model
-summarizes the oldest whole turns (never the last `history.protectTurns` = 8, never between
+the background, once usage reaches `history.prepareThreshold` (30%), a **historian** model
+summarizes the oldest whole turns (never the last `history.protectTurns` = 24, never between
 a tool call and its result) into Markdown (Goals / Done / Findings / Open). The summary
 replaces those turns together with the next drop pass (cold cache, pressure, flush), as one
 frozen block:
@@ -160,6 +180,9 @@ Earlier conversation, summarized by realctx (the agent's own history, not new in
 Tool outputs in this part: #41 bash pnpm test · #44 read src/auth/session.ts
 </realctx-history>
 ```
+
+Parts default to 8,000–50,000 tokens. `history.prepareMaxTokens` is an optional token
+ceiling (`0` = off, the default).
 
 - **Model:** `history.model` (`provider/model`, "Historian model" in `/realctx settings`).
   Empty = `rewriteModel`, else the session model. A value that is set but invalid is
@@ -394,6 +417,11 @@ Moving a memory between stores (manage page) re-expresses its paths.
     is large.
   - `realctx_forget(ids)`: delete memories by id (or unique prefix).
 
+In Pi, tool rows use compact summaries instead of dumping memory bodies: recall/list show
+IDs and captions (expand for all captions), remember/forget show the outcome, and status
+shows counts and warnings. Expand previews restored text only when the row is expanded.
+This is display-only: complete tool content still reaches the model.
+
 ## Commands
 
 `/realctx` opens a menu, or run a subcommand directly:
@@ -470,6 +498,13 @@ In mode `remind` (or without a judge) it only suggests running the command. Runn
 cd ~/Projects/realctx && npm install
 pi install ~/Projects/realctx        # or add the path to "packages" in ~/.pi/agent/settings.json
 ```
+
+**Upgrade warning — settings schema v3:** On first load of an older config, **all Context
+and History settings, including custom values, are reset**. A private `.bak` copy is saved
+next to `config.json` before rewriting it and a warning is shown. Connections, API keys,
+rewrite model, memory settings and stored memories are preserved. Review the two sections
+after upgrading. If backup/save fails, the reset is applied only in memory and a warning
+reports the failure.
 
 realctx ships with no endpoints, API keys or model names: both endpoints default to none
 (empty, or `"none"` in `config.json`), and realctx works without them. Open

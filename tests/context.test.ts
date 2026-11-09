@@ -97,9 +97,13 @@ function writeSettings(extra: Record<string, unknown>) {
 		normalizeSettings({
 			embedding: { endpoint: url, apiKey: "", model: "m", dimensions: 4 },
 			semif: { endpoint: url, apiKey: "", model: "m" },
-			context: { captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2 },
 			capture: { mode: "off" },
 			...extra,
+			context: {
+				captureMinTokens: 100, dropMinTokens: 100, protectTurns: 2, cacheTtlAuto: false,
+				cacheTtlByModel: { "p/m": "5m", "p/other": "5m" },
+				...(extra.context as Record<string, unknown> ?? {}),
+			},
 		}),
 	);
 }
@@ -212,6 +216,28 @@ async function harness(opts: { tools?: Array<{ name: string; sourceInfo?: Record
 	const shutdown = () => emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
 	return { tools, commands, emit, ctx, entries, turn, user, request, resultText, settle, notices, sessionId, shutdown, active: () => active };
 }
+
+test("cache TTL follows the active model; long TTL keeps drops warm, unavailable TTL uses 5m", async () => {
+	writeSettings({ context: { cacheTtlByModel: { "p/m": "24h", "p/other": "5m" } } });
+	const h = await harness();
+	try {
+		h.user("inspect a.ts");
+		const old = await h.turn("read", { path: "src/a.ts" }, big("old model cache"));
+		await h.turn("read", { path: "src/a.ts" }, big("new read"));
+		await h.turn("bash", { command: "echo first" }, big("first"));
+		await h.turn("bash", { command: "echo second" }, big("second"));
+		await h.settle();
+		assert.match(h.resultText(await h.request(), old), /old model cache line 0/, "24h override keeps one-hour cache warm");
+		h.ctx.model = { ...h.ctx.model, id: "unknown" };
+		const lastAssistant = [...h.entries].reverse().find((e) => e.message?.role === "assistant")!.message;
+		lastAssistant.timestamp = Date.now() - 4 * 60_000;
+		assert.match(h.resultText(await h.request(), old), /old model cache line 0/, "placeholder keeps a four-minute cache warm");
+		lastAssistant.timestamp = Date.now() - 6 * 60_000;
+		assert.match(h.resultText(await h.request(), old), /^\[#1 dropped/, "unavailable lifetime uses the 5m placeholder for actual expiry");
+		h.ctx.model = { ...h.ctx.model, id: "other" };
+		assert.match(h.resultText(await h.request(), old), /^\[#1 dropped/, "5m model override applies immediately");
+	} finally { await h.shutdown(); }
+});
 
 test("rule drops apply only when the cache is cold, render byte-stable placeholders, and restore with realctx_expand", async () => {
 	writeSettings({});
@@ -949,7 +975,7 @@ test("1M-window token ceilings and historian fallback: prepareMaxTokens/applyMax
 			protectTurns: 1,
 			applyThreshold: 0.35,
 			applyMaxTokens: 2_500,
-			cacheTtl: "24h",
+			cacheTtlByModel: { "p/m": "24h" },
 		},
 		history: {
 			model: "h/broken",

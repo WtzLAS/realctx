@@ -10,7 +10,7 @@
 import { copyFileSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { embeddingFingerprint, matchModel, parseDuration, type Settings } from "../../src/config.ts";
+import { embeddingFingerprint, matchModel, type Settings } from "../../src/config.ts";
 import type { MemoryEngine } from "../../src/engine.ts";
 import { chunkQuestions } from "../../src/judge.ts";
 import {
@@ -784,10 +784,9 @@ export class ContextLayer {
 	}
 
 	private ttlMs(ctx: ExtensionContext): number {
-		const c = this.cfg;
-		const m = ctx.model;
-		const spec = (m && (c.cacheTtlByModel[`${m.provider}/${m.id}`] ?? c.cacheTtlByModel[m.id])) ?? c.cacheTtl;
-		return parseDuration(spec, 300_000);
+		const engine = this.host.engine();
+		if (this.cfg.cacheTtlAuto) void engine.cacheTtls.refresh();
+		return engine.cacheTtls.resolve(ctx.model, this.cfg).ms;
 	}
 
 	private estimateUsage(messages: MessageView[], ctx: ExtensionContext): LayerStatus["usage"] {

@@ -255,9 +255,13 @@ export default function realctx(pi: ExtensionAPI) {
 	};
 
 	const refreshStatus = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI) return;
 		try {
 			const e = getEngine();
+			for (const warning of e.settingsWarnings.splice(0)) {
+				if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+				else console.warn(warning);
+			}
+			if (!ctx.hasUI) return;
 			const sc = e.scopes(ctx.cwd);
 			const n = e.db.count(sc.stores.map((s) => s.id));
 			const pending = e.db.countPending(sc.project?.root);
@@ -408,6 +412,7 @@ export default function realctx(pi: ExtensionAPI) {
 		}
 		// The engine is shared by every session of the process: pick up config edits made since it opened.
 		e.reloadSettingsIfChanged();
+		if (ctx.model && e.settings.context.cacheTtlAuto) void e.cacheTtls.refresh();
 		const family = familyOf(ctx);
 		// Other context managers: warn, disable them (§12.3), and keep the context layer off while they run.
 		const conflicts = await handleConflicts(ctx, e, family.subagent);

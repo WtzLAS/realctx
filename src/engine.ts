@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
 import { EmbeddingClient, type HttpTrace, SemIfClient, type SemIfResponse } from "./api.ts";
 import { agentDirFromEnv, embeddingFingerprint, loadSettings, type RealctxPaths, realctxPaths, type Settings, saveSettings, settingsMtime } from "./config.ts";
+import { ModelCacheTtls } from "./cache-ttl.ts";
 import { LockTimeoutError, type MemoryRow, RealctxDB } from "./db.ts";
 import { MAX_CAPTION, MAX_CONTENT, type MemoryFile, normalizePathScopes, SCOPE_LABEL, type ScopeKind, type StoreRef } from "./files.ts";
 import { newId, parseId } from "./ids.ts";
@@ -258,6 +259,9 @@ export class MemoryEngine {
 	/** One-line notices shown once by the extension (realmem migration, a personal store moved to its git key). */
 	readonly notices: string[] = [];
 
+	readonly settingsWarnings: string[] = [];
+	readonly cacheTtls: ModelCacheTtls;
+
 	constructor(baseDir?: string) {
 		const explicit = baseDir ?? process.env.REALCTX_HOME;
 		const agentDir = agentDirFromEnv();
@@ -272,7 +276,8 @@ export class MemoryEngine {
 			}
 		}
 		this.paths = realctxPaths(base);
-		this.settings = loadSettings(this.paths.config);
+		this.settings = loadSettings(this.paths.config, (warning) => this.settingsWarnings.push(warning));
+		this.cacheTtls = new ModelCacheTtls(join(base, "model-cache-ttls.json"));
 		this.settingsMtime = settingsMtime(this.paths.config);
 		this.db = new RealctxDB(this.paths.db);
 		this.embedder = new EmbeddingClient(this.settings);
@@ -293,7 +298,7 @@ export class MemoryEngine {
 	/** Pick up settings changed by another Pi process. */
 	reloadSettingsIfChanged(): void {
 		const m = settingsMtime(this.paths.config);
-		if (m !== this.settingsMtime) this.applySettings(loadSettings(this.paths.config), false);
+		if (m !== this.settingsMtime) this.applySettings(loadSettings(this.paths.config, (warning) => this.settingsWarnings.push(warning)), false);
 	}
 
 	/** Apply (and optionally persist) new settings. Changing the embedding space clears the cache. */

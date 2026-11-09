@@ -10,6 +10,7 @@ import { formatList, formatOutcomeForModel, formatRecall, formatStatus, memoryEn
 import { type Completer, createCompleter, createRewriter, type Rewriter, resolveModel } from "../../src/rewrite.ts";
 import { oneLine } from "../../src/text.ts";
 import type { ContextLayer } from "./context-layer.ts";
+import { memoryPreview, toolRenderers } from "./tool-renderers.ts";
 
 export interface ToolHost {
 	engine(ctx: ExtensionContext): MemoryEngine;
@@ -58,7 +59,7 @@ function text(t: string) {
 
 export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 	const reg = <T extends TSchema>(def: ToolDefinition<T>): void => {
-		pi.registerTool(def);
+		pi.registerTool({ ...def, ...toolRenderers(def.name) });
 	};
 
 	reg({
@@ -111,6 +112,8 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 					parts.push(`Not found: ${missing.join(", ")}${outputLike.length ? ` (outputs like #${outputLike[0].replace("#", "")} are restored with realctx_expand)` : ""}`);
 				}
 				details.ids = found.map((m) => m.id);
+				details.memories = found.map(memoryPreview);
+				details.missing = missing;
 			}
 			const wantsSearch = queries.length > 0 || (params.paths && params.paths.length > 0) || parts.length === 0;
 			if (wantsSearch && queries.length === 0 && !(params.paths && params.paths.length > 0)) throw new Error("pass queries, paths or ids");
@@ -125,6 +128,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 				parts.push(formatRecall(r, queries.length > 0 ? queries : (params.paths ?? [])));
 				shown.push(...r.items.map((i) => i.memory.id));
 				details = { ...details, ids: [...((details.ids as string[]) ?? []), ...r.items.map((i) => i.memory.id)], total: r.total, page: r.page, pages: r.pages, embedError: r.embedError };
+				details.memories = [...((details.memories as ReturnType<typeof memoryPreview>[]) ?? []), ...r.items.map((i) => memoryPreview(i.memory))];
 			}
 			if (wantsSearch && sources.has("output") && queries.length > 0 && (params.page ?? 1) === 1) {
 				const layer = host.context();
@@ -202,6 +206,9 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 					details: {
 						status: outcome.status,
 						id: outcome.memory?.id,
+						caption: outcome.memory?.caption,
+						message: outcome.message,
+						warnings: [outcome.safety.redacted ? "Secrets redacted before storing" : "", outcome.trace.embed?.error ? "Embedding API unavailable; keyword duplicate check only" : ""].filter(Boolean),
 						scope: outcome.memory ? SCOPE_LABEL[outcome.memory.kind] : undefined,
 						reasons: outcome.decision?.reasons,
 					},
@@ -280,7 +287,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			const pages = Math.max(1, Math.ceil(total / pageSize));
 			const page = Math.min(Math.max(1, params.page ?? 1), pages);
 			const rows = engine.db.list(stores, { limit: pageSize, offset: (page - 1) * pageSize, order: "path" });
-			return { content: text(formatList(rows, total, page, pageSize)), details: { total, page, pages } };
+			return { content: text(formatList(rows, total, page, pageSize)), details: { total, page, pages, memories: rows.map(memoryPreview) } };
 		},
 	});
 
@@ -297,7 +304,7 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			const r = await engine.forget(ctx.cwd, params.ids);
 			const lines = r.deleted.map((m) => `deleted ${m.id} [${SCOPE_LABEL[m.kind]}] ${m.caption}`);
 			if (r.missing.length) lines.push(`not found: ${r.missing.join(", ")}`);
-			return { content: text(lines.join("\n") || "nothing deleted"), details: { deleted: r.deleted.map((m) => m.id), missing: r.missing } };
+			return { content: text(lines.join("\n") || "nothing deleted"), details: { deleted: r.deleted.map((m) => m.id), missing: r.missing, memories: r.deleted.map(memoryPreview) } };
 		},
 	});
 }

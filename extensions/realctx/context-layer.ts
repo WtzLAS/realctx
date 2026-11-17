@@ -159,6 +159,33 @@ function branchEntries(ctx: ExtensionContext): BranchEntryView[] {
 	return ctx.sessionManager.getBranch() as unknown as BranchEntryView[];
 }
 
+/**
+ * When the prompt cache was last written: the latest assistant response, or a later Pi cache-warming
+ * refresh (`cacheWarming`, "idle" by default since Pi 1.5.1) that re-sent the same request for the
+ * active provider. Warm refreshes are persisted as `usage` entries of kind `cache_warm` after the
+ * assistant message they keep warm; they never enter the model context.
+ */
+export function lastCacheWrite(messages: MessageView[], ctx: ExtensionContext): number {
+	const lastResponse = [...messages].reverse().find((m) => m.role === "assistant")?.timestamp ?? 0;
+	if (lastResponse <= 0) return 0;
+	const provider = ctx.model?.provider;
+	if (!provider) return lastResponse;
+	let branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
+	try {
+		branch = ctx.sessionManager.getBranch();
+	} catch {
+		return lastResponse;
+	}
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const e = branch[i];
+		if (e.type === "message" && e.message.role === "assistant") break;
+		if (e.type !== "usage" || e.kind !== "cache_warm" || e.provider !== provider) continue;
+		const at = Date.parse(e.timestamp);
+		if (Number.isFinite(at) && at > lastResponse) return at;
+	}
+	return lastResponse;
+}
+
 function usageTokens(u: NonNullable<MessageView["usage"]>): number {
 	if (u.totalTokens && u.totalTokens > 0) return u.totalTokens;
 	return (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
@@ -704,8 +731,8 @@ export class ContextLayer {
 
 			const usage = this.estimateUsage(messages, ctx);
 			const now = Date.now();
-			const lastResponse = [...messages].reverse().find((m) => m.role === "assistant")?.timestamp ?? 0;
-			const cold = lastResponse > 0 && now - lastResponse >= this.ttlMs(ctx);
+			const lastWrite = lastCacheWrite(messages, ctx);
+			const cold = lastWrite > 0 && now - lastWrite >= this.ttlMs(ctx);
 			const share = usage?.share ?? 0;
 			const emergency = share >= this.cfg.emergencyThreshold;
 			const applyReached = share >= this.cfg.applyThreshold || (!!usage && this.cfg.applyMaxTokens > 0 && usage.tokens >= this.cfg.applyMaxTokens);

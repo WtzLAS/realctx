@@ -1,7 +1,6 @@
 /**
  * Model-facing tools: realctx_recall, realctx_remember, realctx_expand, realctx_status, realctx_list, realctx_forget
  */
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { CandidateError, type MemoryEngine } from "../../src/engine.ts";
@@ -26,6 +25,14 @@ export interface ToolHost {
 	context(): ContextLayer | undefined;
 	/** Status lines of the context layer for realctx_status. */
 	contextStatus(ctx: ExtensionContext): string[];
+}
+
+/**
+ * A plain `{ type: "string", enum }` schema (no anyOf/const, which some providers reject), typed for TypeBox.
+ * pi-ai's `StringEnum` returns a pi-schema `Schema` since 1.5, which does not compose with `Type.Object`'s static types.
+ */
+function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string }) {
+	return Type.Unsafe<T[number]>({ type: "string", enum: [...values], ...(options?.description ? { description: options.description } : {}) });
 }
 
 const SCOPE_VALUES = ["global", "project-shared", "project-personal"] as const;

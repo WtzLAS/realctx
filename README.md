@@ -81,6 +81,9 @@ filterable model selector like Disabled models. The right column shows the effec
 and its source; Enter edits a duration (`5m`, `1h`, `300s`). Overrides show `(overrided)`;
 empty or `auto` removes an override. `context.cacheTtlByModel` accepts exact
 `provider/model` keys (preferred) or model IDs, case-insensitively; `0` means always cold.
+The TTL counts from the last response or, if later, Pi's last cache-warming refresh for the
+same provider (`cacheWarming`, `"idle"` by default since Pi 1.5.1), so drops never break a
+cache Pi is keeping warm.
 
 With `context.cacheTtlAuto = true`, public [models.dev](https://models.dev) metadata is
 refreshed daily in the background and cached locally; the picker also offers Refresh.

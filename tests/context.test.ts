@@ -239,6 +239,28 @@ test("cache TTL follows the active model; long TTL keeps drops warm, unavailable
 	} finally { await h.shutdown(); }
 });
 
+test("Pi cache-warming refreshes after the last response keep the cache warm", async () => {
+	writeSettings({ context: { cacheTtlByModel: { "p/m": "5m" } } });
+	const h = await harness();
+	try {
+		h.user("inspect a.ts");
+		const old = await h.turn("read", { path: "src/a.ts" }, big("warmed cache"));
+		await h.turn("read", { path: "src/a.ts" }, big("new read"));
+		await h.turn("bash", { command: "echo first" }, big("first"));
+		await h.turn("bash", { command: "echo second" }, big("second"));
+		await h.settle();
+		const lastAssistant = [...h.entries].reverse().find((e) => e.message?.role === "assistant")!.message;
+		lastAssistant.timestamp = Date.now() - 20 * 60_000;
+		const warm = (provider: string, ago: number) => ({ type: "usage", id: `warm-${provider}-${ago}`, kind: "cache_warm", provider, model: "m", usage: {}, timestamp: new Date(Date.now() - ago).toISOString() });
+		h.entries.push(warm("p", 2 * 60_000));
+		assert.match(h.resultText(await h.request(), old), /warmed cache line 0/, "a refresh two minutes ago keeps the 5m cache warm");
+		h.entries.pop();
+		h.entries.push(warm("other", 60_000));
+		h.entries.push(warm("p", 6 * 60_000));
+		assert.match(h.resultText(await h.request(), old), /^\[#1 dropped/, "refreshes of another provider or older than the TTL do not count");
+	} finally { await h.shutdown(); }
+});
+
 test("rule drops apply only when the cache is cold, render byte-stable placeholders, and restore with realctx_expand", async () => {
 	writeSettings({});
 	const h = await harness();

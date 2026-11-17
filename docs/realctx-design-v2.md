@@ -244,7 +244,7 @@ The judge returns no text. Summaries come from the rewrite model (the same model
 Judging is eager and cheap; applying rewrites earlier messages and costs a cache rebuild. Queued drops apply only when:
 
 1. **Pressure:** usage of the safe input window ≥ `context.applyThreshold`.
-2. **Cache cold:** time since the last response ≥ the active model’s resolved cache TTL (manual `context.cacheTtlByModel` override, then catalog metadata/provider estimate when `context.cacheTtlAuto` is on). Unavailable TTLs use a labeled 5m placeholder, including failed fetches without cached metadata.
+2. **Cache cold:** time since the last cache write (the last response, or a later Pi `cache_warm` usage entry for the same provider from `cacheWarming` refreshes) ≥ the active model’s resolved cache TTL (manual `context.cacheTtlByModel` override, then catalog metadata/provider estimate when `context.cacheTtlAuto` is on). Unavailable TTLs use a labeled 5m placeholder, including failed fetches without cached metadata.
 3. **Emergency:** usage ≥ `context.emergencyThreshold`: apply everything queued, then drop the largest unprotected results until under `applyThreshold`.
 4. **Flush:** `/realctx flush`, or a cancelled threshold compaction, applies at the next request.
 
